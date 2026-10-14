@@ -87,6 +87,7 @@ Served by `flux-server` on the same port as gRPC (HTTP/1.1 and HTTP/2):
 - **Code:** tree browser with the last change per entry, README rendering, syntax highlighting, line and range links (`#L10-L20`), raw, blame with age heat-map, file history, permalinks (`y`).
 - **Changes:** history grouped by day, changeset pages with unified or split diffs, compare views (`/-/compare/main...feature`).
 - **Reviews:** open, comment, approve, close, and **land** from the browser. flux tells you whether landing is a fast-forward or a rebase and reports real conflicts.
+- **Edit in the browser:** change or add a file, then commit straight to the branch (landed with a server-side rebase) or to a new branch with a review. Admins can create repositories from the home page.
 - **Search** across the whole tree with regex, case and path filters. **Go to file** (`t`) is a fuzzy finder over every path.
 - **Branches** with ahead/behind counts, **Activity** (every ref move, updated live over server-sent events).
 - **Keyboard:** `t` finder, `/` search, `y` permalink, `Esc`. Light and dark themes.
@@ -104,6 +105,7 @@ docker compose exec flux flux-server token --user admin --admin
 ```
 
 - **Auth** (`--auth`): `open` (single user / trusted network), `token` (anonymous reads, token writes), `private` (tokens for everything). `flux-server token --user NAME [--admin]` issues a token; only its SHA-256 is stored. `flux login` saves it for the CLI; the web UI uses an HttpOnly, SameSite cookie. `flux-server revoke --user NAME` revokes.
+- **Protected refs:** non-admins can only fast-forward `main`, `master`, `trunk` and `release/*`. Rebased work reaches them through `flux land` or a review.
 - **Durability:** objects are fsynced before any metadata references them. Segment files are append-only with per-record CRCs, and a torn tail is truncated on restart. The importer resumes after any crash. A test kills the server with `SIGKILL` three times during a git.git import, then resumes, verifies and runs `fsck --full`.
 - **Integrity:** `flux-server fsck [--full]` re-hashes changesets, trees and file contents, checks graph closure and refs, and re-derives missing derived data. It is safe to run online.
 - **Backups:** `flux-server backup DIR` takes a consistent online snapshot of the all-in-one layout (metadata first, then append-only blobs). Restore with `flux-server --data-dir DIR`. For Postgres use `pg_dump` or PITR; for S3, bucket versioning.
