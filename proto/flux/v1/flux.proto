@@ -1,0 +1,336 @@
+// flux gRPC API, v1 (SPEC §8).
+//
+// Phase 1 surface. Services are split by cacheability: ObjectService serves
+// only immutable, content-addressed objects and is answered identically by
+// every tier (fluxd, flux-cache, flux-server).
+//
+// Conventions:
+//   * All ids are raw 32-byte BLAKE3 hashes (`bytes`), git hashes are 20 bytes.
+//   * Paths are raw bytes ('/'-separated, see SPEC §3.1).
+//   * Batch RPCs stream results in arbitrary order, each tagged with its id.
+
+syntax = "proto3";
+
+package flux.v1;
+
+// ───────────────────────────── Common ─────────────────────────────
+
+message Timestamp {
+  int64 unix_ms = 1;
+  int32 tz_offset_min = 2;
+}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_REGULAR = 1;
+  FILE_KIND_EXECUTABLE = 2;
+  FILE_KIND_SYMLINK = 3;
+  FILE_KIND_GITLINK = 4;
+}
+
+message CopyFrom {
+  bytes path = 1;
+  uint32 parent_index = 2;
+}
+
+message FileChange {
+  bytes path = 1;
+  // Unset (empty) content_id together with deleted=true means deletion.
+  bool deleted = 2;
+  bytes content_id = 3;
+  uint64 size = 4;
+  FileKind kind = 5;
+  bytes gitlink_sha1 = 6;      // only for FILE_KIND_GITLINK
+  CopyFrom copy_from = 7;      // optional
+  // Merges only: keep parents[0]'s value (the parents disagree here).
+  bool retain = 8;
+}
+
+message Changeset {
+  repeated bytes parents = 1;
+  bytes author = 2;
+  Timestamp author_time = 3;
+  optional bytes committer = 4;
+  Timestamp committer_time = 5;  // present iff committer is
+  bytes message = 6;
+  repeated FileChange file_changes = 7;
+  map<string, bytes> extra = 8;
+}
+
+message ChangesetInfo {
+  bytes id = 1;
+  uint64 generation = 2;
+  bytes root_tree = 3;
+  int64 log_seq = 4;
+  // Canonical CBOR encoding; hashing it yields `id` (SPEC §2.3).
+  bytes canonical = 5;
+  Changeset changeset = 6;
+  bytes git_sha1 = 7;            // empty if not mapped
+}
+
+// ─────────────────────────── ObjectService ───────────────────────────
+
+service ObjectService {
+  // Fetch trees by id. With depth > 0 the tier also streams descendant trees
+  // up to `depth` levels, restricted to `sparse_prefixes` when set.
+  rpc GetTrees(GetTreesRequest) returns (stream TreeObject);
+  // Fetch file contents. Each content is streamed as ordered frames.
+  rpc GetContents(GetContentsRequest) returns (stream ContentFrame);
+  rpc GetContentMeta(GetContentMetaRequest) returns (stream ContentMetaResult);
+}
+
+message GetTreesRequest {
+  string repo = 1;
+  repeated bytes tree_ids = 2;
+  uint32 depth = 3;
+  // Directory prefixes (e.g. "src/app"); descendants outside them are not
+  // expanded. Ancestors of a prefix are always expanded.
+  repeated bytes sparse_prefixes = 4;
+  // Path of tree_ids[0]; required when depth > 0 and sparse_prefixes is set.
+  bytes path_hint = 5;
+}
+
+message TreeObject {
+  bytes id = 1;
+  bytes path = 2;        // best-effort, set when expanded via depth
+  bytes canonical = 3;   // canonical CBOR; hash(canonical) == id
+}
+
+message GetContentsRequest {
+  string repo = 1;
+  repeated bytes content_ids = 2;
+}
+
+message ContentFrame {
+  bytes content_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+}
+
+message GetContentMetaRequest {
+  string repo = 1;
+  repeated bytes content_ids = 2;
+}
+
+message ContentMetaResult {
+  bytes content_id = 1;
+  bool found = 2;
+  uint64 size = 3;
+  bytes git_sha1 = 4;
+  bytes sha256 = 5;
+  bool is_binary = 6;
+}
+
+// ─────────────────────────── RepoService ───────────────────────────
+
+service RepoService {
+  // Resolve a revision expression: ref name, cs_<hex>/hex prefix, git:<sha>,
+  // optionally followed by ~N (first-parent ancestor) or ^N (Nth parent).
+  rpc ResolveRev(ResolveRevRequest) returns (ChangesetInfo);
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+  rpc GetChangesets(GetChangesetsRequest) returns (stream ChangesetInfo);
+  // Ancestors of `rev` in descending generation order.
+  rpc Log(LogRequest) returns (stream ChangesetInfo);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc ReadFile(ReadFileRequest) returns (stream ContentFrame);
+  rpc Diff(DiffRequest) returns (stream DiffEntry);
+  // Batch map git commit SHA-1s to changeset ids (empty bytes if unknown).
+  rpc GitLookup(GitLookupRequest) returns (GitLookupResponse);
+}
+
+message GitLookupRequest {
+  string repo = 1;
+  repeated bytes git_sha1s = 2;
+}
+
+message GitLookupResponse {
+  repeated bytes changeset_ids = 1;  // parallel to request
+}
+
+message ResolveRevRequest {
+  string repo = 1;
+  string rev = 2;
+}
+
+message ListRefsRequest {
+  string repo = 1;
+  bytes prefix = 2;
+  uint32 limit = 3;
+}
+
+message RefEntry {
+  bytes name = 1;
+  bytes target = 2;
+  uint64 version = 3;
+}
+
+message ListRefsResponse {
+  repeated RefEntry refs = 1;
+}
+
+message GetChangesetsRequest {
+  string repo = 1;
+  repeated bytes ids = 2;
+}
+
+message LogRequest {
+  string repo = 1;
+  string rev = 2;
+  uint32 limit = 3;
+  bool first_parent = 4;
+  // Only changesets whose first-parent diff touches this path (file or dir).
+  bytes path = 5;
+}
+
+message TreeEntryInfo {
+  bytes name = 1;
+  bool is_dir = 2;
+  FileKind kind = 3;
+  bytes id = 4;
+  uint64 size = 5;
+  uint64 descendant_files = 6;
+}
+
+message ListDirRequest {
+  string repo = 1;
+  string rev = 2;
+  bytes path = 3;   // empty = root
+}
+
+message ListDirResponse {
+  bytes tree_id = 1;
+  repeated TreeEntryInfo entries = 2;
+}
+
+message ReadFileRequest {
+  string repo = 1;
+  string rev = 2;
+  bytes path = 3;
+}
+
+message DiffRequest {
+  string repo = 1;
+  string old_rev = 2;  // empty = first parent of new_rev
+  string new_rev = 3;
+  bytes path_prefix = 4;
+}
+
+message DiffFile {
+  FileKind kind = 1;
+  bytes content_id = 2;
+  uint64 size = 3;
+}
+
+message DiffEntry {
+  bytes path = 1;
+  DiffFile old = 2;  // unset = added
+  DiffFile new = 3;  // unset = deleted
+}
+
+// ─────────────────────────── WriteService ───────────────────────────
+
+service WriteService {
+  rpc HasContents(HasContentsRequest) returns (HasContentsResponse);
+  // Client-streamed upload of one or more contents, each as consecutive
+  // frames ending with last=true. The server re-hashes and verifies.
+  rpc UploadContents(stream UploadFrame) returns (UploadResponse);
+  rpc CreateChangeset(CreateChangesetRequest) returns (ChangesetInfo);
+  // Batch create: changesets are applied in order and may use earlier batch
+  // members as parents. One transaction per batch (importers, agents).
+  rpc CreateChangesets(CreateChangesetsRequest) returns (CreateChangesetsResponse);
+  rpc UpdateRef(UpdateRefRequest) returns (UpdateRefResponse);
+  rpc PutGitMapping(PutGitMappingRequest) returns (PutGitMappingResponse);
+}
+
+message HasContentsRequest {
+  string repo = 1;
+  repeated bytes content_ids = 2;
+}
+
+message HasContentsResponse {
+  repeated bool present = 1;  // parallel to request ids
+}
+
+message UploadFrame {
+  string repo = 1;          // required on the first frame
+  bytes content_id = 2;     // client-computed id, required on each content's first frame
+  bytes data = 3;
+  bool last = 4;
+  // Total content size, on each content's first frame. Required for content
+  // larger than 4 MiB (streamed into chunks without buffering).
+  optional uint64 size = 5;
+  // Optional hint on the first frame: a previous version of the same path.
+  // The server may store this content as a delta against it.
+  bytes delta_base = 6;
+}
+
+message UploadResponse {
+  repeated ContentMetaResult stored = 1;
+}
+
+message CreateChangesetRequest {
+  string repo = 1;
+  Changeset changeset = 2;
+}
+
+message CreateChangesetsRequest {
+  string repo = 1;
+  repeated Changeset changesets = 2;
+}
+
+message CreateChangesetsResponse {
+  repeated ChangesetInfo changesets = 1;
+}
+
+message UpdateRefRequest {
+  string repo = 1;
+  bytes name = 2;
+  oneof expect {
+    bool any = 3;
+    bool absent = 4;
+    uint64 version = 5;
+    bytes target = 6;
+  }
+  bytes new_target = 7;  // empty = delete the ref
+  string reason = 8;
+}
+
+message UpdateRefResponse {
+  bool updated = 1;
+  uint64 version = 2;
+  RefEntry current = 3;  // on mismatch
+}
+
+message GitMapping {
+  bytes changeset_id = 1;
+  bytes git_sha1 = 2;
+}
+
+message PutGitMappingRequest {
+  string repo = 1;
+  repeated GitMapping mappings = 2;
+}
+
+message PutGitMappingResponse {}
+
+// ─────────────────────────── AdminService ───────────────────────────
+
+service AdminService {
+  rpc CreateRepo(CreateRepoRequest) returns (RepoInfo);
+  rpc ListRepos(ListReposRequest) returns (ListReposResponse);
+}
+
+message CreateRepoRequest {
+  string name = 1;
+}
+
+message RepoInfo {
+  string name = 1;
+}
+
+message ListReposRequest {}
+
+message ListReposResponse {
+  repeated RepoInfo repos = 1;
+}

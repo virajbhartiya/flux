@@ -1,0 +1,22 @@
+[package]
+name = "flux-derive"
+description = "flux derived data: trees, tree walking and diffing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+flux-core.workspace = true
+flux-store.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,35 @@
+[package]
+name = "flux-server"
+description = "flux authoritative server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "flux-server"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+flux-store.workspace = true
+flux-derive.workspace = true
+flux-proto.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+moka.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

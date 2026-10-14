@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+repository = "https://github.com/flux-vcs/flux"
+
+[workspace.dependencies]
+flux-core = { path = "crates/flux-core" }
+flux-store = { path = "crates/flux-store" }
+flux-derive = { path = "crates/flux-derive" }
+flux-proto = { path = "crates/flux-proto" }
+flux-server = { path = "crates/flux-server" }
+flux-client = { path = "crates/flux-client" }
+
+anyhow = "1"
+async-trait = "0.1"
+blake3 = { version = "1.8", features = ["rayon"] }
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+object_store = "0.12"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "macros", "migrate"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+proptest = "1"
+moka = { version = "0.12", features = ["future"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"

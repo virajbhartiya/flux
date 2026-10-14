@@ -1,0 +1,29 @@
+[package]
+name = "flux-cli"
+description = "The flux command-line client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+flux-client.workspace = true
+flux-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar = "2"
+tokio.workspace = true
+
+[dev-dependencies]
+flux-server.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

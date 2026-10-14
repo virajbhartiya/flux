@@ -1,0 +1,20 @@
+[package]
+name = "flux-client"
+description = "Rust client for the flux gRPC API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+flux-proto.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true

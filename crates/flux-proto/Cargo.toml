@@ -1,0 +1,21 @@
+[package]
+name = "flux-proto"
+description = "flux gRPC API (generated) and conversions to flux-core types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+flux-core.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[lints]
+workspace = true
