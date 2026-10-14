@@ -1,0 +1,4 @@
+target
+.git
+.playwright-mcp
+*.db

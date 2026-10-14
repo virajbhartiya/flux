@@ -46,9 +46,7 @@ pub fn kind_from_pb(kind: i32, gitlink: &[u8]) -> Result<FileKind, Status> {
         Ok(v1::FileKind::Regular) => Ok(FileKind::Regular),
         Ok(v1::FileKind::Executable) => Ok(FileKind::Executable),
         Ok(v1::FileKind::Symlink) => Ok(FileKind::Symlink),
-        Ok(v1::FileKind::Gitlink) => {
-            Ok(FileKind::GitLink(gitlink.try_into().map_err(|_| bad("gitlink_sha1 must be 20 bytes"))?))
-        }
+        Ok(v1::FileKind::Gitlink) => Ok(FileKind::GitLink(gitlink.try_into().map_err(|_| bad("gitlink_sha1 must be 20 bytes"))?)),
         _ => Err(bad(format!("invalid file kind {kind}"))),
     }
 }

@@ -1,15 +1,16 @@
 //! flux authoritative server (SPEC §9.1).
 
 pub mod auth;
+pub mod cache;
 pub mod core;
 pub mod graph;
+pub mod grpc;
 pub mod history;
 pub mod land;
 pub mod metrics;
 pub mod ops;
 pub mod search;
 pub mod web;
-pub mod grpc;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,9 +41,7 @@ impl StorageConfig {
         let dir = dir.canonicalize()?;
         Ok(Self {
             meta_url: format!("sqlite://{}", dir.join("meta.db").display()),
-            blob_url: url::Url::from_directory_path(dir.join("blobs"))
-                .map_err(|_| anyhow::anyhow!("bad data dir"))?
-                .to_string(),
+            blob_url: url::Url::from_directory_path(dir.join("blobs")).map_err(|_| anyhow::anyhow!("bad data dir"))?.to_string(),
         })
     }
 }
@@ -96,9 +95,7 @@ impl Default for ServeOptions {
 
 macro_rules! grpc_service {
     ($router:expr, $server:ty, $svc:expr) => {{
-        let s = <$server>::new($svc)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let s = <$server>::new($svc).max_decoding_message_size(MAX_MESSAGE_BYTES).max_encoding_message_size(MAX_MESSAGE_BYTES);
         $router.route_service(
             &format!("/{}/{{*rest}}", <$server as tonic::server::NamedService>::NAME),
             tower::ServiceExt::map_request(s, |req: axum::http::Request<axum::body::Body>| req.map(tonic::body::Body::new)),
@@ -122,18 +119,14 @@ pub fn app(flux: Arc<Flux>, opts: ServeOptions) -> axum::Router {
     let router = grpc_service!(router, EventServiceServer<grpc::Services>, svc.clone());
     let router = grpc_service!(router, AuthServiceServer<grpc::Services>, svc.clone());
     let router = grpc_service!(router, AdminServiceServer<grpc::Services>, svc);
-    router
-        .layer(axum::middleware::from_fn(observe))
-        .layer(
-            tower_http::compression::CompressionLayer::new()
-                .quality(tower_http::CompressionLevel::Fastest)
-                .compress_when(
-                    tower_http::compression::predicate::SizeAbove::new(2048)
-                        .and(tower_http::compression::predicate::NotForContentType::GRPC)
-                        .and(tower_http::compression::predicate::NotForContentType::IMAGES)
-                        .and(tower_http::compression::predicate::NotForContentType::SSE),
-                ),
-        )
+    router.layer(axum::middleware::from_fn(observe)).layer(
+        tower_http::compression::CompressionLayer::new().quality(tower_http::CompressionLevel::Fastest).compress_when(
+            tower_http::compression::predicate::SizeAbove::new(2048)
+                .and(tower_http::compression::predicate::NotForContentType::GRPC)
+                .and(tower_http::compression::predicate::NotForContentType::IMAGES)
+                .and(tower_http::compression::predicate::NotForContentType::SSE),
+        ),
+    )
 }
 
 /// Request metrics for both surfaces.

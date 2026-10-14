@@ -10,7 +10,9 @@ mod meta;
 pub mod segment;
 mod sql;
 
-pub use blob::{BlobStats, BlobStore, CHUNK_THRESHOLD, ChunkSink, ContentLayout, MetaHasher, ObjectCodec, PutObject, content_meta};
+pub use blob::{
+    BlobStats, BlobStore, CHUNK_THRESHOLD, ChunkSink, ContentLayout, MetaHasher, ObjectCodec, PutObject, content_meta,
+};
 pub use meta::*;
 pub use sql::{PostgresStore, SqliteStore};
 

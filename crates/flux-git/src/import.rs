@@ -197,11 +197,8 @@ fn read_batches(
             }
             let changes = file_changes(&first, &others).with_context(|| format!("commit {}", hex::encode(sha)))?;
             // Previous version of each modified path, for delta hints.
-            let old: HashMap<&[u8], Sha> = first
-                .iter()
-                .filter(|e| e.old_mode & 0o170000 == 0o100000)
-                .map(|e| (e.path.as_slice(), e.old_sha))
-                .collect();
+            let old: HashMap<&[u8], Sha> =
+                first.iter().filter(|e| e.old_mode & 0o170000 == 0o100000).map(|e| (e.path.as_slice(), e.old_sha)).collect();
             for (path, value) in &changes {
                 let Value::Set(Some((kind, bsha))) = value else { continue };
                 if matches!(kind, FileKind::GitLink(_)) || blobs.contains_key(bsha) {
@@ -316,8 +313,8 @@ fn to_changeset(p: &Pending, mapped: &HashMap<Sha, ChangesetId>, blobs: &HashMap
         .collect::<Result<Vec<_>>>()?;
     let mut file_changes = BTreeMap::new();
     for (path, value) in &p.changes {
-        let rp = RepoPath::new(path.clone())
-            .with_context(|| format!("commit {} has a path flux cannot store", hex::encode(p.sha)))?;
+        let rp =
+            RepoPath::new(path.clone()).with_context(|| format!("commit {} has a path flux cannot store", hex::encode(p.sha)))?;
         let change = match value {
             Value::Retain => FileChange::Retain,
             Value::Set(None) => FileChange::Deletion,
@@ -401,8 +398,10 @@ pub async fn verify(client: &Client, git_dir: &Path, commits: &[Sha]) -> Result<
             }
         }
         if got != want {
-            let missing: Vec<_> = want.keys().filter(|k| !got.contains_key(*k)).take(3).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
-            let extra: Vec<_> = got.keys().filter(|k| !want.contains_key(*k)).take(3).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+            let missing: Vec<_> =
+                want.keys().filter(|k| !got.contains_key(*k)).take(3).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+            let extra: Vec<_> =
+                got.keys().filter(|k| !want.contains_key(*k)).take(3).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
             let differ: Vec<_> = want
                 .iter()
                 .filter(|(k, v)| got.get(*k).is_some_and(|g| g != *v))

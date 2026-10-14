@@ -112,6 +112,7 @@ pub struct Flux {
     pub(crate) lastmod_done: std::sync::Mutex<std::collections::HashMap<RepoId, Arc<std::sync::Mutex<HashSet<ChangesetId>>>>>,
     pub(crate) blame_cache: moka::sync::Cache<(RepoId, ChangesetId, Vec<u8>), Arc<crate::history::Blame>>,
     events: tokio::sync::broadcast::Sender<Event>,
+    derived_cache: moka::sync::Cache<(RepoId, i32, ChangesetId), [u8; 32]>,
     pub auth_mode: crate::auth::AuthMode,
     pub(crate) token_cache: moka::sync::Cache<[u8; 32], flux_store::User>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
@@ -136,8 +137,12 @@ impl Flux {
                 .max_capacity(64 << 20)
                 .build(),
             events: tokio::sync::broadcast::channel(4096).0,
+            derived_cache: moka::sync::Cache::new(2_000_000),
             auth_mode: crate::auth::AuthMode::Open,
-            token_cache: moka::sync::Cache::builder().max_capacity(10_000).time_to_live(std::time::Duration::from_secs(60)).build(),
+            token_cache: moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
             file_lists: moka::sync::Cache::builder()
                 .weigher(|_, l: &crate::search::FileList| (l.len() * 80 + 64) as u32)
                 .max_capacity(256 << 20)
@@ -148,6 +153,23 @@ impl Flux {
     pub fn with_auth_mode(mut self, mode: crate::auth::AuthMode) -> Self {
         self.auth_mode = mode;
         self
+    }
+
+    /// A single 32-byte derived value, cached in memory (derived data is
+    /// immutable once written).
+    pub async fn derived_get(&self, repo: RepoId, ty: i32, id: &ChangesetId) -> FluxResult<Option<[u8; 32]>> {
+        let key = (repo, ty, *id);
+        if let Some(v) = self.derived_cache.get(&key) {
+            return Ok(Some(v));
+        }
+        let v = self.meta.get_derived(repo, ty, std::slice::from_ref(id)).await?.pop().flatten();
+        match v.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()) {
+            Some(v) => {
+                self.derived_cache.insert(key, v);
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
@@ -175,7 +197,8 @@ impl Flux {
         if let Some(id) = self.repos.get(name).await {
             return Ok(id);
         }
-        let info = self.meta.get_repo(name).await?.ok_or_else(|| FluxError::NotFound(format!("repository {name:?} not found")))?;
+        let info =
+            self.meta.get_repo(name).await?.ok_or_else(|| FluxError::NotFound(format!("repository {name:?} not found")))?;
         self.repos.insert(name.to_string(), info.id).await;
         self.repo_names.insert(info.id, name.to_string());
         Ok(info.id)
@@ -197,10 +220,7 @@ impl Flux {
     }
 
     /// Batch form with optional delta hints (previous version of each path).
-    pub async fn put_contents(
-        &self,
-        items: Vec<(bytes::Bytes, Option<ContentId>)>,
-    ) -> FluxResult<Vec<(ContentId, ContentMeta)>> {
+    pub async fn put_contents(&self, items: Vec<(bytes::Bytes, Option<ContentId>)>) -> FluxResult<Vec<(ContentId, ContentMeta)>> {
         let out = self.blobs.put_contents(items).await?;
         self.blobs.sync().await?;
         self.meta.put_content_meta(&out).await?;
@@ -252,8 +272,8 @@ impl Flux {
     /// Root tree of a changeset, deriving it (and any underived ancestors) if
     /// the mapping is missing, e.g. after a crash between insert and derive.
     pub async fn root_tree(&self, repo: RepoId, id: &ChangesetId) -> FluxResult<TreeId> {
-        if let Some(Some(v)) = self.meta.get_derived(repo, TREE_V1, std::slice::from_ref(id)).await?.pop() {
-            return TreeId::from_slice(&v).map_err(|e| FluxError::Internal(e.into()));
+        if let Some(v) = self.derived_get(repo, TREE_V1, id).await? {
+            return Ok(TreeId::from_bytes(v));
         }
         // Walk first parents down to a derived frontier, then derive upwards.
         let mut chain = vec![self.load_one(repo, id).await?];
@@ -436,8 +456,7 @@ impl Flux {
         cs: &Changeset,
         batch_trees: &std::collections::HashMap<ChangesetId, TreeId>,
     ) -> FluxResult<()> {
-        let needs_copy_check =
-            cs.file_changes.values().any(|c| matches!(c, FileChange::Change { copy_from: Some(_), .. }));
+        let needs_copy_check = cs.file_changes.values().any(|c| matches!(c, FileChange::Change { copy_from: Some(_), .. }));
         if cs.parents.len() < 2 && !needs_copy_check {
             return Ok(());
         }
@@ -452,9 +471,7 @@ impl Flux {
             if let FileChange::Change { copy_from: Some((src, idx)), .. } = change {
                 let found = lookup_path(&self.blobs, parent_trees[*idx as usize], src).await?;
                 if found.is_none_or(|e| e.is_dir()) {
-                    return Err(FluxError::InvalidArgument(format!(
-                        "{path}: copy_from {src} does not exist in parent #{idx}"
-                    )));
+                    return Err(FluxError::InvalidArgument(format!("{path}: copy_from {src} does not exist in parent #{idx}")));
                 }
             }
         }
@@ -547,15 +564,19 @@ impl Flux {
             if op == b'~' {
                 for _ in 0..n {
                     let cs = self.load_one(repo, &id).await?;
-                    id = *cs.changeset.parents.first().ok_or_else(|| {
-                        FluxError::NotFound(format!("{rev:?}: {id} has no parent"))
-                    })?;
+                    id = *cs
+                        .changeset
+                        .parents
+                        .first()
+                        .ok_or_else(|| FluxError::NotFound(format!("{rev:?}: {id} has no parent")))?;
                 }
             } else if n > 0 {
                 let cs = self.load_one(repo, &id).await?;
-                id = *cs.changeset.parents.get(n - 1).ok_or_else(|| {
-                    FluxError::NotFound(format!("{rev:?}: {id} has no parent #{n}"))
-                })?;
+                id = *cs
+                    .changeset
+                    .parents
+                    .get(n - 1)
+                    .ok_or_else(|| FluxError::NotFound(format!("{rev:?}: {id} has no parent #{n}")))?;
             }
         }
         Ok(id)

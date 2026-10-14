@@ -19,8 +19,8 @@ fn check(name: &str, bytes: &[u8], id: &str) {
         std::fs::write(&path, &actual).unwrap();
         return;
     }
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("missing golden file {path:?} ({e}); run with FLUX_BLESS=1"));
+    let expected =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing golden file {path:?} ({e}); run with FLUX_BLESS=1"));
     assert_eq!(actual, expected, "golden mismatch for {name}");
 }
 

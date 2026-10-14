@@ -96,18 +96,27 @@ pub fn router(flux: Arc<Flux>) -> Router {
 async fn static_asset(State(web): State<WebState>, axum::extract::Path(file): axum::extract::Path<String>) -> Response {
     let immutable = HeaderValue::from_static("public, max-age=31536000, immutable");
     if format!("/-/static/{file}") == web.css_path {
-        return ([(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8")), (header::CACHE_CONTROL, immutable)], web.css.clone())
+        return (
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8")), (header::CACHE_CONTROL, immutable)],
+            web.css.clone(),
+        )
             .into_response();
     }
     if format!("/-/static/{file}") == web.js_path {
         return (
-            [(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8")), (header::CACHE_CONTROL, immutable)],
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8")),
+                (header::CACHE_CONTROL, immutable),
+            ],
             APP_JS,
         )
             .into_response();
     }
     if file == "favicon.svg" {
-        return ([(header::CONTENT_TYPE, HeaderValue::from_static("image/svg+xml")), (header::CACHE_CONTROL, immutable)], view::FAVICON)
+        return (
+            [(header::CONTENT_TYPE, HeaderValue::from_static("image/svg+xml")), (header::CACHE_CONTROL, immutable)],
+            view::FAVICON,
+        )
             .into_response();
     }
     WebError::NotFound("no such asset".into()).into_response()

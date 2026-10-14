@@ -964,11 +964,7 @@ impl PostgresStore {
     async fn lock_ref(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, repo: RepoId, name: &[u8]) -> StoreResult<()> {
         // Key the lock on (repo, hash(name)) so unrelated refs don't contend.
         let h = fnv1a_lock_key(name);
-        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-            .bind(repo.0 as i32)
-            .bind(h)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)").bind(repo.0 as i32).bind(h).execute(&mut **tx).await?;
         Ok(())
     }
 }

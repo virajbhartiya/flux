@@ -209,7 +209,8 @@ where
                 continue;
             }
             // A merge child equal to another parent's child came from there.
-            let inherited = other_nodes.iter().find_map(|(ot, ol)| find(ot, ol, name).filter(|(oe, _)| oe == e).map(|(_, le)| le));
+            let inherited =
+                other_nodes.iter().find_map(|(ot, ol)| find(ot, ol, name).filter(|(oe, _)| oe == e).map(|(_, le)| le));
             if let Some(le) = inherited {
                 entries.push(le);
                 continue;
@@ -224,18 +225,15 @@ where
                         None => None,
                     };
                     let sub_base = side(from_base);
-                    let sub_others: Vec<Side> =
-                        other_nodes.iter().filter_map(|(ot, ol)| side(find(ot, ol, name))).collect();
+                    let sub_others: Vec<Side> = other_nodes.iter().filter_map(|(ot, ol)| side(find(ot, ol, name))).collect();
                     recurse.push((entries.len(), sub_tree, sub_base, sub_others));
                     entries.push(LmEntry { name: e.name.clone(), cs, sub: None });
                 }
                 None => entries.push(LmEntry { name: e.name.clone(), cs, sub: None }),
             }
         }
-        let subs = futures::future::try_join_all(
-            recurse.iter().map(|(_, t, b, o)| dir(writer, trees, cs, *t, *b, o.clone())),
-        )
-        .await?;
+        let subs =
+            futures::future::try_join_all(recurse.iter().map(|(_, t, b, o)| dir(writer, trees, cs, *t, *b, o.clone()))).await?;
         for ((i, ..), sub) in recurse.iter().zip(subs) {
             entries[*i].sub = Some(sub);
         }
@@ -283,7 +281,15 @@ mod tests {
     }
 
     fn set(path: &str, content: &[u8]) -> (RepoPath, FileChange) {
-        (p(path), FileChange::Change { content_id: ContentId::hash(content), size: content.len() as u64, kind: FileKind::Regular, copy_from: None })
+        (
+            p(path),
+            FileChange::Change {
+                content_id: ContentId::hash(content),
+                size: content.len() as u64,
+                kind: FileKind::Regular,
+                copy_from: None,
+            },
+        )
     }
 
     #[tokio::test]
@@ -302,7 +308,8 @@ mod tests {
         let l3 = derive_lastmod(&blobs, &w, c(3), t3, Some(Side { tree: t1, lm: l1 }), &[]).await.unwrap();
         // c4 = merge(c2, c3) taking c3's `a`.
         let t4 = derive_tree(&blobs, Some(t2), &BTreeMap::from([set("a", b"3")])).await.unwrap();
-        let l4 = derive_lastmod(&blobs, &w, c(4), t4, Some(Side { tree: t2, lm: l2 }), &[Side { tree: t3, lm: l3 }]).await.unwrap();
+        let l4 =
+            derive_lastmod(&blobs, &w, c(4), t4, Some(Side { tree: t2, lm: l2 }), &[Side { tree: t3, lm: l3 }]).await.unwrap();
         w.flush().await.unwrap();
         let at = |root, path: &str| {
             let blobs = blobs.clone();

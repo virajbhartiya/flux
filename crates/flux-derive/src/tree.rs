@@ -388,12 +388,7 @@ mod tests {
     }
 
     async fn files(blobs: &BlobStore, root: TreeId) -> Vec<(String, ContentId)> {
-        walk_tree(blobs, root, &all)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.path.to_string(), f.content_id.unwrap()))
-            .collect()
+        walk_tree(blobs, root, &all).await.unwrap().into_iter().map(|f| (f.path.to_string(), f.content_id.unwrap())).collect()
     }
 
     #[tokio::test]
@@ -430,7 +425,10 @@ mod tests {
         let mut c4 = BTreeMap::new();
         c4.insert(p("a"), change(b"now a file", FileKind::Regular));
         let t4 = derive_tree(&blobs, Some(t3), &c4).await.unwrap();
-        assert_eq!(files(&blobs, t4).await, vec![("a".into(), ContentId::hash(b"now a file")), ("top/inner".into(), ContentId::hash(b"i"))]);
+        assert_eq!(
+            files(&blobs, t4).await,
+            vec![("a".into(), ContentId::hash(b"now a file")), ("top/inner".into(), ContentId::hash(b"i"))]
+        );
 
         // Delete everything.
         let mut c5 = BTreeMap::new();
@@ -450,7 +448,11 @@ mod tests {
         prop::collection::vec((arb_path(), prop::option::weighted(0.7, any::<u8>())), 1..8)
     }
 
-    fn apply_oracle(state: &mut BTreeMap<String, u8>, changes: &BTreeMap<RepoPath, FileChange>, contents: &BTreeMap<RepoPath, u8>) {
+    fn apply_oracle(
+        state: &mut BTreeMap<String, u8>,
+        changes: &BTreeMap<RepoPath, FileChange>,
+        contents: &BTreeMap<RepoPath, u8>,
+    ) {
         for (path, ch) in changes {
             let ps = path.to_string();
             match ch {

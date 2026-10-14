@@ -35,7 +35,9 @@ impl Flux {
         let g = {
             let mut map = self.graphs.lock().unwrap();
             map.entry(repo)
-                .or_insert_with(|| Arc::new(RepoGraph { graph: RwLock::new(Graph::default()), load: tokio::sync::Mutex::new(()) }))
+                .or_insert_with(|| {
+                    Arc::new(RepoGraph { graph: RwLock::new(Graph::default()), load: tokio::sync::Mutex::new(()) })
+                })
                 .clone()
         };
         if g.graph.read().unwrap().loaded_seq == 0 {
@@ -171,8 +173,8 @@ impl Flux {
     /// Root lastmod node of `cs`, deriving it (and any underived ancestors,
     /// in topological order) if needed.
     pub async fn lastmod(&self, repo: RepoId, cs: &ChangesetId) -> FluxResult<DerivedId> {
-        if let Some(v) = self.meta.get_derived(repo, LASTMOD_V1, std::slice::from_ref(cs)).await?.pop().flatten() {
-            return DerivedId::from_slice(&v).map_err(|e| FluxError::Internal(e.into()));
+        if let Some(v) = self.derived_get(repo, LASTMOD_V1, cs).await? {
+            return Ok(DerivedId::from_bytes(v));
         }
         let lock = self.lastmod_lock(repo);
         let _guard = lock.lock().await;
@@ -218,7 +220,8 @@ impl Flux {
             };
             // Batch-fetch every root tree and external parent lastmod the
             // chunk needs (one query each instead of one per changeset).
-            let mut want_trees: Vec<ChangesetId> = items.iter().flat_map(|(id, ps)| std::iter::once(*id).chain(ps.iter().copied())).collect();
+            let mut want_trees: Vec<ChangesetId> =
+                items.iter().flat_map(|(id, ps)| std::iter::once(*id).chain(ps.iter().copied())).collect();
             want_trees.sort_unstable();
             want_trees.dedup();
             let mut trees: std::collections::HashMap<ChangesetId, TreeId> = std::collections::HashMap::new();
@@ -246,7 +249,8 @@ impl Flux {
             for (id, parents) in &items {
                 let sides: Vec<Side> = parents.iter().map(|p| Side { tree: trees[p], lm: known[p] }).collect();
                 let root =
-                    derive_lastmod(&self.blobs, &writer, *id, trees[id], sides.first().copied(), sides.get(1..).unwrap_or(&[])).await?;
+                    derive_lastmod(&self.blobs, &writer, *id, trees[id], sides.first().copied(), sides.get(1..).unwrap_or(&[]))
+                        .await?;
                 known.insert(*id, root);
                 rows.push((*id, root.as_bytes().to_vec()));
             }
@@ -256,7 +260,12 @@ impl Flux {
             done.lock().unwrap().extend(rows.iter().map(|r| r.0));
         }
         if total > 1000 {
-            tracing::info!(repo = repo.0, changesets = total, elapsed_ms = started.elapsed().as_millis() as u64, "derived lastmod");
+            tracing::info!(
+                repo = repo.0,
+                changesets = total,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "derived lastmod"
+            );
         }
         known.get(cs).copied().ok_or_else(|| FluxError::Internal(anyhow::anyhow!("lastmod not derived")))
     }
@@ -343,10 +352,16 @@ impl Flux {
         }
         let mut texts: Vec<bytes::Bytes> = Vec::with_capacity(versions.len());
         for (_, cid) in &versions {
-            texts.push(self.blobs.get_content_bytes(cid).await?.ok_or_else(|| FluxError::Internal(anyhow::anyhow!("content {cid} missing")))?);
+            texts.push(
+                self.blobs
+                    .get_content_bytes(cid)
+                    .await?
+                    .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("content {cid} missing")))?,
+            );
         }
         let ids: Vec<ChangesetId> = versions.iter().map(|v| v.0).collect();
-        let blame = tokio::task::spawn_blocking(move || compute_blame(&ids, &texts)).await.map_err(|e| FluxError::Internal(e.into()))?;
+        let blame =
+            tokio::task::spawn_blocking(move || compute_blame(&ids, &texts)).await.map_err(|e| FluxError::Internal(e.into()))?;
         let blame = Arc::new(blame);
         self.blame_cache.insert(key, blame.clone());
         Ok(blame)

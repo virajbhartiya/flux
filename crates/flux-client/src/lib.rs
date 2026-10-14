@@ -9,9 +9,9 @@ use flux_core::{Changeset, ChangesetId, ContentId, Tree, TreeId};
 use flux_proto::v1::admin_service_client::AdminServiceClient;
 use flux_proto::v1::auth_service_client::AuthServiceClient;
 use flux_proto::v1::event_service_client::EventServiceClient;
-use flux_proto::v1::review_service_client::ReviewServiceClient;
 use flux_proto::v1::object_service_client::ObjectServiceClient;
 use flux_proto::v1::repo_service_client::RepoServiceClient;
+use flux_proto::v1::review_service_client::ReviewServiceClient;
 use flux_proto::v1::write_service_client::WriteServiceClient;
 use flux_proto::v1::{self, *};
 use flux_proto::{FRAME_BYTES, MAX_MESSAGE_BYTES};
@@ -574,7 +574,8 @@ impl Client {
     }
 
     pub async fn search(&self, req: SearchRequest) -> Result<Vec<SearchMatch>> {
-        let mut s = self.repos.clone().search(SearchRequest { repo: self.repo.clone(), ..req }).await.map_err(Self::status)?.into_inner();
+        let mut s =
+            self.repos.clone().search(SearchRequest { repo: self.repo.clone(), ..req }).await.map_err(Self::status)?.into_inner();
         let mut out = Vec::new();
         while let Some(m) = s.next().await {
             out.push(m?);

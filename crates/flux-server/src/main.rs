@@ -77,6 +77,18 @@ enum Cmd {
     Backup { dir: PathBuf },
     /// Create a repository.
     CreateRepo { name: String },
+    /// Run a regional cache tier in front of an upstream flux server: serves
+    /// trees and contents from local disk, proxies everything else.
+    Cache {
+        /// Upstream flux server URL.
+        #[arg(long, env = "FLUX_UPSTREAM")]
+        upstream: String,
+        /// Directory for cached objects.
+        #[arg(long, env = "FLUX_CACHE_DIR", default_value = ".flux-cache")]
+        dir: PathBuf,
+        #[arg(long, env = "FLUX_CACHE_LISTEN", default_value = "127.0.0.1:7879")]
+        listen: std::net::SocketAddr,
+    },
 }
 
 #[tokio::main]
@@ -85,6 +97,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+    if let Some(Cmd::Cache { upstream, dir, listen }) = &cli.cmd {
+        std::fs::create_dir_all(dir)?;
+        let url = url::Url::from_directory_path(dir.canonicalize()?).map_err(|_| anyhow::anyhow!("bad cache dir"))?;
+        let cache = flux_server::cache::Cache::new(upstream, url.as_str()).await?;
+        let (listener, addr) = flux_server::bind(*listen).await?;
+        tracing::info!(%addr, %upstream, dir = %dir.display(), "flux-cache listening");
+        return flux_server::cache::serve(cache, listener, shutdown_signal()).await;
+    }
     let cfg = match (cli.storage.data_dir, cli.storage.meta_url, cli.storage.blob_url) {
         (Some(dir), _, _) => StorageConfig::data_dir(&dir)?,
         (None, Some(meta_url), Some(blob_url)) => StorageConfig { meta_url, blob_url },
@@ -148,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
             println!("created {name}");
             return Ok(());
         }
+        Cmd::Cache { .. } => unreachable!("handled above"),
     }
     for name in &cli.serve.create_repos {
         if flux.meta.get_repo(name).await?.is_none() {

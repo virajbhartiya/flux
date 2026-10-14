@@ -200,7 +200,12 @@ impl Flux {
 
     /// Three-way merge of one path: `base` (original parent), `ours` (new
     /// parent) and `theirs` (the change being rebased). `None` = conflict.
-    async fn merge3(&self, base: &Option<TreeEntry>, ours: &Option<TreeEntry>, theirs: &FileChange) -> FluxResult<Option<FileChange>> {
+    async fn merge3(
+        &self,
+        base: &Option<TreeEntry>,
+        ours: &Option<TreeEntry>,
+        theirs: &FileChange,
+    ) -> FluxResult<Option<FileChange>> {
         let (Some(b), Some(o), FileChange::Change { content_id: t_id, kind: t_kind, .. }) = (base, ours, theirs) else {
             return Ok(None);
         };
@@ -331,7 +336,8 @@ impl Flux {
             "reopen" => "reopened",
             _ => "updated",
         };
-        let r = self.meta.update_review(repo, number, update).await?.ok_or_else(|| FluxError::NotFound("review vanished".into()))?;
+        let r =
+            self.meta.update_review(repo, number, update).await?.ok_or_else(|| FluxError::NotFound("review vanished".into()))?;
         self.meta.add_review_event(repo, number, kind, actor, body, head, None, None).await?;
         self.review_event(repo, number, kind).await;
         Ok(r)
@@ -345,7 +351,11 @@ impl Flux {
         let base = self.meta.get_ref(repo, &r.target).await?.map(|x| x.target);
         let result = self.land(repo, r.head, &r.target, actor, &format!("land review #{number}")).await?;
         self.meta
-            .update_review(repo, number, ReviewUpdate { state: Some("landed".into()), landed: Some(result.head), ..Default::default() })
+            .update_review(
+                repo,
+                number,
+                ReviewUpdate { state: Some("landed".into()), landed: Some(result.head), ..Default::default() },
+            )
             .await?;
         let note = if result.fast_forward {
             "fast-forward".to_string()

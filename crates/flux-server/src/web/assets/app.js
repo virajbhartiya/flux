@@ -419,7 +419,31 @@
   });
 
   // ── per-page setup ────────────────────────────────────────────────
+  // Highlighting for a big file was still running when the page rendered:
+  // fetch the page again shortly and swap in the highlighted code.
+  let hlTimer;
+  function pollHighlight(attempt) {
+    clearTimeout(hlTimer);
+    if (!$(".hl-pending") || attempt > 8) return;
+    const url = location.href;
+    hlTimer = setTimeout(async () => {
+      if (location.href !== url) return;
+      cache.delete(url);
+      try {
+        const html = await fetchPage(url);
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const next = $("table.code", doc);
+        if (!$(".hl-pending", doc) && next && $("table.code") && location.href === url) {
+          $("table.code").replaceWith(next);
+          const p = $(".hl-pending"); if (p) p.remove();
+          applyLineHash();
+        } else pollHighlight(attempt + 1);
+      } catch (_) {}
+    }, 150 + attempt * 150);
+  }
+
   function onPage() {
+    pollHighlight(0);
     applyLineHash();
     applyDiffMode();
     connectLive();

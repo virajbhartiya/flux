@@ -69,7 +69,6 @@ impl Kind {
             _ => bail!("corrupt dirstate: bad kind {b}"),
         })
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,11 +239,7 @@ pub fn mtime_ns(md: &fs::Metadata) -> i128 {
 
 #[cfg(not(unix))]
 pub fn mtime_ns(md: &fs::Metadata) -> i128 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0)
+    md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as i128).unwrap_or(0)
 }
 
 #[cfg(unix)]
@@ -330,8 +325,7 @@ impl WorkingCopy {
 
     /// Should the walker descend into directory `path`?
     fn descend(&self, path: &[u8]) -> bool {
-        self.in_sparse(path)
-            || self.sparse_prefixes().iter().any(|p| p.starts_with(path) && p.get(path.len()) == Some(&b'/'))
+        self.in_sparse(path) || self.sparse_prefixes().iter().any(|p| p.starts_with(path) && p.get(path.len()) == Some(&b'/'))
     }
 
     #[cfg(unix)]
@@ -411,6 +405,60 @@ impl WorkingCopy {
         }
         fs::rename(&tmp, &fp).with_context(|| format!("writing {}", fp.display()))?;
         Ok(fs::symlink_metadata(&fp)?)
+    }
+
+    /// Write many files in parallel (checkout's hot path). Parent
+    /// directories are prepared once; new files are written in place,
+    /// existing ones are replaced atomically.
+    pub fn write_files(&self, files: Vec<(RepoPath, Kind, Vec<u8>)>) -> Result<Vec<(RepoPath, fs::Metadata)>> {
+        let mut dirs: Vec<PathBuf> =
+            files.iter().filter_map(|(p, _, _)| self.fs_path(p).parent().map(Path::to_path_buf)).collect();
+        dirs.sort();
+        dirs.dedup();
+        for d in &dirs {
+            if d.is_dir() {
+                continue;
+            }
+            // A file may sit where a directory is needed (file→dir).
+            let mut anc = Some(d.as_path());
+            while let Some(a) = anc {
+                if a == self.root {
+                    break;
+                }
+                if fs::symlink_metadata(a).is_ok_and(|m| !m.is_dir()) {
+                    fs::remove_file(a)?;
+                    break;
+                }
+                anc = a.parent();
+            }
+            fs::create_dir_all(d)?;
+        }
+        files
+            .into_par_iter()
+            .map(|(p, kind, data)| {
+                if matches!(kind, Kind::Symlink | Kind::GitLink) {
+                    let md = self.write_file(&p, kind, &data)?;
+                    return Ok((p, md));
+                }
+                let fp = self.fs_path(&p);
+                match fs::symlink_metadata(&fp) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let mut f = fs::File::create(&fp).with_context(|| format!("writing {}", fp.display()))?;
+                        f.write_all(&data)?;
+                        #[cfg(unix)]
+                        if kind == Kind::Executable {
+                            f.set_permissions(fs::Permissions::from_mode(0o755))?;
+                        }
+                        drop(f);
+                        Ok((p, fs::symlink_metadata(&fp)?))
+                    }
+                    _ => {
+                        let md = self.write_file(&p, kind, &data)?;
+                        Ok((p, md))
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn remove_file(&self, p: &RepoPath) -> Result<()> {

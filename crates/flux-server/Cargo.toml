@@ -18,6 +18,8 @@ flux-proto.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 similar = "2"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+flux-client.workspace = true
 axum = { version = "0.8", features = ["http1", "http2", "tokio", "query", "form"] }
 maud = "0.27"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

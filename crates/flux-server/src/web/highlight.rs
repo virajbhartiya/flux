@@ -102,6 +102,18 @@ impl Highlighter {
         Some(out)
     }
 
+    /// The cached result, without doing any work.
+    pub fn cached(&self, id: ContentId, path: &str, text: &str) -> Option<Arc<Vec<String>>> {
+        let ss = SYNTAXES.get()?;
+        let syntax = find_syntax(ss, path, text.lines().next().unwrap_or(""))?;
+        self.cache.get(&(id, syntax_name_static(&syntax.name)))
+    }
+
+    pub fn has_grammar(&self, path: &str, text: &str) -> bool {
+        text.len() <= MAX_HIGHLIGHT_BYTES
+            && find_syntax(syntaxes(), path, text.lines().next().unwrap_or("")).is_some_and(|s| s.name != "Plain Text")
+    }
+
     pub fn language(&self, path: &str, text: &str) -> Option<String> {
         let ss = syntaxes();
         find_syntax(ss, path, text.lines().next().unwrap_or("")).map(|s| s.name.clone()).filter(|n| n != "Plain Text")
@@ -173,8 +185,12 @@ pub fn theme_css() -> String {
             if sel.trim().ends_with(".hl-code") {
                 continue;
             }
-            let scoped: Vec<String> =
-                sel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with("/*")).map(|s| format!("{prefix} {s}")).collect();
+            let scoped: Vec<String> = sel
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && !s.starts_with("/*"))
+                .map(|s| format!("{prefix} {s}"))
+                .collect();
             if scoped.is_empty() {
                 continue;
             }

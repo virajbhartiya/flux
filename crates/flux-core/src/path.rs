@@ -106,8 +106,7 @@ impl RepoPath {
 
     /// True if `self` equals `prefix` or lives underneath it.
     pub fn starts_with(&self, prefix: &RepoPath) -> bool {
-        self.0.starts_with(&prefix.0)
-            && (self.0.len() == prefix.0.len() || self.0[prefix.0.len()] == b'/')
+        self.0.starts_with(&prefix.0) && (self.0.len() == prefix.0.len() || self.0[prefix.0.len()] == b'/')
     }
 
     /// Lossy UTF-8 rendering for display.

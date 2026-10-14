@@ -235,8 +235,15 @@ pub trait MetaStore: Send + Sync + 'static {
 
     // reviews
     /// Creates a review with the next number in the repo.
-    async fn create_review(&self, repo: RepoId, title: &str, body: &str, author: &str, head: ChangesetId, target: &[u8])
-    -> StoreResult<Review>;
+    async fn create_review(
+        &self,
+        repo: RepoId,
+        title: &str,
+        body: &str,
+        author: &str,
+        head: ChangesetId,
+        target: &[u8],
+    ) -> StoreResult<Review>;
     async fn get_review(&self, repo: RepoId, number: i64) -> StoreResult<Option<Review>>;
     /// Newest first, optionally filtered by state.
     async fn list_reviews(&self, repo: RepoId, state: Option<&str>, limit: u32) -> StoreResult<Vec<Review>>;

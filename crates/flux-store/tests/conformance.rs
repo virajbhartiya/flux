@@ -75,13 +75,25 @@ async fn ref_cas() {
         let b = ChangesetId::hash(b"b");
         let log = || RefLogEntry { actor: "test".into(), reason: "test".into() };
 
-        assert_eq!(s.cas_ref(repo, b"main", RefExpect::Absent, Some(a), log()).await.unwrap(), CasOutcome::Updated { version: 1 });
+        assert_eq!(
+            s.cas_ref(repo, b"main", RefExpect::Absent, Some(a), log()).await.unwrap(),
+            CasOutcome::Updated { version: 1 }
+        );
+        assert!(
+            matches!(
+                s.cas_ref(repo, b"main", RefExpect::Absent, Some(b), log()).await.unwrap(),
+                CasOutcome::Mismatch { current: Some(RefValue { version: 1, .. }) }
+            ),
+            "{label}"
+        );
         assert!(matches!(
-            s.cas_ref(repo, b"main", RefExpect::Absent, Some(b), log()).await.unwrap(),
-            CasOutcome::Mismatch { current: Some(RefValue { version: 1, .. }) }
-        ), "{label}");
-        assert!(matches!(s.cas_ref(repo, b"main", RefExpect::Version(7), Some(b), log()).await.unwrap(), CasOutcome::Mismatch { .. }));
-        assert_eq!(s.cas_ref(repo, b"main", RefExpect::Target(a), Some(b), log()).await.unwrap(), CasOutcome::Updated { version: 2 });
+            s.cas_ref(repo, b"main", RefExpect::Version(7), Some(b), log()).await.unwrap(),
+            CasOutcome::Mismatch { .. }
+        ));
+        assert_eq!(
+            s.cas_ref(repo, b"main", RefExpect::Target(a), Some(b), log()).await.unwrap(),
+            CasOutcome::Updated { version: 2 }
+        );
         assert_eq!(s.get_ref(repo, b"main").await.unwrap(), Some(RefValue { target: b, version: 2 }));
 
         s.cas_ref(repo, b"scratch/x", RefExpect::Absent, Some(a), log()).await.unwrap();
@@ -106,10 +118,13 @@ async fn concurrent_cas_is_linearizable() {
         for i in 0..16u8 {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
-                s.cas_ref(repo, b"main", RefExpect::Version(1), Some(ChangesetId::hash(&[i])), RefLogEntry {
-                    actor: "t".into(),
-                    reason: "race".into(),
-                })
+                s.cas_ref(
+                    repo,
+                    b"main",
+                    RefExpect::Version(1),
+                    Some(ChangesetId::hash(&[i])),
+                    RefLogEntry { actor: "t".into(), reason: "race".into() },
+                )
                 .await
                 .unwrap()
             }));

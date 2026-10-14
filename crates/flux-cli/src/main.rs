@@ -83,16 +83,16 @@ enum Cmd {
     },
     /// Discard working-copy changes to paths (restores the parent's version).
     Revert { paths: Vec<String> },
-    /// Show history.
+    /// Show history (optionally of one file or directory).
     Log {
-        #[arg(default_value = "@")]
+        /// Only changesets that modified this path.
+        path: Option<String>,
+        #[arg(short, long, default_value = "@")]
         rev: String,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: u32,
         #[arg(long)]
         first_parent: bool,
-        /// Only changesets touching this path.
-        path: Option<String>,
         /// Hide changesets reachable from this revision (log BASE..REV).
         #[arg(long)]
         since: Option<String>,
@@ -228,7 +228,9 @@ enum ReviewCmd {
         state: String,
     },
     /// Show a review with its timeline and stack.
-    Show { number: i64 },
+    Show {
+        number: i64,
+    },
     /// Comment on a review.
     Comment {
         number: i64,
@@ -248,16 +250,24 @@ enum ReviewCmd {
         head: String,
     },
     /// Land a review.
-    Land { number: i64 },
-    Close { number: i64 },
-    Reopen { number: i64 },
+    Land {
+        number: i64,
+    },
+    Close {
+        number: i64,
+    },
+    Reopen {
+        number: i64,
+    },
 }
 
 #[derive(Subcommand)]
 enum SparseCmd {
     Show,
     /// Replace the profile (no prefixes = full checkout) and reconcile.
-    Set { prefixes: Vec<String> },
+    Set {
+        prefixes: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -408,7 +418,11 @@ async fn run(cli: Cli) -> Result<()> {
             let client = connect(&server, repo).await?;
             let mut wc = WorkingCopy::init(
                 &dir,
-                Config { server: server.clone(), repo: repo.clone(), sparse: sparse.iter().map(|s| s.trim_matches('/').to_string()).collect() },
+                Config {
+                    server: server.clone(),
+                    repo: repo.clone(),
+                    sparse: sparse.iter().map(|s| s.trim_matches('/').to_string()).collect(),
+                },
             )?;
             let rev = match rev {
                 Some(r) => Some(r.clone()),
@@ -610,13 +624,22 @@ async fn run(cli: Cli) -> Result<()> {
                 let id = ChangesetId::from_slice(&r.target)?;
                 let name = String::from_utf8_lossy(&r.name).into_owned();
                 let mark = if current.as_deref() == Some(name.as_str()) { "*" } else { " " };
-                println!("{mark} {}  {}", st.yellow(&id.short()), if mark == "*" { st.bold(&st.cyan(&name)) } else { st.cyan(&name) });
+                println!(
+                    "{mark} {}  {}",
+                    st.yellow(&id.short()),
+                    if mark == "*" { st.bold(&st.cyan(&name)) } else { st.cyan(&name) }
+                );
             }
         }
         Cmd::Branch { name, rev, delete } => {
             let client = client_for(&cli, wc.as_ref()).await?;
             if *delete {
-                let cur = client.list_refs(name.as_bytes()).await?.into_iter().find(|r| r.name == name.as_bytes()).context("no such branch")?;
+                let cur = client
+                    .list_refs(name.as_bytes())
+                    .await?
+                    .into_iter()
+                    .find(|r| r.name == name.as_bytes())
+                    .context("no such branch")?;
                 if !client.update_ref(name, Expect::Version(cur.version), None, "flux branch -d").await? {
                     bail!("{name} moved concurrently; retry");
                 }
@@ -651,7 +674,11 @@ async fn run(cli: Cli) -> Result<()> {
                         let cur_id = ChangesetId::from_slice(&cur.target)?;
                         let a = client.ancestry(&cur_id.to_hex(), &target.id.to_hex()).await?;
                         if !a.a_is_ancestor_of_b {
-                            bail!("{name} ({}) is not an ancestor of {}; use --force or `flux land`", cur_id.short(), target.id.short());
+                            bail!(
+                                "{name} ({}) is not an ancestor of {}; use --force or `flux land`",
+                                cur_id.short(),
+                                target.id.short()
+                            );
                         }
                         Expect::Version(cur.version)
                     }
@@ -670,7 +697,12 @@ async fn run(cli: Cli) -> Result<()> {
             let r = client.land(&rev, onto, "flux land").await?;
             let head = ChangesetId::from_slice(&r.new_head)?;
             if r.fast_forward {
-                println!("landed on {} by fast-forward: {} ({:.0} ms)", st.cyan(onto), st.yellow(&head.short()), started.elapsed().as_secs_f64() * 1000.0);
+                println!(
+                    "landed on {} by fast-forward: {} ({:.0} ms)",
+                    st.cyan(onto),
+                    st.yellow(&head.short()),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
             } else {
                 println!(
                     "landed {} changeset(s) on {} by server-side rebase{}: {} ({:.0} ms)",
@@ -718,7 +750,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Repo { cmd } => {
-            let server = cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("--server required")?;
+            let server =
+                cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("--server required")?;
             let client = connect(&server, "").await?;
             match cmd {
                 RepoCmd::Create { name } => {
@@ -734,7 +767,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Login { server, token } => {
             let server = normalize_server(
-                &server.clone().or_else(|| cli.server.clone()).or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("which server?")?,
+                &server
+                    .clone()
+                    .or_else(|| cli.server.clone())
+                    .or_else(|| wc.as_ref().map(|w| w.config.server.clone()))
+                    .context("which server?")?,
             );
             let token = match token {
                 Some(t) => t.clone(),
@@ -756,7 +793,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Logout { server } => {
             let server = normalize_server(
-                &server.clone().or_else(|| cli.server.clone()).or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("which server?")?,
+                &server
+                    .clone()
+                    .or_else(|| cli.server.clone())
+                    .or_else(|| wc.as_ref().map(|w| w.config.server.clone()))
+                    .context("which server?")?,
             );
             let mut creds = load_credentials();
             creds.remove(&server);
@@ -790,7 +831,9 @@ async fn run(cli: Cli) -> Result<()> {
                         st.yellow(&short(&e.old)),
                         st.yellow(&short(&e.new))
                     ),
-                    "changesets" => println!("{} {} new changeset(s), latest {}", st.dim(&e.repo), e.count, st.yellow(&short(&e.new))),
+                    "changesets" => {
+                        println!("{} {} new changeset(s), latest {}", st.dim(&e.repo), e.count, st.yellow(&short(&e.new)))
+                    }
                     "review" => println!("{} review #{} {}", st.dim(&e.repo), e.review, e.detail),
                     other => println!("{} {other}", st.dim(&e.repo)),
                 }
@@ -984,16 +1027,31 @@ async fn checkout(client: &Client, wc: &mut WorkingCopy, rev: &str, force: bool)
     }
     let ids: Vec<ContentId> = wanted.keys().copied().collect();
     let mut written: Vec<(RepoPath, Entry)> = Vec::new();
+    // Buffer fetched contents and write them in parallel batches.
+    const BATCH_BYTES: usize = 64 << 20;
+    let mut batch: Vec<(RepoPath, Kind, Vec<u8>)> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let flush = |batch: &mut Vec<(RepoPath, Kind, Vec<u8>)>, written: &mut Vec<(RepoPath, Entry)>| -> Result<()> {
+        for (path, md) in wc.write_files(std::mem::take(batch))? {
+            let t = &target[&path];
+            written.push((path, Entry { kind: t.kind, id: t.id, size: t.size, mtime_ns: mtime_ns(&md) }));
+        }
+        Ok(())
+    };
     client
         .get_contents(&ids, |cid, data| {
             for path in &wanted[&cid] {
-                let t = &target[path];
-                let md = wc.write_file(path, t.kind, &data)?;
-                written.push((path.clone(), Entry { kind: t.kind, id: t.id, size: t.size, mtime_ns: mtime_ns(&md) }));
+                batch_bytes += data.len();
+                batch.push((path.clone(), target[path].kind, data.clone()));
+            }
+            if batch_bytes >= BATCH_BYTES {
+                flush(&mut batch, &mut written)?;
+                batch_bytes = 0;
             }
             Ok(())
         })
         .await?;
+    flush(&mut batch, &mut written)?;
     for path in gitlinks {
         let t = &target[&path];
         let md = wc.write_file(&path, Kind::GitLink, &[])?;
@@ -1190,7 +1248,12 @@ async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool,
                 let md = std::fs::symlink_metadata(wc.fs_path(&e.path))?;
                 wc.state.files.insert(
                     e.path.clone(),
-                    Entry { kind: *kind, id: *ContentId::hash(data).as_bytes(), size: data.len() as u64, mtime_ns: mtime_ns(&md) },
+                    Entry {
+                        kind: *kind,
+                        id: *ContentId::hash(data).as_bytes(),
+                        size: data.len() as u64,
+                        mtime_ns: mtime_ns(&md),
+                    },
                 );
             }
         }
@@ -1238,7 +1301,12 @@ async fn review(cli: &Cli, wc: Option<WorkingCopy>, cmd: &ReviewCmd, st: &Style)
                     "landed" => st.paint("35", "landed"),
                     _ => st.red("closed"),
                 };
-                println!("{} {badge} {}  {}", st.yellow(&format!("#{:<4}", r.number)), r.title, st.dim(&format!("{} · {}", r.author, ago(r.updated_ms))));
+                println!(
+                    "{} {badge} {}  {}",
+                    st.yellow(&format!("#{:<4}", r.number)),
+                    r.title,
+                    st.dim(&format!("{} · {}", r.author, ago(r.updated_ms)))
+                );
             }
         }
         ReviewCmd::Show { number } => {
@@ -1256,7 +1324,13 @@ async fn review(cli: &Cli, wc: Option<WorkingCopy>, cmd: &ReviewCmd, st: &Style)
             }
             println!("{}", st.bold("timeline"));
             for e in d.events {
-                println!("  {} {} {}{}", st.dim(&ago(e.ts_ms)), st.bold(&e.author), e.kind, if e.body.is_empty() { String::new() } else { format!(": {}", e.body) });
+                println!(
+                    "  {} {} {}{}",
+                    st.dim(&ago(e.ts_ms)),
+                    st.bold(&e.author),
+                    e.kind,
+                    if e.body.is_empty() { String::new() } else { format!(": {}", e.body) }
+                );
             }
             println!("{}", st.dim(&web(r.number)));
         }
@@ -1279,7 +1353,11 @@ async fn review(cli: &Cli, wc: Option<WorkingCopy>, cmd: &ReviewCmd, st: &Style)
             let head = ChangesetId::from_slice(&r.new_head)?;
             println!(
                 "landed #{number}{}: {} ({:.0} ms)",
-                if r.fast_forward { " (fast-forward)".to_string() } else { format!(" (rebased {}, merged {} file(s))", r.rebased.len(), r.merged_files) },
+                if r.fast_forward {
+                    " (fast-forward)".to_string()
+                } else {
+                    format!(" (rebased {}, merged {} file(s))", r.rebased.len(), r.merged_files)
+                },
                 st.yellow(&head.short()),
                 started.elapsed().as_secs_f64() * 1000.0
             );

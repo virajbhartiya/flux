@@ -76,11 +76,7 @@ impl Principal {
     }
 
     pub fn require_write(&self) -> FluxResult<()> {
-        if self.can_write() {
-            Ok(())
-        } else {
-            Err(FluxError::Unauthenticated("writes require a token (flux login)".into()))
-        }
+        if self.can_write() { Ok(()) } else { Err(FluxError::Unauthenticated("writes require a token (flux login)".into())) }
     }
 
     pub fn require_admin(&self) -> FluxResult<()> {

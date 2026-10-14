@@ -51,11 +51,7 @@ fn entry_info(e: &flux_core::TreeEntry) -> TreeEntryInfo {
     }
 }
 
-async fn send_content(
-    flux: &Flux,
-    id: ContentId,
-    tx: &mpsc::Sender<Result<ContentFrame, Status>>,
-) -> Result<bool, Status> {
+async fn send_content(flux: &Flux, id: ContentId, tx: &mpsc::Sender<Result<ContentFrame, Status>>) -> Result<bool, Status> {
     let layout = flux
         .blobs
         .content_layout(&id)
@@ -74,14 +70,24 @@ async fn send_content(
     for part in parts {
         let data = match (&layout, part) {
             (ContentLayout::Whole(b), _) => b.clone(),
-            (_, Some(c)) => flux.blobs.get_chunk(&c).await.map_err(FluxError::from)?.ok_or_else(|| Status::internal(format!("chunk {c} missing")))?,
+            (_, Some(c)) => flux
+                .blobs
+                .get_chunk(&c)
+                .await
+                .map_err(FluxError::from)?
+                .ok_or_else(|| Status::internal(format!("chunk {c} missing")))?,
             _ => unreachable!(),
         };
         let mut pos = 0usize;
         loop {
             let end = (pos + FRAME_BYTES).min(data.len());
             let last = offset + end as u64 == total;
-            let frame = ContentFrame { content_id: id.as_bytes().to_vec(), offset: offset + pos as u64, data: data.slice(pos..end), last };
+            let frame = ContentFrame {
+                content_id: id.as_bytes().to_vec(),
+                offset: offset + pos as u64,
+                data: data.slice(pos..end),
+                last,
+            };
             if tx.send(Ok(frame)).await.is_err() {
                 return Ok(false); // client went away
             }
@@ -269,10 +275,7 @@ impl repo_service_server::RepoService for Services {
         }))
     }
 
-    async fn get_changesets(
-        &self,
-        req: Request<GetChangesetsRequest>,
-    ) -> Result<Response<Self::GetChangesetsStream>, Status> {
+    async fn get_changesets(&self, req: Request<GetChangesetsRequest>) -> Result<Response<Self::GetChangesetsStream>, Status> {
         let principal = self.who(&req).await?;
         principal.require_read()?;
         let req = req.into_inner();
@@ -340,7 +343,8 @@ impl repo_service_server::RepoService for Services {
                 None => return Err(Status::not_found(format!("{p} not found"))),
             },
         };
-        let tree = self.flux.blobs.get_tree(&dir).await.map_err(FluxError::from)?.ok_or_else(|| Status::internal("missing tree"))?;
+        let tree =
+            self.flux.blobs.get_tree(&dir).await.map_err(FluxError::from)?.ok_or_else(|| Status::internal("missing tree"))?;
         Ok(Response::new(ListDirResponse {
             tree_id: dir.as_bytes().to_vec(),
             entries: tree.entries().iter().map(entry_info).collect(),
@@ -391,7 +395,9 @@ impl repo_service_server::RepoService for Services {
         };
         let out: Vec<Result<DiffEntry, Status>> = entries
             .iter()
-            .map(|e| Ok(DiffEntry { path: e.path.as_bytes().to_vec(), old: e.old.as_ref().map(to_pb), new: e.new.as_ref().map(to_pb) }))
+            .map(|e| {
+                Ok(DiffEntry { path: e.path.as_bytes().to_vec(), old: e.old.as_ref().map(to_pb), new: e.new.as_ref().map(to_pb) })
+            })
             .collect();
         Ok(Response::new(Box::pin(futures::stream::iter(out))))
     }
@@ -428,7 +434,11 @@ impl repo_service_server::RepoService for Services {
             ranges: blame
                 .ranges
                 .iter()
-                .map(|(start, count, cs)| BlameRange { start_line: *start, line_count: *count, changeset_id: cs.as_bytes().to_vec() })
+                .map(|(start, count, cs)| BlameRange {
+                    start_line: *start,
+                    line_count: *count,
+                    changeset_id: cs.as_bytes().to_vec(),
+                })
                 .collect(),
             changesets: self.flux.infos(repo, &loaded).await?,
         }))
@@ -458,8 +468,7 @@ impl repo_service_server::RepoService for Services {
         let root = self.flux.root_tree(repo, &id).await?;
         let prefix = opt_repo_path(&req.path_prefix)?;
         let limit = if req.limit == 0 { 500 } else { req.limit.min(10_000) as usize };
-        let result =
-            self.flux.search(repo, root, &req.pattern, req.regex, req.case_insensitive, prefix.as_ref(), limit).await?;
+        let result = self.flux.search(repo, root, &req.pattern, req.regex, req.case_insensitive, prefix.as_ref(), limit).await?;
         let out: Vec<Result<SearchMatch, Status>> = result
             .hits
             .into_iter()
@@ -516,7 +525,11 @@ const UPLOAD_BATCH_BYTES: usize = 64 << 20;
 /// A content being received.
 #[allow(clippy::large_enum_variant)] // one per upload stream
 enum Incoming {
-    Small { expected: ContentId, base: Option<ContentId>, buf: Vec<u8> },
+    Small {
+        expected: ContentId,
+        base: Option<ContentId>,
+        buf: Vec<u8>,
+    },
     Large {
         expected: ContentId,
         size: u64,
@@ -528,7 +541,10 @@ enum Incoming {
 }
 
 impl Services {
-    async fn store_batch(&self, batch: Vec<(ContentId, bytes::Bytes, Option<ContentId>)>) -> Result<Vec<ContentMetaResult>, Status> {
+    async fn store_batch(
+        &self,
+        batch: Vec<(ContentId, bytes::Bytes, Option<ContentId>)>,
+    ) -> Result<Vec<ContentMetaResult>, Status> {
         if batch.is_empty() {
             return Ok(vec![]);
         }
@@ -680,7 +696,8 @@ impl write_service_server::WriteService for Services {
         };
         let new = if req.new_target.is_empty() { None } else { Some(cs_id(&req.new_target)?) };
         let (outcome, current) = self.flux.update_ref(repo, &req.name, expect, new, principal.name(), req.reason).await?;
-        let current = current.map(|c| RefEntry { name: req.name.clone(), target: c.target.as_bytes().to_vec(), version: c.version });
+        let current =
+            current.map(|c| RefEntry { name: req.name.clone(), target: c.target.as_bytes().to_vec(), version: c.version });
         Ok(Response::new(match outcome {
             CasOutcome::Updated { version } => UpdateRefResponse { updated: true, version, current: None },
             CasOutcome::Deleted => UpdateRefResponse { updated: true, version: 0, current: None },
@@ -695,7 +712,8 @@ impl write_service_server::WriteService for Services {
         let repo = self.flux.repo(&req.repo).await?;
         let mut entries = Vec::with_capacity(req.mappings.len());
         for m in &req.mappings {
-            let sha: [u8; 20] = m.git_sha1.as_slice().try_into().map_err(|_| Status::invalid_argument("git_sha1 must be 20 bytes"))?;
+            let sha: [u8; 20] =
+                m.git_sha1.as_slice().try_into().map_err(|_| Status::invalid_argument("git_sha1 must be 20 bytes"))?;
             entries.push((cs_id(&m.changeset_id)?, sha));
         }
         let ids: Vec<ChangesetId> = entries.iter().map(|e| e.0).collect();
@@ -744,7 +762,6 @@ impl admin_service_server::AdminService for Services {
         Ok(Response::new(ListReposResponse { repos: repos.into_iter().map(|r| v1::RepoInfo { name: r.name }).collect() }))
     }
 }
-
 
 // ───────────────────────────── ReviewService ─────────────────────────────
 

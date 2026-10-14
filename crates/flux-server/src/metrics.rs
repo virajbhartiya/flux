@@ -46,7 +46,9 @@ pub fn observe(grpc: bool, started: Instant, error: bool) {
 }
 
 pub fn render() -> String {
-    let mut out = String::from("# TYPE flux_requests_total counter\n# TYPE flux_request_errors_total counter\n# TYPE flux_request_duration_ms histogram\n");
+    let mut out = String::from(
+        "# TYPE flux_requests_total counter\n# TYPE flux_request_errors_total counter\n# TYPE flux_request_duration_ms histogram\n",
+    );
     for (name, h) in [("grpc", &GRPC), ("web", &WEB)] {
         out.push_str(&format!("flux_requests_total{{surface=\"{name}\"}} {}\n", h.count.load(Ordering::Relaxed)));
         out.push_str(&format!("flux_request_errors_total{{surface=\"{name}\"}} {}\n", h.errors.load(Ordering::Relaxed)));
@@ -56,8 +58,14 @@ pub fn render() -> String {
                 h.buckets[i].load(Ordering::Relaxed)
             ));
         }
-        out.push_str(&format!("flux_request_duration_ms_bucket{{surface=\"{name}\",le=\"+Inf\"}} {}\n", h.count.load(Ordering::Relaxed)));
-        out.push_str(&format!("flux_request_duration_ms_sum{{surface=\"{name}\"}} {}\n", h.sum_us.load(Ordering::Relaxed) as f64 / 1000.0));
+        out.push_str(&format!(
+            "flux_request_duration_ms_bucket{{surface=\"{name}\",le=\"+Inf\"}} {}\n",
+            h.count.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "flux_request_duration_ms_sum{{surface=\"{name}\"}} {}\n",
+            h.sum_us.load(Ordering::Relaxed) as f64 / 1000.0
+        ));
         out.push_str(&format!("flux_request_duration_ms_count{{surface=\"{name}\"}} {}\n", h.count.load(Ordering::Relaxed)));
     }
     out

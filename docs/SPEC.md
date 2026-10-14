@@ -805,17 +805,32 @@ flux/
 - Codec golden vectors pass on Linux, macOS and Windows.
 - `CreateChangeset` p99 < 100 ms (Postgres, 100 changes).
 
-**Implementation notes (phase 1, 2026-10-14).** Where the code differs from the spec above:
-- **Git import** uses git's own plumbing (one long-running `cat-file --batch` and one streaming `diff-tree --stdin`) instead of `gix`. Git therefore decides what the history contains, including legacy objects. Switching to `gix` remains an option for speed.
-- **`CreateChangesets` batch RPC (added).** Changesets are applied in order, and later ones may name earlier ones as parents. Each batch gets one content check, one concurrent tree flush (through `TreeWriter`) and one metadata transaction. The importer uses it.
-- **Fast local blob backend.** `file://` blob URLs use a dedicated local backend (temp file + rename, cached fan-out directories) rather than `object_store::LocalFileSystem`.
-- **CLI dirstate** is JSON (`.flux/state.json`). The SQLite dirstate and the filesystem-watcher journal come with fluxd in phase 2.
+**Implementation notes (2026-10-14).** What is built, and where it differs from the spec above:
+- **Git import** uses git's own plumbing (one long-running `cat-file --batch` and one streaming `diff-tree --stdin`) instead of `gix`, in a three-stage pipeline (git reader thread → uploader → creator). It sends delta hints (the previous version of each path). git.git imports at about 1,170 changesets/s on SQLite or Postgres.
+- **`CreateChangesets` batch RPC (added).** Changesets are applied in order and may name earlier batch members as parents. A batch gets one content check, one tree flush, parallel merge checks and one metadata transaction.
+- **`FileChange::Retain` (added, encoding tag `[2]`).** Valid only in merges. It lists a path where the parents disagree and the resolution is `parents[0]`'s value, which satisfies the merge-completeness rule (§3.3, enforced) without repeating content ids. git.git merges list thousands of such paths, so this keeps metadata about 4x smaller. Changeset bodies are also zstd-compressed at rest.
+- **Blob storage (§5.2).**
+  - `file://` uses an append-only segment store: CRC-checked records, sealed segments with a git-pack-style index, torn tails truncated on open.
+  - Objects may be stored as zstd deltas against a hinted base (codec 3; the chain depth sits in the `dict_id` field and is capped at 16 for trees and 10 for content).
+  - Content over 4 MiB is FastCDC-chunked behind a manifest (codec 4) and streamed on upload and download.
+  - Trained dictionaries (§5.3) are not implemented.
+- **Derived data.**
+  - `lastmod_v1` (type 2) plays the role of `pathhist_v1`. It is a tree-shaped index of the changeset that last modified each entry, derived incrementally in the background. It powers per-entry last commits, file and directory history and blame (computed on demand and cached).
+  - Skip lists are replaced by an in-memory commit graph per repository (dense indices, about 60 B per changeset), which answers log, ancestry, merge-base and ahead/behind queries.
+- **Landing (§7.3, §11).** `Land` and reviews are implemented as a synchronous server-side rebase with line-level three-way merges (`diffy`). Landing retries the compare-and-swap on contention. There is no separate lander service or batching yet.
+- **Auth (§12).** Bearer tokens (SHA-256 at rest) with `open`, `token` and `private` modes. OIDC and path ACL domains are not implemented.
+- **Tiers (§9).** `flux-server cache` is the regional cache. There is no fluxd; the CLI talks to a server or cache directly.
+- **CLI dirstate** is a checksummed binary file (`.flux/dirstate`). Status is parallel and honours `.gitignore`/`.fluxignore`.
+- **Web UI and events (added).** A server-rendered web UI and `EventService` (gRPC streaming plus server-sent events) share the gRPC port.
+- **Operations.** `fsck`, online `backup`, Prometheus metrics, health checks and graceful shutdown.
 - **Not yet implemented:**
-  - authentication and ACLs (§12);
-  - the merge-completeness check (§3.3);
-  - chunking of contents over 4 MiB (§3.2). Uploads are single-object, up to 512 MiB.
-  - `copy_from` source validation;
-  - Windows support in the CLI.
+  - fluxd and the VFS;
+  - the git smart-HTTP frontend and mirror;
+  - path ACL domains;
+  - admission control;
+  - `changed_dirs_v1`;
+  - the simulation harness;
+  - Windows (untested).
 
 ### Phase 2: Scale tier
 **Scope:**

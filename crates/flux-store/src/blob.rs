@@ -234,10 +234,8 @@ impl BlobStore {
             }
             "memory" => Backend::Object { store: Arc::new(object_store::memory::InMemory::new()), namespace: String::new() },
             _ => {
-                let opts: Vec<(String, String)> = std::env::vars()
-                    .filter(|(k, _)| k.starts_with("AWS_"))
-                    .map(|(k, v)| (k.to_ascii_lowercase(), v))
-                    .collect();
+                let opts: Vec<(String, String)> =
+                    std::env::vars().filter(|(k, _)| k.starts_with("AWS_")).map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
                 let (store, path) = object_store::parse_url_opts(&parsed, opts)?;
                 Backend::Object { store: Arc::from(store), namespace: path.to_string() }
             }
@@ -283,7 +281,9 @@ impl BlobStore {
                 let st = s.snapshot_to(dest)?;
                 Ok(BlobStats { objects: st.objects, bytes: st.bytes })
             }
-            Backend::Object { .. } => anyhow::bail!("blob snapshots are only supported for file:// stores; use bucket versioning or replication"),
+            Backend::Object { .. } => {
+                anyhow::bail!("blob snapshots are only supported for file:// stores; use bucket versioning or replication")
+            }
         }
     }
 
@@ -519,7 +519,13 @@ impl BlobStore {
         let index: HashMap<[u8; 32], usize> = todo.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
         let mut planned: Vec<Option<u16>> = vec![None; todo.len()];
         let mut bases: Vec<Option<([u8; 32], u16, Bytes)>> = vec![None; todo.len()];
-        fn plan(i: usize, todo: &[PutObject], index: &HashMap<[u8; 32], usize>, planned: &mut [Option<u16>], guard: usize) -> Option<u16> {
+        fn plan(
+            i: usize,
+            todo: &[PutObject],
+            index: &HashMap<[u8; 32], usize>,
+            planned: &mut [Option<u16>],
+            guard: usize,
+        ) -> Option<u16> {
             if let Some(d) = planned[i] {
                 return Some(d);
             }
@@ -658,7 +664,12 @@ impl BlobStore {
                     self.put_chunked(id, data).await?;
                 }
             } else {
-                objects.push(PutObject { kind: ObjectKind::Content, id: *id.as_bytes(), data, base: base.map(|b| *b.as_bytes()) });
+                objects.push(PutObject {
+                    kind: ObjectKind::Content,
+                    id: *id.as_bytes(),
+                    data,
+                    base: base.map(|b| *b.as_bytes()),
+                });
             }
         }
         self.put_objects(objects).await?;
@@ -702,7 +713,10 @@ impl BlobStore {
         if h.codec != ObjectCodec::Manifest {
             return Ok(self.get_content_bytes(id).await?.map(ContentLayout::Whole));
         }
-        let raw = self.backend_get(ObjectKind::Content, id.as_bytes()).await?.ok_or_else(|| StoreError::Corrupt("manifest vanished".into()))?;
+        let raw = self
+            .backend_get(ObjectKind::Content, id.as_bytes())
+            .await?
+            .ok_or_else(|| StoreError::Corrupt("manifest vanished".into()))?;
         Ok(Some(ContentLayout::Chunked { size: h.len, chunks: parse_manifest(&raw[HEADER_LEN..])? }))
     }
 
@@ -724,7 +738,12 @@ impl BlobStore {
             if self.inner.trees.contains_key(&id) {
                 continue;
             }
-            objects.push(PutObject { kind: ObjectKind::Tree, id: *id.as_bytes(), data: Bytes::from(bytes), base: base.map(|b| *b.as_bytes()) });
+            objects.push(PutObject {
+                kind: ObjectKind::Tree,
+                id: *id.as_bytes(),
+                data: Bytes::from(bytes),
+                base: base.map(|b| *b.as_bytes()),
+            });
             self.inner.trees.insert(id, tree).await;
         }
         self.put_objects(objects).await?;
@@ -739,7 +758,12 @@ impl BlobStore {
             if self.inner.trees.contains_key(&id) && self.exists(ObjectKind::Tree, id.as_bytes()).await? {
                 continue;
             }
-            objects.push(PutObject { kind: ObjectKind::Tree, id: *id.as_bytes(), data: bytes, base: base.map(|b| *b.as_bytes()) });
+            objects.push(PutObject {
+                kind: ObjectKind::Tree,
+                id: *id.as_bytes(),
+                data: bytes,
+                base: base.map(|b| *b.as_bytes()),
+            });
             self.inner.trees.insert(id, tree).await;
         }
         self.put_objects(objects).await
@@ -769,8 +793,8 @@ impl BlobStore {
 
 /// Decompressing more than a few MiB inline would stall the reactor.
 fn block_in_place_if_large<R>(len: usize, f: impl FnOnce() -> R) -> R {
-    let multi = tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let multi =
+        tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     if len > (1 << 20) && multi { tokio::task::block_in_place(f) } else { f() }
 }
 

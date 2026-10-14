@@ -15,7 +15,9 @@ use serde::Deserialize;
 
 use super::diff::{FileDiff, LineKind, diff_text, is_binary};
 use super::markdown::{self, LinkBase};
-use super::view::{self, RepoNav, Tab, avatar, breadcrumbs, empty_state, enc, enc_path, icon, page, person, short, subject, time, url};
+use super::view::{
+    self, RepoNav, Tab, avatar, breadcrumbs, empty_state, enc, enc_path, icon, page, person, short, subject, time, url,
+};
 use super::{COOKIE, Req, WebError, WebResult, WebState};
 use crate::core::{Flux, Loaded};
 
@@ -47,13 +49,15 @@ fn percent_decode(s: &str, plus_is_space: bool) -> Vec<u8> {
     while i < b.len() {
         match b[i] {
             b'+' if plus_is_space => out.push(b' '),
-            b'%' if i + 3 <= b.len() => match std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                Some(v) => {
-                    out.push(v);
-                    i += 2;
+            b'%' if i + 3 <= b.len() => {
+                match std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(v) => {
+                        out.push(v);
+                        i += 2;
+                    }
+                    None => out.push(b'%'),
                 }
-                None => out.push(b'%'),
-            },
+            }
             c => out.push(c),
         }
         i += 1;
@@ -139,9 +143,8 @@ fn path_from(segs: &[String]) -> WebResult<Option<RepoPath>> {
 /// The lastmod root if already derived; otherwise kick off derivation in
 /// the background and return `None` (pages render without it).
 async fn lastmod_ready(flux: &Arc<Flux>, repo: RepoId, cs: &ChangesetId) -> Option<DerivedId> {
-    let v = flux.meta.get_derived(repo, LASTMOD_V1, std::slice::from_ref(cs)).await.ok()?.pop().flatten();
-    match v {
-        Some(v) => DerivedId::from_slice(&v).ok(),
+    match flux.derived_get(repo, LASTMOD_V1, cs).await.ok()? {
+        Some(v) => Some(DerivedId::from_bytes(v)),
         None => {
             let (f, c) = (flux.clone(), *cs);
             tokio::spawn(async move {
@@ -164,7 +167,11 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
     let mut cards = Vec::new();
     for r in &repos {
         let refs = web.flux.meta.list_refs(r.id, b"", 1000).await?;
-        let head = refs.iter().find(|(n, _)| n == b"main").or_else(|| refs.first()).map(|(n, v)| (String::from_utf8_lossy(n).into_owned(), v.target));
+        let head = refs
+            .iter()
+            .find(|(n, _)| n == b"main")
+            .or_else(|| refs.first())
+            .map(|(n, v)| (String::from_utf8_lossy(n).into_owned(), v.target));
         let latest = match &head {
             Some((_, id)) => web.flux.load_one_arc(r.id, id).await.ok(),
             None => None,
@@ -241,7 +248,7 @@ pub async fn login_form(State(web): State<WebState>, req: Req) -> WebResult {
         div.container.narrow {
             div.card.login {
                 h1 { "Sign in to flux" }
-                p.muted { "Paste an access token. An admin can create one with " code { "flux-server token create --user NAME" } "." }
+                p.muted { "Paste an access token. An admin can create one with " code { "flux-server token --user NAME" } "." }
                 form method="post" action="/-/login" {
                     input type="hidden" name="next" value=(next);
                     label { "Token" input type="password" name="token" placeholder="flx_…" autofocus required autocomplete="current-password"; }
@@ -277,7 +284,8 @@ pub async fn login(State(web): State<WebState>, headers: HeaderMap, Form(f): For
 pub async fn logout(headers: HeaderMap) -> WebResult {
     check_origin(&headers)?;
     let mut r = Redirect::to("/").into_response();
-    r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("flux_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
+    r.headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_static("flux_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
     Ok(r)
 }
 
@@ -470,14 +478,10 @@ async fn tree(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Option<
         flux.load_arc(ctx.id, &want).await?.into_iter().flatten().map(|l| (l.id, l)).collect();
     let mut entries: Vec<&TreeEntry> = t.entries().iter().collect();
     entries.sort_by_key(|e| (!e.is_dir(), e.name.as_bytes().to_ascii_lowercase()));
-    let readme = t
-        .entries()
-        .iter()
-        .filter(|e| !e.is_dir())
-        .find(|e| {
-            let n = String::from_utf8_lossy(e.name.as_bytes()).to_ascii_lowercase();
-            matches!(n.as_str(), "readme.md" | "readme.markdown" | "readme" | "readme.txt" | "readme.rst")
-        });
+    let readme = t.entries().iter().filter(|e| !e.is_dir()).find(|e| {
+        let n = String::from_utf8_lossy(e.name.as_bytes()).to_ascii_lowercase();
+        matches!(n.as_str(), "readme.md" | "readme.markdown" | "readme" | "readme.txt" | "readme.rst")
+    });
     let readme_html = match readme.and_then(|e| e.content_id().map(|c| (e, c))) {
         Some((e, cid)) if e.size <= 512 * 1024 => {
             let data = flux.blobs.get_content_bytes(&cid).await?.unwrap_or_default();
@@ -623,6 +627,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
     let history_url = url(&ctx.name, "commits", rev, Some(path));
     let raw_url = url(&ctx.name, "raw", rev, Some(path));
     let content_block: Markup;
+    let mut hl_pending = false;
     let mut info: Vec<String> = Vec::new();
     match (entry.file_kind(), entry.content_id()) {
         (Some(FileKind::GitLink(sha)), _) => {
@@ -659,7 +664,8 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                     let out = markdown::render(&text, Some(&LinkBase { blob: &blob_base, raw: &raw_base, dir: &dir_s }));
                     content_block = html! { article.markdown.padded { (PreEscaped(out)) } };
                 } else {
-                    let hl = web.hl.lines(cid, &path.to_string(), &text);
+                    let (hl, pending) = highlight_bounded(web, cid, &path.to_string(), &text).await;
+                    hl_pending = pending;
                     if let Some(lang) = web.hl.language(&path.to_string(), &text) {
                         info.push(lang);
                     }
@@ -702,10 +708,29 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                 }
                 (content_block)
             }
+            @if hl_pending { div.hl-pending hidden {} }
         }
     };
     let n = nav(web, ctx, Tab::Code, rev).await;
     Ok(page(web, req, &format!("{path} at {} · {}", rev_label(rev), ctx.name), Some(n), body))
+}
+
+/// Highlight within a small time budget. Large files keep highlighting in
+/// the background (the result is cached by content id); the page renders
+/// plain text now and the client swaps in the highlighted version.
+async fn highlight_bounded(web: &WebState, id: flux_core::ContentId, path: &str, text: &str) -> (Option<Arc<Vec<String>>>, bool) {
+    if let Some(v) = web.hl.cached(id, path, text) {
+        return (Some(v), false);
+    }
+    if !web.hl.has_grammar(path, text) {
+        return (None, false);
+    }
+    let (w, p, t) = (web.clone(), path.to_string(), text.to_string());
+    let task = tokio::task::spawn_blocking(move || w.hl.lines(id, &p, &t));
+    match tokio::time::timeout(std::time::Duration::from_millis(50), task).await {
+        Ok(Ok(v)) => (v, false),
+        _ => (None, true),
+    }
 }
 
 async fn raw(web: &WebState, ctx: &RepoCtx, rev: &str, path: &RepoPath) -> WebResult {
@@ -721,7 +746,10 @@ async fn raw(web: &WebState, ctx: &RepoCtx, rev: &str, path: &RepoPath) -> WebRe
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
     // Repository content must never run as this origin (SVG/HTML XSS).
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"),
+    );
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert(header::ETAG, HeaderValue::from_str(&format!("\"{}\"", cid.to_hex())).unwrap());
     let immutable = rev == cs.to_hex();
@@ -755,14 +783,12 @@ async fn blame(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoP
     if plain.len() > 1 && plain.last() == Some(&"") {
         plain.pop();
     }
-    let hl = web.hl.lines(cid, &path.to_string(), &text);
+    let (hl, hl_pending) = highlight_bounded(web, cid, &path.to_string(), &text).await;
     let mut gutter: Vec<Markup> = vec![html! { td.bl {} }; plain.len()];
     for (start, count, id) in &b.ranges {
         let l = loaded.get(id);
         let age = l
-            .map(|l| {
-                if max_t > min_t { ((l.changeset.author_time.unix_ms - min_t) * 9 / (max_t - min_t)) as u32 } else { 9 }
-            })
+            .map(|l| if max_t > min_t { ((l.changeset.author_time.unix_ms - min_t) * 9 / (max_t - min_t)) as u32 } else { 9 })
             .unwrap_or(0);
         for k in 0..*count {
             let i = (*start + k) as usize;
@@ -802,6 +828,7 @@ async fn blame(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoP
                     None => (code_table(&[], false, &plain, Some(&gutter))),
                 }
             }
+            @if hl_pending { div.hl-pending hidden {} }
         }
     };
     let n = nav(web, ctx, Tab::Code, rev).await;
@@ -914,7 +941,8 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
         })
         .collect();
     use futures::StreamExt;
-    let fetched: Vec<Result<(Fetched, Fetched), flux_store::StoreError>> = futures::stream::iter(futs).buffered(32).collect().await;
+    let fetched: Vec<Result<(Fetched, Fetched), flux_store::StoreError>> =
+        futures::stream::iter(futs).buffered(32).collect().await;
     let mut budget = DIFF_LINE_BUDGET;
     let mut out = Vec::with_capacity(entries.len());
     for (i, e) in entries.into_iter().enumerate() {
@@ -923,13 +951,15 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
             (Some(_), None) => "deleted",
             _ => "modified",
         };
-        let mut rf = RenderedFile { path: e.path.clone(), status, old: e.old.clone(), new: e.new.clone(), diff: None, note: None };
+        let mut rf =
+            RenderedFile { path: e.path.clone(), status, old: e.old.clone(), new: e.new.clone(), diff: None, note: None };
         let Some(Ok((a, b))) = fetched.get(i) else {
             rf.note = Some("Too many files; diff not shown.".into());
             out.push(rf);
             continue;
         };
-        let too_big = e.old.as_ref().is_some_and(|f| f.size > MAX_DIFF_FILE) || e.new.as_ref().is_some_and(|f| f.size > MAX_DIFF_FILE);
+        let too_big =
+            e.old.as_ref().is_some_and(|f| f.size > MAX_DIFF_FILE) || e.new.as_ref().is_some_and(|f| f.size > MAX_DIFF_FILE);
         let a_bytes = a.as_ref().map(|x| x.1.clone()).unwrap_or_default();
         let b_bytes = b.as_ref().map(|x| x.1.clone()).unwrap_or_default();
         if too_big {
@@ -1226,10 +1256,15 @@ async fn activity(web: &WebState, req: &Req, ctx: &RepoCtx, before: Option<i64>)
 async fn search(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String, String>) -> WebResult {
     let flux = &web.flux;
     let query = q.get("q").cloned().unwrap_or_default();
-    let rev = q.get("rev").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| ctx.default_branch().unwrap_or("main").to_string());
+    let rev =
+        q.get("rev").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| ctx.default_branch().unwrap_or("main").to_string());
     let regex = q.get("regex").is_some_and(|v| v == "1" || v == "on");
     let case = q.get("case").is_some_and(|v| v == "1" || v == "on");
-    let prefix = q.get("path").filter(|p| !p.trim_matches('/').is_empty()).map(|p| RepoPath::new(p.trim_matches('/').as_bytes())).transpose()
+    let prefix = q
+        .get("path")
+        .filter(|p| !p.trim_matches('/').is_empty())
+        .map(|p| RepoPath::new(p.trim_matches('/').as_bytes()))
+        .transpose()
         .map_err(|e| WebError::BadRequest(e.to_string()))?;
     let started = std::time::Instant::now();
     let result = if query.is_empty() {
@@ -1331,7 +1366,10 @@ async fn files_json(web: &WebState, ctx: &RepoCtx, rev: &str) -> WebResult {
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let immutable = rev == cs.to_hex();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, max-age=5" }));
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if immutable { "private, max-age=31536000, immutable" } else { "private, max-age=5" }),
+    );
     Ok(r)
 }
 
@@ -1479,10 +1517,13 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
     let files = if files_tab {
         let (top, base) = match (r.state.as_str(), r.landed) {
             ("landed", Some(l)) => (l, d.stack.last().and_then(|c| c.changeset.parents.first().copied())),
-            _ => (r.head, match d.target_head {
-                Some(h) => flux.merge_base(ctx.id, &h, &r.head).await?,
-                None => None,
-            }),
+            _ => (
+                r.head,
+                match d.target_head {
+                    Some(h) => flux.merge_base(ctx.id, &h, &r.head).await?,
+                    None => None,
+                },
+            ),
         };
         let old = match base {
             Some(b) => Some(flux.tree_of(ctx.id, &b).await?),
@@ -1562,11 +1603,12 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                             div.card.land-box {
                                 @match status {
                                     Some((true, _, _)) => { div.land-status.ok { (icon("check")) div { strong { "Ready to land" } div.muted.small { "Fast-forward: " (target) " is an ancestor of the head." } } } }
+                                    Some((_, 0, _)) => { div.land-status.ok { (icon("check")) div { strong { "Nothing to land" } div.muted.small { "Every changeset here is already in " (target) ". You can close this review." } } } }
                                     Some((false, ahead, behind)) => { div.land-status.warn { (icon("merge")) div { strong { "Will rebase on land" } div.muted.small { (ahead) " ahead, " (behind) " behind " (target) ". flux re-applies the stack server-side and three-way merges overlapping files; real conflicts are reported." } } } }
                                     None => { div.land-status.ok { (icon("check")) div { strong { "Ready to land" } div.muted.small { (target) " doesn't exist yet; landing creates it." } } } }
                                 }
                                 @if !approvals.is_empty() { div.muted.small { (icon("check")) " Approved by " (approvals.join(", ")) } }
-                                @if can_write {
+                                @if can_write && !matches!(status, Some((_, 0, _))) {
                                     form method="post" action=(format!("{base_url}/land")) {
                                         button.btn.primary.big type="submit" { (icon("merge")) "Land into " (target) }
                                     }
@@ -1618,7 +1660,13 @@ pub struct ReviewForm {
     target: String,
 }
 
-pub async fn repo_post(State(web): State<WebState>, req: Req, headers: HeaderMap, Path(rest): Path<String>, Form(f): Form<ReviewForm>) -> WebResult {
+pub async fn repo_post(
+    State(web): State<WebState>,
+    req: Req,
+    headers: HeaderMap,
+    Path(rest): Path<String>,
+    Form(f): Form<ReviewForm>,
+) -> WebResult {
     check_origin(&headers)?;
     let (repo, segs) = split_repo(&rest);
     let ctx = repo_ctx(&web, &req, &repo).await?;
@@ -1629,7 +1677,11 @@ pub async fn repo_post(State(web): State<WebState>, req: Req, headers: HeaderMap
     match segs.as_slice() {
         ["reviews"] => {
             let head = flux.resolve_rev(ctx.id, f.head.trim()).await?;
-            let target = if f.target.trim().is_empty() { ctx.default_branch().unwrap_or("main").to_string() } else { f.target.trim().to_string() };
+            let target = if f.target.trim().is_empty() {
+                ctx.default_branch().unwrap_or("main").to_string()
+            } else {
+                f.target.trim().to_string()
+            };
             let r = flux.create_review(ctx.id, &f.title, &f.body, &actor, head, target.as_bytes()).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)).into_response())
         }

@@ -123,10 +123,7 @@ impl Tree {
     }
 
     pub fn get(&self, name: &[u8]) -> Option<&TreeEntry> {
-        self.entries
-            .binary_search_by(|e| e.name.as_bytes().cmp(name))
-            .ok()
-            .map(|i| &self.entries[i])
+        self.entries.binary_search_by(|e| e.name.as_bytes().cmp(name)).ok().map(|i| &self.entries[i])
     }
 
     /// Recursive total size of everything in this tree.

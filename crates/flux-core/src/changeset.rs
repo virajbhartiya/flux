@@ -86,9 +86,7 @@ impl Changeset {
                 if let Some((_, idx)) = copy_from
                     && *idx as usize >= self.parents.len()
                 {
-                    return Err(Error::InvalidObject(format!(
-                        "copy_from parent index {idx} out of range for {path}"
-                    )));
+                    return Err(Error::InvalidObject(format!("copy_from parent index {idx} out of range for {path}")));
                 }
                 if matches!(kind, FileKind::GitLink(_)) && copy_from.is_some() {
                     return Err(Error::InvalidObject("gitlink cannot have copy_from".into()));
@@ -99,12 +97,8 @@ impl Changeset {
         // underneath a created file are allowed: they spell out the implicit
         // dir→file replacement (git emits them that way). A sorted adjacency
         // check is not enough because bytes like '-' sort before '/'.
-        let files: std::collections::HashSet<&[u8]> = self
-            .file_changes
-            .iter()
-            .filter(|(_, c)| matches!(c, FileChange::Change { .. }))
-            .map(|(p, _)| p.as_bytes())
-            .collect();
+        let files: std::collections::HashSet<&[u8]> =
+            self.file_changes.iter().filter(|(_, c)| matches!(c, FileChange::Change { .. })).map(|(p, _)| p.as_bytes()).collect();
         let mut change_ancestors: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
         for (path, change) in &self.file_changes {
             if matches!(change, FileChange::Deletion) {
@@ -224,16 +218,7 @@ impl Changeset {
         d.end();
         d.end();
         d.finish()?;
-        Ok(Self {
-            parents,
-            author,
-            author_time,
-            committer,
-            committer_time,
-            message,
-            file_changes,
-            extra,
-        })
+        Ok(Self { parents, author, author_time, committer, committer_time, message, file_changes, extra })
     }
 
     pub fn id(&self) -> ChangesetId {
@@ -389,12 +374,7 @@ pub(crate) mod tests {
         let mut cs = sample();
         cs.file_changes.insert(
             RepoPath::try_from("src/main.rs/inner").unwrap(),
-            FileChange::Change {
-                content_id: ContentId::empty(),
-                size: 0,
-                kind: FileKind::Regular,
-                copy_from: None,
-            },
+            FileChange::Change { content_id: ContentId::empty(), size: 0, kind: FileKind::Regular, copy_from: None },
         );
         assert!(matches!(cs.validate(), Err(Error::PathConflict(_))));
     }
@@ -402,12 +382,7 @@ pub(crate) mod tests {
     #[test]
     fn conflict_detected_across_non_adjacent_sort() {
         // "a" < "a-b" < "a/c" bytewise: "a" and "a/c" are not adjacent.
-        let file = FileChange::Change {
-            content_id: ContentId::empty(),
-            size: 0,
-            kind: FileKind::Regular,
-            copy_from: None,
-        };
+        let file = FileChange::Change { content_id: ContentId::empty(), size: 0, kind: FileKind::Regular, copy_from: None };
         let mut cs = sample();
         cs.file_changes.clear();
         for p in ["a", "a-b", "a/c"] {
