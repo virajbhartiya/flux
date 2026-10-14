@@ -169,6 +169,12 @@ pub struct GitCaches {
     pub commits: moka::sync::Cache<(RepoId, ChangesetId), Sha>,
 }
 
+impl Default for GitCaches {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GitCaches {
     pub fn new() -> Self {
         Self {
