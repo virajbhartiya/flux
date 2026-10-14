@@ -74,6 +74,8 @@ async fn pages_render() {
         "/demo/-/reviews/1/files".into(),
         "/demo/-/reviews/new?head=main".into(),
         "/-/login".into(),
+        "/demo/-/edit/main/src/main.rs".into(),
+        "/demo/-/new/main/src".into(),
     ] {
         let (status, body, headers) = get(&app, &uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
@@ -102,6 +104,40 @@ async fn pages_render() {
         let (status, _, _) = get(&app, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
     }
+    // Edit a file in the browser, committing directly to main.
+    let form = format!("base={hex}&branch=main&path=src%2Fmain.rs&content=fn+main%28%29+%7B%7D%0A&message=Simplify&mode=direct");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/demo/-/edit")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("host", "localhost")
+                .header("origin", "http://localhost")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let main = flux.meta.get_ref(repo, b"main").await.unwrap().unwrap().target;
+    let e = flux.entry_at(repo, &main, &RepoPath::try_from("src/main.rs").unwrap()).await.unwrap().unwrap();
+    assert_eq!(flux.blobs.get_content(&e.content_id().unwrap()).await.unwrap().unwrap(), b"fn main() {}\n");
+
+    // Cross-origin form posts are refused.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/-/repos")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("host", "localhost")
+                .header("origin", "http://evil.example")
+                .body(Body::from("name=x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
     let (status, body, _) = get(&app, "/-/metrics").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("flux_requests_total"));

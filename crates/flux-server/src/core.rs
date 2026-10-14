@@ -646,6 +646,11 @@ impl Flux {
     }
 }
 
+/// Refs that only move forward (or via landing) unless an admin moves them.
+pub fn is_protected_ref(name: &[u8]) -> bool {
+    matches!(name, b"main" | b"master" | b"trunk") || name.starts_with(b"release/")
+}
+
 /// Ref names: non-empty, no revision operators, no whitespace or control chars.
 pub fn validate_ref_name(name: &[u8]) -> FluxResult<()> {
     let ok = !name.is_empty()

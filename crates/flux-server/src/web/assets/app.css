@@ -392,3 +392,17 @@ ul.reviews li:first-child { border-top: 0; }
 #progress { position: fixed; top: 0; left: 0; height: 2px; background: var(--accent); z-index: 200; transition: width .2s ease-out, opacity .3s; box-shadow: 0 0 8px var(--accent); }
 .error { text-align: center; }
 .pad { padding: 8px 12px; }
+
+/* ── editor ── */
+.editor { padding: 0; }
+.editor .toolbar { padding: 12px 16px; margin: 0; border-bottom: 1px solid var(--border-soft); background: var(--bg-soft); }
+.editor .toolbar input { max-width: 520px; }
+.mono { font-family: var(--mono); font-size: 13px; }
+textarea.code-editor { border: 0; border-radius: 0; font: 12.5px/20px var(--mono); padding: 12px 16px; min-height: 420px; tab-size: 4; box-shadow: none !important; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+.commit-panel { padding: 16px; border-top: 1px solid var(--border-soft); background: var(--bg-soft); }
+.radio-row { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 8px; }
+label.radio { display: flex; align-items: center; gap: 6px; font-weight: 500; margin: 0; flex-wrap: wrap; }
+label.radio input[type=radio] { accent-color: var(--accent); }
+.inline-input { width: 260px !important; margin: 0 !important; padding: 3px 8px !important; font-family: var(--mono); font-size: 12.5px; }
+.inline-form { display: flex; gap: 8px; align-items: center; }
+.inline-form input { width: 200px; }

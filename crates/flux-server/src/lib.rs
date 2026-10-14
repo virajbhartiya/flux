@@ -158,7 +158,23 @@ pub async fn serve_with(
     let listener = listener.tap_io(|tcp| {
         let _ = tcp.set_nodelay(true);
     });
-    axum::serve(listener, app(flux, opts)).with_graceful_shutdown(shutdown).await?;
+    // Long-lived streams (events, watches) would hold a graceful shutdown
+    // open forever: drain for at most 10 s after the signal.
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let signal = async move {
+        shutdown.await;
+        let _ = tx.send(true);
+    };
+    let mut rx2 = rx.clone();
+    let server = axum::serve(listener, app(flux, opts)).with_graceful_shutdown(signal);
+    tokio::select! {
+        r = server => r?,
+        _ = async move {
+            let _ = rx2.wait_for(|v| *v).await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        } => tracing::warn!("shutdown: closing connections still open after 10 s"),
+    }
+    drop(rx);
     Ok(())
 }
 

@@ -181,9 +181,18 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
     cards.sort_by_key(|c| std::cmp::Reverse(c.3.as_ref().map(|l| l.changeset.author_time.unix_ms).unwrap_or(0)));
     let body = html! {
         div.container {
-            div.page-head {
-                h1 { "Repositories" }
-                p.muted { (repos.len()) " repositories on this server" }
+            div.page-head.row {
+                div {
+                    h1 { "Repositories" }
+                    p.muted { (repos.len()) " repositories on this server" }
+                }
+                div.spacer {}
+                @if req.principal.is_admin() {
+                    form.inline-form method="post" action="/-/repos" {
+                        input type="text" name="name" placeholder="new-repo" pattern="[A-Za-z0-9._/-]+" required;
+                        button.btn.primary type="submit" { (icon("plus")) "New repository" }
+                    }
+                }
             }
             @if cards.is_empty() {
                 (empty_state("No repositories yet", html! {
@@ -214,6 +223,18 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
         }
     };
     Ok(page(&web, &req, "Repositories", None, body))
+}
+
+#[derive(Deserialize)]
+pub struct NewRepoForm {
+    name: String,
+}
+
+pub async fn create_repo(State(web): State<WebState>, req: Req, headers: HeaderMap, Form(f): Form<NewRepoForm>) -> WebResult {
+    check_origin(&headers)?;
+    req.principal.require_admin()?;
+    web.flux.create_repo(f.name.trim()).await?;
+    Ok(Redirect::to(&view::repo_url(f.name.trim())).into_response())
 }
 
 pub async fn readyz(State(web): State<WebState>) -> Response {
@@ -366,6 +387,16 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
             files_json(&web, &ctx, &rev).await
         }
         "events" => Ok(events(&web, &ctx)),
+        "edit" => {
+            let (rev, rest) = ctx.split_rev(args);
+            let path = path_from(rest)?.ok_or_else(|| WebError::BadRequest("missing path".into()))?;
+            edit_form(&web, &req, &ctx, &rev, Some(&path), None).await
+        }
+        "new" => {
+            let (rev, rest) = ctx.split_rev(args);
+            let dir = path_from(rest)?;
+            edit_form(&web, &req, &ctx, &rev, None, dir.as_ref()).await
+        }
         "reviews" => match args {
             [] => reviews(&web, &req, &ctx, q.get("state").map(String::as_str).unwrap_or("open")).await,
             [n] if n == "new" => new_review(&web, &req, &ctx, &q).await,
@@ -508,6 +539,9 @@ async fn tree(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Option<
                 (breadcrumbs(&ctx.name, rev, path.as_ref()))
                 div.spacer {}
                 span.muted.small { (view::count(total_files)) " files · " (view::size(t.total_size())) }
+                @if req.principal.can_write() {
+                    a.btn.small href=(url(&ctx.name, "new", rev, path.as_ref())) { (icon("plus")) "Add file" }
+                }
             }
             div.card.files {
                 @match latest_id.and_then(|id| loaded.get(&id)) {
@@ -627,6 +661,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
     let history_url = url(&ctx.name, "commits", rev, Some(path));
     let raw_url = url(&ctx.name, "raw", rev, Some(path));
     let content_block: Markup;
+    let mut editable = false;
     let mut hl_pending = false;
     let mut info: Vec<String> = Vec::new();
     match (entry.file_kind(), entry.content_id()) {
@@ -655,6 +690,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                     v
                 };
                 info.insert(0, format!("{} lines", plain.len()));
+                editable = entry.size <= 1 << 20 && matches!(entry.file_kind(), Some(FileKind::Regular | FileKind::Executable));
                 if entry.file_kind() == Some(FileKind::Symlink) {
                     content_block = html! { div.notice { (icon("link")) " Symbolic link to " code { (text) } } };
                 } else if is_md && !plain_md {
@@ -702,6 +738,9 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                         }
                     }
                     a.btn.small href=(raw_url) { (icon("raw")) "Raw" }
+                    @if req.principal.can_write() && editable {
+                        a.btn.small href=(url(&ctx.name, "edit", rev, Some(path))) { (icon("edit")) "Edit" }
+                    }
                     a.btn.small href=(url(&ctx.name, "blame", rev, Some(path))) { (icon("blame")) "Blame" }
                     a.btn.small href=(history_url) { (icon("history")) "History" }
                     button.btn.small.copy-btn type="button" data-copy-url=(permalink) title="Copy permalink (y)" { (icon("copy")) "Permalink" }
@@ -1651,6 +1690,20 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
 #[derive(Deserialize, Default)]
 pub struct ReviewForm {
     #[serde(default)]
+    path: String,
+    #[serde(default)]
+    base: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    new_branch: String,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     body: String,
@@ -1695,6 +1748,118 @@ pub async fn repo_post(
             flux.update_review(ctx.id, n, action, &actor, &f.body, None).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
+        ["edit"] => save_edit(&web, &ctx, &actor, f).await,
         _ => Err(WebError::NotFound("no such action".into())),
     }
+}
+
+/// Edit (or create) a file in the browser.
+async fn edit_form(
+    web: &WebState,
+    req: &Req,
+    ctx: &RepoCtx,
+    rev: &str,
+    path: Option<&RepoPath>,
+    dir: Option<&RepoPath>,
+) -> WebResult {
+    req.principal.require_write()?;
+    let flux = &web.flux;
+    let cs = flux.resolve_rev(ctx.id, rev).await?;
+    let content = match path {
+        Some(p) => {
+            let e = flux.entry_at(ctx.id, &cs, p).await?.ok_or_else(|| WebError::NotFound(format!("{p} not found")))?;
+            let cid = e.content_id().ok_or_else(|| WebError::BadRequest("not a regular file".into()))?;
+            let data = flux.blobs.get_content_bytes(&cid).await?.unwrap_or_default();
+            if is_binary(&data) || data.len() > 1 << 20 {
+                return Err(WebError::BadRequest("only text files up to 1 MiB can be edited in the browser".into()));
+            }
+            String::from_utf8_lossy(&data).into_owned()
+        }
+        None => String::new(),
+    };
+    let is_branch = ctx.is_ref(rev);
+    let suggested = format!("{}-edit-{}", req.principal.name(), &view::now_ms().to_string()[7..]);
+    let prefix = dir.map(|d| format!("{d}/")).unwrap_or_default();
+    let body = html! {
+        div.container {
+            form.card.form.editor method="post" action=(format!("/{}/-/edit", enc(&ctx.name))) {
+                input type="hidden" name="base" value=(cs.to_hex());
+                input type="hidden" name="branch" value=(rev);
+                div.toolbar {
+                    span.pill { (icon("branch")) (rev_label(rev)) }
+                    @match path {
+                        Some(p) => { input type="hidden" name="path" value=(p.to_string()); strong.mono { (p.to_string()) } }
+                        None => { input.mono type="text" name="path" value=(prefix) placeholder="path/to/new-file.txt" required autofocus; }
+                    }
+                }
+                textarea.code-editor name="content" rows="28" spellcheck="false" autofocus[path.is_some()] { (content) }
+                div.commit-panel {
+                    label { "Commit message" input type="text" name="message" required placeholder=(match path { Some(p) => format!("Update {}", p.basename().escape_ascii()), None => "Add a new file".into() }); }
+                    div.radio-row {
+                        @if is_branch {
+                            label.radio { input type="radio" name="mode" value="direct" checked; " Commit directly to " code { (rev) } span.muted.small { " (lands with a server-side rebase if it moved)" } }
+                        }
+                        label.radio { input type="radio" name="mode" value="review" checked[!is_branch]; " Create a branch and open a review: " input.inline-input type="text" name="new_branch" value=(suggested); }
+                    }
+                    div.form-actions {
+                        a.btn href=(match path { Some(p) => url(&ctx.name, "blob", rev, Some(p)), None => url(&ctx.name, "tree", rev, dir) }) { "Cancel" }
+                        button.btn.primary type="submit" { "Commit changes" }
+                    }
+                }
+            }
+        }
+    };
+    let n = nav(web, ctx, Tab::Code, rev).await;
+    Ok(page(web, req, &format!("Edit · {}", ctx.name), Some(n), body))
+}
+
+async fn save_edit(web: &WebState, ctx: &RepoCtx, actor: &str, f: ReviewForm) -> WebResult {
+    let flux = &web.flux;
+    let base = flux.resolve_rev(ctx.id, &f.base).await?;
+    let path = RepoPath::new(f.path.trim().trim_matches('/').as_bytes()).map_err(|e| WebError::BadRequest(e.to_string()))?;
+    if f.message.trim().is_empty() {
+        return Err(WebError::BadRequest("a commit message is required".into()));
+    }
+    // Browsers submit CRLF; store what the file had (LF unless it was CRLF).
+    let existing = flux.entry_at(ctx.id, &base, &path).await?;
+    let mut content = f.content.replace("\r\n", "\n");
+    if let Some(cid) = existing.as_ref().and_then(|e| e.content_id())
+        && flux.blobs.get_content_bytes(&cid).await?.is_some_and(|d| d.windows(2).any(|w| w == b"\r\n"))
+    {
+        content = content.replace('\n', "\r\n");
+    }
+    let kind = existing.as_ref().and_then(|e| e.file_kind()).unwrap_or(FileKind::Regular);
+    let (id, meta) = flux.put_content(content.as_bytes()).await?;
+    let now = view::now_ms();
+    let who = format!("{actor} <{actor}@flux>").into_bytes();
+    let mut message = f.message.trim().to_string();
+    message.push('\n');
+    let cs = flux_core::Changeset {
+        parents: vec![base],
+        author: who.clone(),
+        author_time: flux_core::Timestamp { unix_ms: now, tz_offset_min: 0 },
+        committer: Some(who),
+        committer_time: Some(flux_core::Timestamp { unix_ms: now, tz_offset_min: 0 }),
+        message: message.into_bytes(),
+        file_changes: BTreeMap::from([(
+            path.clone(),
+            flux_core::FileChange::Change { content_id: id, size: meta.size, kind, copy_from: None },
+        )]),
+        extra: BTreeMap::from([("flux.web_edit".to_string(), b"1".to_vec())]),
+    };
+    let info = flux.create_changeset(ctx.id, cs).await?;
+    let new_id = ChangesetId::from_slice(&info.id).map_err(|e| WebError::Internal(e.to_string()))?;
+    if f.mode == "direct" && ctx.is_ref(&f.branch) {
+        let r = flux.land(ctx.id, new_id, f.branch.as_bytes(), actor, "web edit").await?;
+        let _ = r;
+        return Ok(Redirect::to(&url(&ctx.name, "blob", &f.branch, Some(&path))).into_response());
+    }
+    let branch = f.new_branch.trim();
+    if branch.is_empty() {
+        return Err(WebError::BadRequest("name the new branch".into()));
+    }
+    flux.update_ref(ctx.id, branch.as_bytes(), flux_store::RefExpect::Absent, Some(new_id), actor, "web edit".into()).await?;
+    let target = if ctx.is_ref(&f.branch) { f.branch.clone() } else { ctx.default_branch().unwrap_or("main").to_string() };
+    let r = flux.create_review(ctx.id, f.message.trim(), "", actor, new_id, target.as_bytes()).await?;
+    Ok(Redirect::to(&format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)).into_response())
 }

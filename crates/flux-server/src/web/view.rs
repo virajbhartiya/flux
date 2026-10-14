@@ -61,6 +61,8 @@ pub fn icon(name: &str) -> Markup {
         "raw" => "M4 2.5h8M4 6h8M4 9.5h5M4 13h3",
         "blame" => "M2 3h3M2 7h3M2 11h3M7 3h7M7 7h5M7 11h7",
         "lock" => "M4.5 7V5a3.5 3.5 0 0 1 7 0v2M3.5 7h9v7h-9Z",
+        "edit" => "M10.5 2.5l3 3L6 13H3v-3Zm-2 2 3 3",
+        "plus" => "M8 3v10M3 8h10",
         _ => "M2 2h12v12H2Z",
     };
     html! {

@@ -695,6 +695,26 @@ impl write_service_server::WriteService for Services {
             None => return Err(Status::invalid_argument("an expectation is required (use any=true for unconditional)")),
         };
         let new = if req.new_target.is_empty() { None } else { Some(cs_id(&req.new_target)?) };
+        let mut expect = expect;
+        if crate::core::is_protected_ref(&req.name) && !principal.is_admin() {
+            // Protected refs only move forward for non-admins (land is the
+            // way to put rebased work on them).
+            let Some(new) = new else {
+                return Err(Status::permission_denied("only admins can delete a protected ref"));
+            };
+            if let Some(cur) = self.flux.meta.get_ref(repo, &req.name).await.map_err(FluxError::from)? {
+                if !self.flux.is_ancestor(repo, &cur.target, &new).await? {
+                    return Err(Status::permission_denied(
+                        "protected ref: only fast-forward updates are allowed; use `flux land` to rebase onto it",
+                    ));
+                }
+                // Pin the check to the value we validated.
+                expect = match expect {
+                    RefExpect::Any => RefExpect::Version(cur.version),
+                    other => other,
+                };
+            }
+        }
         let (outcome, current) = self.flux.update_ref(repo, &req.name, expect, new, principal.name(), req.reason).await?;
         let current =
             current.map(|c| RefEntry { name: req.name.clone(), target: c.target.as_bytes().to_vec(), version: c.version });

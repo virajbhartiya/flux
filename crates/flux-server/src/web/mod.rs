@@ -85,6 +85,7 @@ pub fn router(flux: Arc<Flux>) -> Router {
         .route("/-/static/{file}", get(static_asset))
         .route("/-/login", get(pages::login_form).post(pages::login))
         .route("/-/logout", post(pages::logout))
+        .route("/-/repos", post(pages::create_repo))
         .route("/-/healthz", get(|| async { "ok" }))
         .route("/-/readyz", get(pages::readyz))
         .route("/-/metrics", get(pages::metrics))

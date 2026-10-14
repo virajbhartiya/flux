@@ -418,6 +418,15 @@
     applyDiffMode();
   });
 
+  // ── editor: Tab inserts indentation ───────────────────────────────
+  document.addEventListener("keydown", (ev) => {
+    const t = ev.target;
+    if (ev.key !== "Tab" || !t.classList || !t.classList.contains("code-editor") || ev.shiftKey) return;
+    ev.preventDefault();
+    const s = t.selectionStart, e = t.selectionEnd;
+    t.setRangeText("    ", s, e, "end");
+  });
+
   // ── per-page setup ────────────────────────────────────────────────
   // Highlighting for a big file was still running when the page rendered:
   // fetch the page again shortly and swap in the highlighted code.
