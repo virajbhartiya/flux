@@ -137,6 +137,91 @@ service RepoService {
   rpc Diff(DiffRequest) returns (stream DiffEntry);
   // Batch map git commit SHA-1s to changeset ids (empty bytes if unknown).
   rpc GitLookup(GitLookupRequest) returns (GitLookupResponse);
+  // Line-level attribution of a file.
+  rpc Blame(BlameRequest) returns (BlameResponse);
+  // Ancestry between two revisions: is_ancestor, merge base, ahead/behind.
+  rpc Ancestry(AncestryRequest) returns (AncestryResponse);
+  // Regex search over the files of a revision (no checkout needed).
+  rpc Search(SearchRequest) returns (stream SearchMatch);
+  // All file paths of a revision (for fuzzy finders), optionally filtered.
+  rpc FindFiles(FindFilesRequest) returns (FindFilesResponse);
+  // The changeset that last modified each entry of a directory.
+  rpc LastModified(LastModifiedRequest) returns (LastModifiedResponse);
+}
+
+message BlameRequest {
+  string repo = 1;
+  string rev = 2;
+  bytes path = 3;
+}
+
+message BlameRange {
+  uint32 start_line = 1;   // 0-based
+  uint32 line_count = 2;
+  bytes changeset_id = 3;
+}
+
+message BlameResponse {
+  repeated BlameRange ranges = 1;
+  // Changesets referenced by ranges (deduplicated).
+  repeated ChangesetInfo changesets = 2;
+}
+
+message AncestryRequest {
+  string repo = 1;
+  string a = 2;
+  string b = 3;
+}
+
+message AncestryResponse {
+  bool a_is_ancestor_of_b = 1;
+  bool b_is_ancestor_of_a = 2;
+  bytes merge_base = 3;  // empty if none
+  uint64 a_ahead = 4;    // in a, not in b
+  uint64 b_ahead = 5;    // in b, not in a
+}
+
+message SearchRequest {
+  string repo = 1;
+  string rev = 2;
+  string pattern = 3;
+  bool regex = 4;          // otherwise a literal
+  bool case_insensitive = 5;
+  bytes path_prefix = 6;
+  uint32 limit = 7;        // max matches (default 500)
+}
+
+message SearchMatch {
+  bytes path = 1;
+  uint32 line_number = 2;  // 1-based
+  bytes line = 3;
+}
+
+message FindFilesRequest {
+  string repo = 1;
+  string rev = 2;
+  string query = 3;        // fuzzy query; empty = all
+  uint32 limit = 4;
+}
+
+message FindFilesResponse {
+  repeated bytes paths = 1;
+}
+
+message LastModifiedRequest {
+  string repo = 1;
+  string rev = 2;
+  bytes path = 3;          // directory; empty = root
+}
+
+message LastModifiedEntry {
+  bytes name = 1;
+  bytes changeset_id = 2;
+}
+
+message LastModifiedResponse {
+  repeated LastModifiedEntry entries = 1;
+  repeated ChangesetInfo changesets = 2;
 }
 
 message GitLookupRequest {
@@ -179,8 +264,11 @@ message LogRequest {
   string rev = 2;
   uint32 limit = 3;
   bool first_parent = 4;
-  // Only changesets whose first-parent diff touches this path (file or dir).
+  // Only changesets that modified this path (file or dir).
   bytes path = 5;
+  // Exclude ancestors of these revisions (git's `hide..rev`).
+  repeated string hide = 6;
+  uint32 skip = 7;
 }
 
 message TreeEntryInfo {
@@ -241,6 +329,25 @@ service WriteService {
   rpc CreateChangesets(CreateChangesetsRequest) returns (CreateChangesetsResponse);
   rpc UpdateRef(UpdateRefRequest) returns (UpdateRefResponse);
   rpc PutGitMapping(PutGitMappingRequest) returns (PutGitMappingResponse);
+  // Land a stack (all ancestors of `rev` not yet in `target_ref`) on the
+  // target: fast-forward, or a server-side rebase (SPEC §7.3) with
+  // line-level three-way merges, then a compare-and-swap of the ref.
+  rpc Land(LandRequest) returns (LandResponse);
+}
+
+message LandRequest {
+  string repo = 1;
+  string rev = 2;
+  string target_ref = 3;
+  string reason = 4;
+}
+
+message LandResponse {
+  bytes new_head = 1;
+  // Rebased changesets, oldest first (empty for a fast-forward).
+  repeated bytes rebased = 2;
+  bool fast_forward = 3;
+  uint32 merged_files = 4;  // files resolved by three-way merge
 }
 
 message HasContentsRequest {
@@ -313,6 +420,122 @@ message PutGitMappingRequest {
 }
 
 message PutGitMappingResponse {}
+
+// ─────────────────────────── ReviewService ───────────────────────────
+
+service ReviewService {
+  rpc CreateReview(CreateReviewRequest) returns (Review);
+  rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
+  rpc GetReview(GetReviewRequest) returns (ReviewDetail);
+  // Comment, approve, close, reopen or point the review at a new head.
+  rpc UpdateReview(UpdateReviewRequest) returns (Review);
+  rpc LandReview(LandReviewRequest) returns (LandResponse);
+}
+
+message Review {
+  int64 number = 1;
+  string title = 2;
+  string body = 3;
+  string author = 4;
+  bytes head = 5;
+  string target = 6;
+  string state = 7;     // open | landed | closed
+  bytes landed = 8;
+  int64 created_ms = 9;
+  int64 updated_ms = 10;
+}
+
+message ReviewEvent {
+  string kind = 1;      // comment | approved | updated | landed | closed | reopened
+  string author = 2;
+  string body = 3;
+  bytes changeset_id = 4;
+  bytes path = 5;
+  int64 line = 6;
+  int64 ts_ms = 7;
+}
+
+message CreateReviewRequest {
+  string repo = 1;
+  string title = 2;
+  string body = 3;
+  string head_rev = 4;
+  string target = 5;    // default "main"
+}
+
+message ListReviewsRequest {
+  string repo = 1;
+  string state = 2;     // empty = all
+  uint32 limit = 3;
+}
+
+message ListReviewsResponse {
+  repeated Review reviews = 1;
+}
+
+message GetReviewRequest {
+  string repo = 1;
+  int64 number = 2;
+}
+
+message ReviewDetail {
+  Review review = 1;
+  repeated ReviewEvent events = 2;
+  // Changesets in the review (head not in target), newest first.
+  repeated ChangesetInfo stack = 3;
+}
+
+message UpdateReviewRequest {
+  string repo = 1;
+  int64 number = 2;
+  string action = 3;    // comment | approve | close | reopen | update
+  string body = 4;
+  string head_rev = 5;  // for update
+}
+
+message LandReviewRequest {
+  string repo = 1;
+  int64 number = 2;
+}
+
+// ─────────────────────────── EventService ───────────────────────────
+
+service EventService {
+  // Stream repository events as they happen (ref moves, new changesets,
+  // review activity).
+  rpc Watch(WatchRequest) returns (stream RepoEvent);
+}
+
+message WatchRequest {
+  string repo = 1;      // empty = all repositories
+}
+
+message RepoEvent {
+  string repo = 1;
+  string kind = 2;      // ref | changesets | review
+  bytes ref_name = 3;
+  bytes old = 4;
+  bytes new = 5;
+  string actor = 6;
+  uint64 count = 7;
+  int64 review = 8;
+  string detail = 9;
+}
+
+// ─────────────────────────── AuthService ───────────────────────────
+
+service AuthService {
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  string user = 1;      // empty = anonymous
+  bool is_admin = 2;
+  bool can_write = 3;
+  string auth_mode = 4; // open | token | private
+}
 
 // ─────────────────────────── AdminService ───────────────────────────
 

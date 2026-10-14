@@ -275,6 +275,18 @@ impl BlobStore {
         if namespace.is_empty() { ObjPath::from(rel) } else { ObjPath::from(format!("{namespace}/{rel}")) }
     }
 
+    /// Snapshot local blobs into `dest` (segment backend only; object-store
+    /// backends rely on the provider's durability and versioning).
+    pub fn snapshot_to(&self, dest: &std::path::Path) -> anyhow::Result<BlobStats> {
+        match &self.inner.backend {
+            Backend::Segments(s) => {
+                let st = s.snapshot_to(dest)?;
+                Ok(BlobStats { objects: st.objects, bytes: st.bytes })
+            }
+            Backend::Object { .. } => anyhow::bail!("blob snapshots are only supported for file:// stores; use bucket versioning or replication"),
+        }
+    }
+
     pub fn stats(&self) -> BlobStats {
         match &self.inner.backend {
             Backend::Segments(s) => {

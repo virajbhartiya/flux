@@ -7,13 +7,33 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use flux_core::{Changeset, ChangesetId, ContentId, Tree, TreeId};
 use flux_proto::v1::admin_service_client::AdminServiceClient;
+use flux_proto::v1::auth_service_client::AuthServiceClient;
+use flux_proto::v1::event_service_client::EventServiceClient;
+use flux_proto::v1::review_service_client::ReviewServiceClient;
 use flux_proto::v1::object_service_client::ObjectServiceClient;
 use flux_proto::v1::repo_service_client::RepoServiceClient;
 use flux_proto::v1::write_service_client::WriteServiceClient;
 use flux_proto::v1::{self, *};
 use flux_proto::{FRAME_BYTES, MAX_MESSAGE_BYTES};
 use futures::StreamExt;
+use tonic::metadata::MetadataValue;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
+
+/// Adds `authorization: Bearer <token>` to every request when set.
+#[derive(Clone)]
+pub struct Auth(Option<MetadataValue<tonic::metadata::Ascii>>);
+
+impl tonic::service::Interceptor for Auth {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(v) = &self.0 {
+            req.metadata_mut().insert("authorization", v.clone());
+        }
+        Ok(req)
+    }
+}
+
+type Ch = InterceptedService<Channel, Auth>;
 
 pub use flux_proto::v1::ChangesetInfo;
 
@@ -27,10 +47,13 @@ const ID_BATCH: usize = 2_000;
 #[derive(Clone)]
 pub struct Client {
     repo: String,
-    objects: ObjectServiceClient<Channel>,
-    repos: RepoServiceClient<Channel>,
-    writes: WriteServiceClient<Channel>,
-    admin: AdminServiceClient<Channel>,
+    objects: ObjectServiceClient<Ch>,
+    repos: RepoServiceClient<Ch>,
+    writes: WriteServiceClient<Ch>,
+    admin: AdminServiceClient<Ch>,
+    reviews: ReviewServiceClient<Ch>,
+    events: EventServiceClient<Ch>,
+    auth: AuthServiceClient<Ch>,
 }
 
 /// Decoded view of a [`ChangesetInfo`].
@@ -61,29 +84,53 @@ impl TryFrom<ChangesetInfo> for CsInfo {
 impl Client {
     /// Connect to `url` (e.g. `http://127.0.0.1:7878`) for repository `repo`.
     pub async fn connect(url: &str, repo: &str) -> Result<Self> {
+        Self::connect_with_token(url, repo, None).await
+    }
+
+    /// Connect, authenticating with `token` (or `$FLUX_TOKEN` when `None`).
+    pub async fn connect_with_token(url: &str, repo: &str, token: Option<&str>) -> Result<Self> {
         let channel = Endpoint::from_shared(url.to_string())?
             .tcp_nodelay(true)
             .http2_adaptive_window(true)
+            .connect_timeout(std::time::Duration::from_secs(10))
             .connect()
             .await
             .with_context(|| format!("connecting to {url}"))?;
-        Ok(Self::from_channel(channel, repo))
+        let token = token.map(str::to_string).or_else(|| std::env::var("FLUX_TOKEN").ok()).filter(|t| !t.is_empty());
+        Self::from_channel_with_token(channel, repo, token.as_deref())
     }
 
     pub fn from_channel(channel: Channel, repo: &str) -> Self {
-        Self {
+        Self::from_channel_with_token(channel, repo, None).expect("no token")
+    }
+
+    pub fn from_channel_with_token(channel: Channel, repo: &str, token: Option<&str>) -> Result<Self> {
+        let auth = Auth(match token {
+            Some(t) => Some(format!("Bearer {}", t.trim()).parse().map_err(|_| anyhow!("token contains invalid characters"))?),
+            None => None,
+        });
+        let ch = |c: &Channel| InterceptedService::new(c.clone(), auth.clone());
+        Ok(Self {
             repo: repo.to_string(),
-            objects: ObjectServiceClient::new(channel.clone())
+            objects: ObjectServiceClient::new(ch(&channel))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
-            repos: RepoServiceClient::new(channel.clone())
+            repos: RepoServiceClient::new(ch(&channel))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
-            writes: WriteServiceClient::new(channel.clone())
+            writes: WriteServiceClient::new(ch(&channel))
                 .max_decoding_message_size(MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
-            admin: AdminServiceClient::new(channel),
-        }
+            admin: AdminServiceClient::new(ch(&channel)),
+            reviews: ReviewServiceClient::new(ch(&channel)).max_decoding_message_size(MAX_MESSAGE_BYTES),
+            events: EventServiceClient::new(ch(&channel)),
+            auth: AuthServiceClient::new(ch(&channel)),
+        })
+    }
+
+    /// Same connection, different repository.
+    pub fn with_repo(&self, repo: &str) -> Self {
+        Self { repo: repo.to_string(), ..self.clone() }
     }
 
     pub fn repo(&self) -> &str {
@@ -134,6 +181,19 @@ impl Client {
     }
 
     pub async fn log(&self, rev: &str, limit: u32, first_parent: bool, path: Option<&[u8]>) -> Result<Vec<CsInfo>> {
+        self.log_range(rev, &[], 0, limit, first_parent, path).await
+    }
+
+    /// `hide..rev` (ancestors of `rev` not reachable from `hide`).
+    pub async fn log_range(
+        &self,
+        rev: &str,
+        hide: &[String],
+        skip: u32,
+        limit: u32,
+        first_parent: bool,
+        path: Option<&[u8]>,
+    ) -> Result<Vec<CsInfo>> {
         let mut s = self
             .repos
             .clone()
@@ -143,6 +203,8 @@ impl Client {
                 limit,
                 first_parent,
                 path: path.map(<[u8]>::to_vec).unwrap_or_default(),
+                hide: hide.to_vec(),
+                skip,
             })
             .await
             .map_err(|s| anyhow!("{}", s.message()))?
@@ -476,5 +538,146 @@ impl Client {
                 .await?;
         }
         Ok(())
+    }
+
+    // ───────────── history, search, landing ─────────────
+
+    fn status(s: tonic::Status) -> anyhow::Error {
+        anyhow!("{}", s.message())
+    }
+
+    pub async fn blame(&self, rev: &str, path: &[u8]) -> Result<(Vec<(u32, u32, ChangesetId)>, Vec<CsInfo>)> {
+        let r = self
+            .repos
+            .clone()
+            .blame(BlameRequest { repo: self.repo.clone(), rev: rev.into(), path: path.to_vec() })
+            .await
+            .map_err(Self::status)?
+            .into_inner();
+        let ranges = r
+            .ranges
+            .iter()
+            .map(|x| Ok((x.start_line, x.line_count, ChangesetId::from_slice(&x.changeset_id)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let infos = r.changesets.into_iter().map(CsInfo::try_from).collect::<Result<Vec<_>>>()?;
+        Ok((ranges, infos))
+    }
+
+    pub async fn ancestry(&self, a: &str, b: &str) -> Result<AncestryResponse> {
+        Ok(self
+            .repos
+            .clone()
+            .ancestry(AncestryRequest { repo: self.repo.clone(), a: a.into(), b: b.into() })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn search(&self, req: SearchRequest) -> Result<Vec<SearchMatch>> {
+        let mut s = self.repos.clone().search(SearchRequest { repo: self.repo.clone(), ..req }).await.map_err(Self::status)?.into_inner();
+        let mut out = Vec::new();
+        while let Some(m) = s.next().await {
+            out.push(m?);
+        }
+        Ok(out)
+    }
+
+    pub async fn find_files(&self, rev: &str, query: &str, limit: u32) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .repos
+            .clone()
+            .find_files(FindFilesRequest { repo: self.repo.clone(), rev: rev.into(), query: query.into(), limit })
+            .await
+            .map_err(Self::status)?
+            .into_inner()
+            .paths)
+    }
+
+    pub async fn land(&self, rev: &str, target: &str, reason: &str) -> Result<LandResponse> {
+        Ok(self
+            .writes
+            .clone()
+            .land(LandRequest { repo: self.repo.clone(), rev: rev.into(), target_ref: target.into(), reason: reason.into() })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn create_review(&self, title: &str, body: &str, head: &str, target: &str) -> Result<v1::Review> {
+        Ok(self
+            .reviews
+            .clone()
+            .create_review(CreateReviewRequest {
+                repo: self.repo.clone(),
+                title: title.into(),
+                body: body.into(),
+                head_rev: head.into(),
+                target: target.into(),
+            })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn list_reviews(&self, state: &str) -> Result<Vec<v1::Review>> {
+        Ok(self
+            .reviews
+            .clone()
+            .list_reviews(ListReviewsRequest { repo: self.repo.clone(), state: state.into(), limit: 0 })
+            .await
+            .map_err(Self::status)?
+            .into_inner()
+            .reviews)
+    }
+
+    pub async fn get_review(&self, number: i64) -> Result<ReviewDetail> {
+        Ok(self
+            .reviews
+            .clone()
+            .get_review(GetReviewRequest { repo: self.repo.clone(), number })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn update_review(&self, number: i64, action: &str, body: &str, head: &str) -> Result<v1::Review> {
+        Ok(self
+            .reviews
+            .clone()
+            .update_review(UpdateReviewRequest {
+                repo: self.repo.clone(),
+                number,
+                action: action.into(),
+                body: body.into(),
+                head_rev: head.into(),
+            })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn land_review(&self, number: i64) -> Result<LandResponse> {
+        Ok(self
+            .reviews
+            .clone()
+            .land_review(LandReviewRequest { repo: self.repo.clone(), number })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    /// Stream repository events (empty repo name = all repositories).
+    pub async fn watch(&self, all: bool) -> Result<tonic::Streaming<RepoEvent>> {
+        Ok(self
+            .events
+            .clone()
+            .watch(WatchRequest { repo: if all { String::new() } else { self.repo.clone() } })
+            .await
+            .map_err(Self::status)?
+            .into_inner())
+    }
+
+    pub async fn whoami(&self) -> Result<WhoAmIResponse> {
+        Ok(self.auth.clone().who_am_i(WhoAmIRequest {}).await.map_err(Self::status)?.into_inner())
     }
 }

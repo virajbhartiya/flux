@@ -3,20 +3,20 @@
 mod wc;
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use flux_client::{Client, CsInfo};
-use flux_core::{Changeset, ContentId, FileChange, FileKind, RepoPath, Timestamp};
+use flux_core::{Changeset, ChangesetId, ContentId, FileChange, FileKind, RepoPath, Timestamp};
 use flux_proto::v1::update_ref_request::Expect;
 
-use crate::wc::{Change, Config, Entry, Kind, WorkingCopy, key_path, mtime_ns, path_key};
+use crate::wc::{Change, Config, Entry, Kind, WorkingCopy, mtime_ns, repo_path_arg};
 
 #[derive(Parser)]
-#[command(name = "flux", version, about = "flux source control client")]
+#[command(name = "flux", version, about = "flux: fast source control for huge monorepos", max_term_width = 100)]
 struct Cli {
     /// Server URL (defaults to the working copy's server).
     #[arg(long, global = true, env = "FLUX_SERVER")]
@@ -24,13 +24,17 @@ struct Cli {
     /// Repository (defaults to the working copy's repository).
     #[arg(long, global = true, env = "FLUX_REPO")]
     repo: Option<String>,
+    /// Print timing for the command.
+    #[arg(long, global = true)]
+    time: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a working copy attached to a server repository.
+    /// Create a working copy attached to a server repository (alias: clone).
+    #[command(alias = "clone")]
     Attach {
         server: String,
         repo: String,
@@ -38,33 +42,47 @@ enum Cmd {
         /// Only materialize these directory prefixes (repeatable).
         #[arg(long)]
         sparse: Vec<String>,
-        /// Revision to check out (default: main, if it exists).
+        /// Revision to check out (default: the default branch).
         #[arg(long)]
         rev: Option<String>,
     },
-    /// Update the working copy to a revision.
+    /// Update the working copy to a revision (alias: switch).
+    #[command(alias = "switch")]
     Checkout {
         rev: String,
         /// Discard local modifications.
         #[arg(long)]
         force: bool,
     },
+    /// Fetch the latest version of the followed branch.
+    #[command(alias = "pull")]
+    Sync,
     /// Show working-copy changes.
+    #[command(alias = "st")]
     Status,
-    /// Show working-copy changes as a diff.
+    /// Show working-copy changes as a diff, or a changeset's diff with --rev.
     Diff {
         /// Names only.
         #[arg(long)]
         stat: bool,
+        /// Diff this changeset against its first parent instead.
+        #[arg(long, short)]
+        rev: Option<String>,
+        paths: Vec<String>,
     },
     /// Create a changeset from working-copy changes.
+    #[command(alias = "ci")]
     Commit {
         #[arg(short, long)]
         message: String,
         /// Also commit untracked files.
         #[arg(short = 'A', long)]
         all: bool,
+        /// Only these paths.
+        paths: Vec<String>,
     },
+    /// Discard working-copy changes to paths (restores the parent's version).
+    Revert { paths: Vec<String> },
     /// Show history.
     Log {
         #[arg(default_value = "@")]
@@ -74,13 +92,18 @@ enum Cmd {
         #[arg(long)]
         first_parent: bool,
         /// Only changesets touching this path.
-        #[arg(long)]
         path: Option<String>,
+        /// Hide changesets reachable from this revision (log BASE..REV).
+        #[arg(long)]
+        since: Option<String>,
     },
-    /// Show a changeset and the files it changes.
+    /// Show a changeset and its diff.
     Show {
         #[arg(default_value = "@")]
         rev: String,
+        /// File names only.
+        #[arg(long)]
+        stat: bool,
     },
     /// Print a file at a revision (no checkout needed).
     Cat { rev: String, path: String },
@@ -91,10 +114,50 @@ enum Cmd {
         #[arg(default_value = "")]
         path: String,
     },
-    /// List refs.
+    /// Show who last changed each line of a file.
+    Blame {
+        path: String,
+        #[arg(long, default_value = "@")]
+        rev: String,
+    },
+    /// Search file contents at a revision, on the server (no checkout needed).
+    Grep {
+        pattern: String,
+        /// Treat the pattern as a regular expression.
+        #[arg(short = 'E', long)]
+        regex: bool,
+        #[arg(short, long)]
+        ignore_case: bool,
+        #[arg(long, default_value = "@")]
+        rev: String,
+        /// Only under this path.
+        path: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 200)]
+        limit: u32,
+    },
+    /// Fuzzy-find file paths at a revision.
+    Find {
+        query: String,
+        #[arg(long, default_value = "@")]
+        rev: String,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// List refs (branches).
+    #[command(alias = "branches")]
     Refs {
         #[arg(default_value = "")]
         prefix: String,
+    },
+    /// Create a branch at a revision (default: the working copy's parent)
+    /// and follow it.
+    Branch {
+        name: String,
+        #[arg(default_value = "@")]
+        rev: String,
+        /// Delete the branch instead.
+        #[arg(short, long)]
+        delete: bool,
     },
     /// Point a ref at a revision (fast-forward check unless --force).
     SetRef {
@@ -102,6 +165,19 @@ enum Cmd {
         rev: String,
         #[arg(long)]
         force: bool,
+    },
+    /// Land a stack onto a branch: fast-forward or server-side rebase with
+    /// three-way merges, then compare-and-swap.
+    Land {
+        #[arg(default_value = "@")]
+        rev: String,
+        #[arg(long, default_value = "main")]
+        onto: String,
+    },
+    /// Code review.
+    Review {
+        #[command(subcommand)]
+        cmd: ReviewCmd,
     },
     /// Show or change the sparse profile.
     Sparse {
@@ -113,6 +189,68 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
+    /// Store a token for a server (read from --token or stdin).
+    Login {
+        server: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Forget the stored token for a server.
+    Logout { server: Option<String> },
+    /// Show who the server thinks you are.
+    Whoami,
+    /// Stream live repository events.
+    Watch {
+        /// All repositories on the server.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Open the web UI for the current repository, revision and path.
+    Web { path: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// Open a review for a stack (default head: the working copy's parent).
+    Create {
+        #[arg(short, long)]
+        title: Option<String>,
+        #[arg(short, long, default_value = "")]
+        message: String,
+        #[arg(long, default_value = "@")]
+        head: String,
+        #[arg(long, default_value = "main")]
+        target: String,
+    },
+    /// List reviews.
+    List {
+        #[arg(long, default_value = "open")]
+        state: String,
+    },
+    /// Show a review with its timeline and stack.
+    Show { number: i64 },
+    /// Comment on a review.
+    Comment {
+        number: i64,
+        #[arg(short, long)]
+        message: String,
+    },
+    /// Approve a review.
+    Approve {
+        number: i64,
+        #[arg(short, long, default_value = "")]
+        message: String,
+    },
+    /// Point a review at a new head (default: the working copy's parent).
+    Update {
+        number: i64,
+        #[arg(long, default_value = "@")]
+        head: String,
+    },
+    /// Land a review.
+    Land { number: i64 },
+    Close { number: i64 },
+    Reopen { number: i64 },
 }
 
 #[derive(Subcommand)]
@@ -128,19 +266,97 @@ enum RepoCmd {
     List,
 }
 
+// ───────────── terminal styling ─────────────
+
+struct Style {
+    on: bool,
+}
+
+impl Style {
+    fn new() -> Self {
+        Self { on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() }
+    }
+    fn paint(&self, code: &str, s: &str) -> String {
+        if self.on { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
+    }
+    fn yellow(&self, s: &str) -> String {
+        self.paint("33", s)
+    }
+    fn green(&self, s: &str) -> String {
+        self.paint("32", s)
+    }
+    fn red(&self, s: &str) -> String {
+        self.paint("31", s)
+    }
+    fn cyan(&self, s: &str) -> String {
+        self.paint("36", s)
+    }
+    fn dim(&self, s: &str) -> String {
+        self.paint("2", s)
+    }
+    fn bold(&self, s: &str) -> String {
+        self.paint("1", s)
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run(Cli::parse()).await {
+    let cli = Cli::parse();
+    let started = Instant::now();
+    let timed = cli.time;
+    let r = run(cli).await;
+    if timed {
+        eprintln!("({:.1} ms)", started.elapsed().as_secs_f64() * 1000.0);
+    }
+    if let Err(e) = r {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+// ───────────── credentials ─────────────
+
+fn normalize_server(s: &str) -> String {
+    let s = s.trim().trim_end_matches('/');
+    if s.contains("://") { s.to_string() } else { format!("http://{s}") }
+}
+
+fn credentials_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flux").join("credentials.json"))
+}
+
+fn load_credentials() -> HashMap<String, String> {
+    credentials_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_credentials(c: &HashMap<String, String>) -> Result<()> {
+    let p = credentials_path().context("no config directory")?;
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    let tmp = p.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(&serde_json::to_vec_pretty(c)?)?;
+    }
+    std::fs::rename(tmp, p)?;
+    Ok(())
+}
+
+async fn connect(server: &str, repo: &str) -> Result<Client> {
+    let server = normalize_server(server);
+    let token = std::env::var("FLUX_TOKEN").ok().or_else(|| load_credentials().get(&server).cloned());
+    Client::connect_with_token(&server, repo, token.as_deref()).await
 }
 
 async fn client_for(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<Client> {
     let server = cli.server.clone().or_else(|| wc.map(|w| w.config.server.clone()));
     let repo = cli.repo.clone().or_else(|| wc.map(|w| w.config.repo.clone()));
     match (server, repo) {
-        (Some(s), Some(r)) => Client::connect(&s, &r).await,
+        (Some(s), Some(r)) => connect(&s, &r).await,
         _ => bail!("no working copy here; pass --server and --repo"),
     }
 }
@@ -148,29 +364,62 @@ async fn client_for(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<Client> {
 /// Resolve `@` to the working-copy parent.
 fn expand_rev(rev: &str, wc: Option<&WorkingCopy>) -> Result<String> {
     if let Some(rest) = rev.strip_prefix('@') {
-        let parent = wc
-            .and_then(|w| w.state.parent)
-            .context("`@` needs a working copy with a checked-out changeset")?;
+        let parent = wc.and_then(|w| w.state.parent).context("`@` needs a working copy with a checked-out changeset")?;
         return Ok(format!("{}{rest}", parent.to_hex()));
     }
     Ok(rev.to_string())
 }
 
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn ago(ms: i64) -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let s = (now - ms).max(0) / 1000;
+    match s {
+        0..60 => format!("{s}s ago"),
+        60..3600 => format!("{}m ago", s / 60),
+        3600..86_400 => format!("{}h ago", s / 3600),
+        86_400..2_592_000 => format!("{}d ago", s / 86_400),
+        2_592_000..31_536_000 => format!("{}mo ago", s / 2_592_000),
+        _ => format!("{}y ago", s / 31_536_000),
+    }
+}
+
+fn subject(msg: &[u8]) -> String {
+    String::from_utf8_lossy(msg).lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string()
+}
+
+fn author_name(a: &[u8]) -> String {
+    let s = String::from_utf8_lossy(a);
+    s.split('<').next().unwrap_or(&s).trim().to_string()
+}
+
 async fn run(cli: Cli) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let wc = WorkingCopy::find(&cwd).ok();
+    let st = Style::new();
     match &cli.cmd {
         Cmd::Attach { server, repo, dir, sparse, rev } => {
+            let server = normalize_server(server);
             let dir = dir.clone().unwrap_or_else(|| PathBuf::from(repo.rsplit('/').next().unwrap_or(repo)));
             std::fs::create_dir_all(&dir)?;
-            let client = Client::connect(server, repo).await?;
+            let client = connect(&server, repo).await?;
             let mut wc = WorkingCopy::init(
                 &dir,
                 Config { server: server.clone(), repo: repo.clone(), sparse: sparse.iter().map(|s| s.trim_matches('/').to_string()).collect() },
             )?;
             let rev = match rev {
                 Some(r) => Some(r.clone()),
-                None => client.list_refs(b"main").await?.iter().any(|r| r.name == b"main").then(|| "main".to_string()),
+                None => {
+                    let refs = client.list_refs(b"").await?;
+                    ["main", "master", "trunk"]
+                        .iter()
+                        .find(|b| refs.iter().any(|r| r.name == b.as_bytes()))
+                        .map(|b| b.to_string())
+                        .or_else(|| refs.first().map(|r| String::from_utf8_lossy(&r.name).into_owned()))
+                }
             };
             match rev {
                 Some(r) => checkout(&client, &mut wc, &r, false).await?,
@@ -184,59 +433,93 @@ async fn run(cli: Cli) -> Result<()> {
             let rev = expand_rev(rev, Some(&wc))?;
             checkout(&client, &mut wc, &rev, *force).await?;
         }
-        Cmd::Status => {
-            let wc = wc.context("not in a working copy")?;
-            let st = wc.status()?;
-            if let Some(p) = wc.state.parent {
-                println!("parent: {}{}", p.short(), wc.state.bookmark.as_ref().map(|b| format!(" ({b})")).unwrap_or_default());
-            }
-            if st.is_empty() {
-                println!("clean");
-            }
-            for e in st {
-                let c = match e.change {
-                    Change::Modified => "M",
-                    Change::Deleted => "D",
-                    Change::Untracked => "?",
-                };
-                println!("{c} {}", e.path);
-            }
-        }
-        Cmd::Diff { stat } => {
-            let wc = wc.context("not in a working copy")?;
-            let client = client_for(&cli, Some(&wc)).await?;
-            diff_wc(&client, &wc, *stat).await?;
-        }
-        Cmd::Commit { message, all } => {
+        Cmd::Sync => {
             let mut wc = wc.context("not in a working copy")?;
             let client = client_for(&cli, Some(&wc)).await?;
-            commit(&client, &mut wc, message, *all).await?;
-        }
-        Cmd::Log { rev, limit, first_parent, path } => {
-            let client = client_for(&cli, wc.as_ref()).await?;
-            let rev = expand_rev(rev, wc.as_ref())?;
-            for cs in client.log(&rev, *limit, *first_parent, path.as_deref().map(str::as_bytes)).await? {
-                print_header(&cs, true);
+            let bm = wc.state.bookmark.clone().context("the working copy doesn't follow a branch; use `flux checkout BRANCH`")?;
+            let before = wc.state.parent;
+            checkout(&client, &mut wc, &bm, false).await?;
+            if before == wc.state.parent {
+                println!("already up to date");
             }
         }
-        Cmd::Show { rev } => {
+        Cmd::Status => {
+            let wc = wc.context("not in a working copy")?;
+            let entries = wc.status()?;
+            if let Some(p) = wc.state.parent {
+                let follow = wc.state.bookmark.as_ref().map(|b| format!(" on {}", st.cyan(b))).unwrap_or_default();
+                println!("parent {}{follow}", st.yellow(&p.short()));
+            }
+            if entries.is_empty() {
+                println!("{}", st.dim("clean"));
+            }
+            for e in entries {
+                let line = match e.change {
+                    Change::Modified => st.yellow(&format!("M {}", e.path)),
+                    Change::Deleted => st.red(&format!("D {}", e.path)),
+                    Change::Untracked => st.dim(&format!("? {}", e.path)),
+                };
+                println!("{line}");
+            }
+        }
+        Cmd::Diff { stat, rev, paths } => match rev {
+            Some(r) => {
+                let client = client_for(&cli, wc.as_ref()).await?;
+                let r = expand_rev(r, wc.as_ref())?;
+                let cs = client.resolve(&r).await?;
+                print_changeset_diff(&client, &cs, *stat, &st).await?;
+            }
+            None => {
+                let wc = wc.context("not in a working copy")?;
+                let client = client_for(&cli, Some(&wc)).await?;
+                let filters: Vec<RepoPath> = paths.iter().filter_map(|p| repo_path_arg(&wc, p).ok().flatten()).collect();
+                diff_wc(&client, &wc, *stat, &filters, &st).await?;
+            }
+        },
+        Cmd::Commit { message, all, paths } => {
+            let mut wc = wc.context("not in a working copy")?;
+            let client = client_for(&cli, Some(&wc)).await?;
+            let filters: Vec<RepoPath> = paths.iter().filter_map(|p| repo_path_arg(&wc, p).ok().flatten()).collect();
+            commit(&client, &mut wc, message, *all, &filters).await?;
+        }
+        Cmd::Revert { paths } => {
+            let mut wc = wc.context("not in a working copy")?;
+            let client = client_for(&cli, Some(&wc)).await?;
+            if paths.is_empty() {
+                bail!("name the paths to revert (use `.` for everything)");
+            }
+            let filters: Vec<RepoPath> = paths.iter().filter_map(|p| repo_path_arg(&wc, p).ok().flatten()).collect();
+            let everything = paths.iter().any(|p| repo_path_arg(&wc, p).ok().flatten().is_none());
+            revert(&client, &mut wc, if everything { &[] } else { &filters }).await?;
+        }
+        Cmd::Log { rev, limit, first_parent, path, since } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = expand_rev(rev, wc.as_ref())?;
+            let path = match (path, wc.as_ref()) {
+                (Some(p), Some(w)) => repo_path_arg(w, p)?.map(|p| p.into_bytes()),
+                (Some(p), None) => Some(p.trim_matches('/').as_bytes().to_vec()),
+                _ => None,
+            };
+            let hide: Vec<String> = since.iter().map(|s| expand_rev(s, wc.as_ref())).collect::<Result<_>>()?;
+            for cs in client.log_range(&rev, &hide, 0, *limit, *first_parent, path.as_deref()).await? {
+                print_oneline(&cs, &st);
+            }
+        }
+        Cmd::Show { rev, stat } => {
             let client = client_for(&cli, wc.as_ref()).await?;
             let rev = expand_rev(rev, wc.as_ref())?;
             let cs = client.resolve(&rev).await?;
-            print_header(&cs, false);
-            for d in client.diff("", &cs.id.to_hex(), b"").await? {
-                let c = match (&d.old, &d.new) {
-                    (None, Some(_)) => "A",
-                    (Some(_), None) => "D",
-                    _ => "M",
-                };
-                println!("{c} {}", String::from_utf8_lossy(&d.path));
-            }
+            print_header(&cs, &st);
+            print_changeset_diff(&client, &cs, *stat, &st).await?;
         }
         Cmd::Cat { rev, path } => {
             let client = client_for(&cli, wc.as_ref()).await?;
             let rev = expand_rev(rev, wc.as_ref())?;
-            std::io::stdout().write_all(&client.read_file(&rev, path.as_bytes()).await?)?;
+            let path = match wc.as_ref() {
+                Some(w) => repo_path_arg(w, path)?.map(|p| p.into_bytes()).unwrap_or_default(),
+                None => path.trim_matches('/').as_bytes().to_vec(),
+            };
+            std::io::stdout().write_all(&client.read_file(&rev, &path).await?)?;
         }
         Cmd::Ls { rev, path } => {
             let client = client_for(&cli, wc.as_ref()).await?;
@@ -245,17 +528,114 @@ async fn run(cli: Cli) -> Result<()> {
             for e in dir.entries {
                 let name = String::from_utf8_lossy(&e.name);
                 if e.is_dir {
-                    println!("{:>12}  {:>8} files  {name}/", e.size, e.descendant_files);
+                    println!("{:>10}  {:>8} files  {}", human(e.size), e.descendant_files, st.cyan(&format!("{name}/")));
                 } else {
-                    println!("{:>12}  {:>14}  {name}", e.size, "");
+                    println!("{:>10}  {:>14}  {name}", human(e.size), "");
                 }
+            }
+        }
+        Cmd::Blame { path, rev } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = expand_rev(rev, wc.as_ref())?;
+            let p = match wc.as_ref() {
+                Some(w) => repo_path_arg(w, path)?.context("blame needs a file")?.into_bytes(),
+                None => path.trim_matches('/').as_bytes().to_vec(),
+            };
+            let (ranges, infos) = client.blame(&rev, &p).await?;
+            let content = client.read_file(&rev, &p).await?;
+            let by_id: HashMap<ChangesetId, &CsInfo> = infos.iter().map(|i| (i.id, i)).collect();
+            let text = String::from_utf8_lossy(&content);
+            let lines: Vec<&str> = text.lines().collect();
+            let width = lines.len().to_string().len();
+            for (start, count, id) in ranges {
+                let info = by_id.get(&id);
+                for k in 0..count {
+                    let i = (start + k) as usize;
+                    let Some(line) = lines.get(i) else { break };
+                    let who = info.map(|c| author_name(&c.changeset.author)).unwrap_or_default();
+                    let when = info.map(|c| ago(c.changeset.author_time.unix_ms)).unwrap_or_default();
+                    let meta = if k == 0 {
+                        format!("{} {:<16.16} {:>8}", st.yellow(&id.to_hex()[..10]), who, when)
+                    } else {
+                        format!("{} {:<16} {:>8}", st.dim(&"·".repeat(10)), "", "")
+                    };
+                    println!("{meta} {} {line}", st.dim(&format!("{:>width$}", i + 1)));
+                }
+            }
+        }
+        Cmd::Grep { pattern, regex, ignore_case, rev, path, limit } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = expand_rev(rev, wc.as_ref())?;
+            let prefix = match (path, wc.as_ref()) {
+                (Some(p), Some(w)) => repo_path_arg(w, p)?.map(|p| p.into_bytes()).unwrap_or_default(),
+                (Some(p), None) => p.trim_matches('/').as_bytes().to_vec(),
+                _ => vec![],
+            };
+            let hits = client
+                .search(flux_proto::v1::SearchRequest {
+                    repo: String::new(),
+                    rev,
+                    pattern: pattern.clone(),
+                    regex: *regex,
+                    case_insensitive: *ignore_case,
+                    path_prefix: prefix,
+                    limit: *limit,
+                })
+                .await?;
+            for h in &hits {
+                println!(
+                    "{}{}{}{}{}",
+                    st.cyan(&String::from_utf8_lossy(&h.path)),
+                    st.dim(":"),
+                    st.green(&h.line_number.to_string()),
+                    st.dim(":"),
+                    String::from_utf8_lossy(&h.line)
+                );
+            }
+            if hits.is_empty() {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Find { query, rev, limit } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = expand_rev(rev, wc.as_ref())?;
+            for p in client.find_files(&rev, query, *limit).await? {
+                println!("{}", String::from_utf8_lossy(&p));
             }
         }
         Cmd::Refs { prefix } => {
             let client = client_for(&cli, wc.as_ref()).await?;
+            let current = wc.as_ref().and_then(|w| w.state.bookmark.clone());
             for r in client.list_refs(prefix.as_bytes()).await? {
-                let id = flux_core::ChangesetId::from_slice(&r.target)?;
-                println!("{}  {}  (v{})", id.short(), String::from_utf8_lossy(&r.name), r.version);
+                let id = ChangesetId::from_slice(&r.target)?;
+                let name = String::from_utf8_lossy(&r.name).into_owned();
+                let mark = if current.as_deref() == Some(name.as_str()) { "*" } else { " " };
+                println!("{mark} {}  {}", st.yellow(&id.short()), if mark == "*" { st.bold(&st.cyan(&name)) } else { st.cyan(&name) });
+            }
+        }
+        Cmd::Branch { name, rev, delete } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            if *delete {
+                let cur = client.list_refs(name.as_bytes()).await?.into_iter().find(|r| r.name == name.as_bytes()).context("no such branch")?;
+                if !client.update_ref(name, Expect::Version(cur.version), None, "flux branch -d").await? {
+                    bail!("{name} moved concurrently; retry");
+                }
+                println!("deleted {name}");
+                return Ok(());
+            }
+            let rev = expand_rev(rev, wc.as_ref())?;
+            let target = client.resolve(&rev).await?;
+            if !client.update_ref(name, Expect::Absent(true), Some(target.id), "flux branch").await? {
+                bail!("{name} already exists");
+            }
+            if let Some(mut w) = wc
+                && w.state.parent == Some(target.id)
+            {
+                w.state.bookmark = Some(name.clone());
+                w.save_state()?;
+                println!("created {} at {} (now following it)", st.cyan(name), st.yellow(&target.id.short()));
+            } else {
+                println!("created {} at {}", st.cyan(name), st.yellow(&target.id.short()));
             }
         }
         Cmd::SetRef { name, rev, force } => {
@@ -268,11 +648,10 @@ async fn run(cli: Cli) -> Result<()> {
                 match client.list_refs(name.as_bytes()).await?.into_iter().find(|r| r.name == name.as_bytes()) {
                     None => Expect::Absent(true),
                     Some(cur) => {
-                        let cur_id = flux_core::ChangesetId::from_slice(&cur.target)?;
-                        // Fast-forward check: current must be an ancestor of target.
-                        let anc = client.log(&target.id.to_hex(), 0, false, None).await?;
-                        if !anc.iter().any(|c| c.id == cur_id) {
-                            bail!("{name} ({}) is not an ancestor of {}; use --force", cur_id.short(), target.id.short());
+                        let cur_id = ChangesetId::from_slice(&cur.target)?;
+                        let a = client.ancestry(&cur_id.to_hex(), &target.id.to_hex()).await?;
+                        if !a.a_is_ancestor_of_b {
+                            bail!("{name} ({}) is not an ancestor of {}; use --force or `flux land`", cur_id.short(), target.id.short());
                         }
                         Expect::Version(cur.version)
                     }
@@ -283,6 +662,34 @@ async fn run(cli: Cli) -> Result<()> {
             }
             println!("{name} -> {}", target.id.short());
         }
+        Cmd::Land { rev, onto } => {
+            let mut wc = wc;
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = expand_rev(rev, wc.as_ref())?;
+            let started = Instant::now();
+            let r = client.land(&rev, onto, "flux land").await?;
+            let head = ChangesetId::from_slice(&r.new_head)?;
+            if r.fast_forward {
+                println!("landed on {} by fast-forward: {} ({:.0} ms)", st.cyan(onto), st.yellow(&head.short()), started.elapsed().as_secs_f64() * 1000.0);
+            } else {
+                println!(
+                    "landed {} changeset(s) on {} by server-side rebase{}: {} ({:.0} ms)",
+                    r.rebased.len(),
+                    st.cyan(onto),
+                    if r.merged_files > 0 { format!(", {} file(s) merged", r.merged_files) } else { String::new() },
+                    st.yellow(&head.short()),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            // Move the working copy onto the landed result.
+            if let Some(w) = wc.as_mut() {
+                let clean = w.status()?.iter().all(|e| e.change == Change::Untracked);
+                if clean {
+                    checkout(&client, w, onto, false).await?;
+                }
+            }
+        }
+        Cmd::Review { cmd } => review(&cli, wc, cmd, &st).await?,
         Cmd::Sparse { cmd } => {
             let mut wc = wc.context("not in a working copy")?;
             match cmd {
@@ -302,14 +709,17 @@ async fn run(cli: Cli) -> Result<()> {
                     wc.config.sparse = prefixes.iter().map(|s| s.trim_matches('/').to_string()).collect();
                     wc.save_config()?;
                     if let Some(p) = wc.state.parent {
+                        let bm = wc.state.bookmark.clone();
                         checkout(&client, &mut wc, &p.to_hex(), true).await?;
+                        wc.state.bookmark = bm;
+                        wc.save_state()?;
                     }
                 }
             }
         }
         Cmd::Repo { cmd } => {
             let server = cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("--server required")?;
-            let client = Client::connect(&server, "").await?;
+            let client = connect(&server, "").await?;
             match cmd {
                 RepoCmd::Create { name } => {
                     client.create_repo(name).await?;
@@ -322,28 +732,123 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Login { server, token } => {
+            let server = normalize_server(
+                &server.clone().or_else(|| cli.server.clone()).or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("which server?")?,
+            );
+            let token = match token {
+                Some(t) => t.clone(),
+                None => {
+                    eprint!("token for {server}: ");
+                    let mut t = String::new();
+                    std::io::stdin().read_line(&mut t)?;
+                    t.trim().to_string()
+                }
+            };
+            let who = Client::connect_with_token(&server, "", Some(&token)).await?.whoami().await?;
+            if who.user.is_empty() {
+                bail!("the server did not accept that token");
+            }
+            let mut creds = load_credentials();
+            creds.insert(server.clone(), token);
+            save_credentials(&creds)?;
+            println!("logged in to {server} as {}{}", st.bold(&who.user), if who.is_admin { " (admin)" } else { "" });
+        }
+        Cmd::Logout { server } => {
+            let server = normalize_server(
+                &server.clone().or_else(|| cli.server.clone()).or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("which server?")?,
+            );
+            let mut creds = load_credentials();
+            creds.remove(&server);
+            save_credentials(&creds)?;
+            println!("logged out of {server}");
+        }
+        Cmd::Whoami => {
+            let client = client_for(&cli, wc.as_ref()).await.or_else(|_| bail!("pass --server"))?;
+            let w = client.whoami().await?;
+            println!(
+                "{} on a server in {} mode{}",
+                if w.user.is_empty() { "anonymous".to_string() } else { st.bold(&w.user) },
+                w.auth_mode,
+                if w.can_write { "; you can write" } else { "; read-only" }
+            );
+        }
+        Cmd::Watch { all } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let mut s = client.watch(*all).await?;
+            eprintln!("{}", st.dim("watching for events (Ctrl-C to stop)…"));
+            use futures::StreamExt;
+            while let Some(e) = s.next().await {
+                let e = e?;
+                let short = |b: &[u8]| ChangesetId::from_slice(b).map(|c| c.short()).unwrap_or_else(|_| "∅".into());
+                match e.kind.as_str() {
+                    "ref" => println!(
+                        "{} {} moved {} {} → {}",
+                        st.dim(&e.repo),
+                        st.bold(&e.actor),
+                        st.cyan(&String::from_utf8_lossy(&e.ref_name)),
+                        st.yellow(&short(&e.old)),
+                        st.yellow(&short(&e.new))
+                    ),
+                    "changesets" => println!("{} {} new changeset(s), latest {}", st.dim(&e.repo), e.count, st.yellow(&short(&e.new))),
+                    "review" => println!("{} review #{} {}", st.dim(&e.repo), e.review, e.detail),
+                    other => println!("{} {other}", st.dim(&e.repo)),
+                }
+            }
+        }
+        Cmd::Web { path } => {
+            let wc = wc.context("not in a working copy")?;
+            let rev = wc.state.bookmark.clone().or_else(|| wc.state.parent.map(|p| p.to_hex())).unwrap_or_else(|| "main".into());
+            let p = match path {
+                Some(p) => repo_path_arg(&wc, p)?,
+                None => repo_path_arg(&wc, ".")?,
+            };
+            let url = match p {
+                Some(p) => {
+                    let is_file = wc.fs_path(&p).is_file();
+                    format!("{}/{}/-/{}/{}/{}", wc.config.server, wc.config.repo, if is_file { "blob" } else { "tree" }, rev, p)
+                }
+                None => format!("{}/{}/-/tree/{}", wc.config.server, wc.config.repo, rev),
+            };
+            println!("{url}");
+            let _ = open::that(&url);
+        }
     }
     Ok(())
 }
 
-fn print_header(cs: &CsInfo, oneline: bool) {
-    let c = &cs.changeset;
-    let subject = String::from_utf8_lossy(c.message.split(|b| *b == b'\n').next().unwrap_or_default()).into_owned();
-    if oneline {
-        let git = cs.git_sha1.map(|g| format!(" git:{}", &hex(&g)[..10])).unwrap_or_default();
-        println!("{}{git}  {}  {subject}", cs.id.short(), String::from_utf8_lossy(&c.author));
-        return;
+fn human(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{:.1} KB", n as f64 / 1024.0),
+        1_048_576..1_073_741_824 => format!("{:.1} MB", n as f64 / 1_048_576.0),
+        _ => format!("{:.1} GB", n as f64 / 1_073_741_824.0),
     }
-    println!("changeset  {}", cs.id);
+}
+
+fn print_oneline(cs: &CsInfo, st: &Style) {
+    let c = &cs.changeset;
+    let merge = if c.parents.len() > 1 { st.dim(" (merge)") } else { String::new() };
+    println!(
+        "{} {} {} {}{merge}",
+        st.yellow(&cs.id.to_hex()[..10]),
+        subject(&c.message),
+        st.dim(&format!("— {}", author_name(&c.author))),
+        st.dim(&ago(c.author_time.unix_ms))
+    );
+}
+
+fn print_header(cs: &CsInfo, st: &Style) {
+    let c = &cs.changeset;
+    println!("{} {}", st.yellow("changeset"), st.yellow(&cs.id.to_string()));
     if let Some(g) = cs.git_sha1 {
         println!("git        {}", hex(&g));
     }
     for p in &c.parents {
         println!("parent     {}", p.short());
     }
-    println!("generation {}", cs.generation);
     println!("author     {}", String::from_utf8_lossy(&c.author));
-    println!("date       {} ms (tz {:+} min)", c.author_time.unix_ms, c.author_time.tz_offset_min);
+    println!("date       {} ({})", ago(c.author_time.unix_ms), c.author_time.unix_ms);
     println!();
     for line in String::from_utf8_lossy(&c.message).lines() {
         println!("    {line}");
@@ -351,20 +856,73 @@ fn print_header(cs: &CsInfo, oneline: bool) {
     println!();
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+fn print_unified(path: &str, old: &[u8], new: &[u8], st: &Style) {
+    let bin = |d: &[u8]| d[..d.len().min(8192)].contains(&0) || std::str::from_utf8(d).is_err();
+    if bin(old) || bin(new) {
+        println!("{}", st.bold(&format!("Binary files a/{path} and b/{path} differ")));
+        return;
+    }
+    let (a, b) = (String::from_utf8_lossy(old), String::from_utf8_lossy(new));
+    let d = similar::TextDiff::configure().algorithm(similar::Algorithm::Patience).diff_lines(a.as_ref(), b.as_ref());
+    let text = d.unified_diff().header(&format!("a/{path}"), &format!("b/{path}")).to_string();
+    for line in text.lines() {
+        let out = if line.starts_with("+++") || line.starts_with("---") {
+            st.bold(line)
+        } else if line.starts_with('+') {
+            st.green(line)
+        } else if line.starts_with('-') {
+            st.red(line)
+        } else if line.starts_with("@@") {
+            st.cyan(line)
+        } else {
+            line.to_string()
+        };
+        println!("{out}");
+    }
 }
 
-/// Target state for a checkout: key → (path, kind, id string, size, content).
+async fn fetch_one(client: &Client, id: Option<ContentId>) -> Result<Vec<u8>> {
+    let Some(id) = id else { return Ok(vec![]) };
+    let mut buf = Vec::new();
+    client
+        .get_contents(&[id], |_, d| {
+            buf = d;
+            Ok(())
+        })
+        .await?;
+    Ok(buf)
+}
+
+async fn print_changeset_diff(client: &Client, cs: &CsInfo, stat: bool, st: &Style) -> Result<()> {
+    let entries = client.diff("", &cs.id.to_hex(), b"").await?;
+    for d in &entries {
+        let path = String::from_utf8_lossy(&d.path).into_owned();
+        let (code, color): (&str, fn(&Style, &str) -> String) = match (&d.old, &d.new) {
+            (None, Some(_)) => ("A", Style::green),
+            (Some(_), None) => ("D", Style::red),
+            _ => ("M", Style::yellow),
+        };
+        if stat {
+            println!("{}", color(st, &format!("{code} {path}")));
+            continue;
+        }
+        let cid = |f: &Option<flux_proto::v1::DiffFile>| f.as_ref().and_then(|f| ContentId::from_slice(&f.content_id).ok());
+        let (old, new) = (fetch_one(client, cid(&d.old)).await?, fetch_one(client, cid(&d.new)).await?);
+        print_unified(&path, &old, &new, st);
+    }
+    Ok(())
+}
+
+/// Target state for a checkout.
 struct TargetFile {
-    path: RepoPath,
     kind: Kind,
-    id: String,
+    id: [u8; 32],
     size: u64,
     content: Option<ContentId>,
 }
 
 async fn checkout(client: &Client, wc: &mut WorkingCopy, rev: &str, force: bool) -> Result<()> {
+    let started = Instant::now();
     if !force {
         let dirty: Vec<_> = wc.status()?.into_iter().filter(|e| e.change != Change::Untracked).collect();
         if !dirty.is_empty() {
@@ -375,7 +933,7 @@ async fn checkout(client: &Client, wc: &mut WorkingCopy, rev: &str, force: bool)
     let sparse = wc.sparse_prefixes();
     // One round trip: the server expands the whole (sparse) tree.
     let trees = client.get_trees(&[info.root_tree], 4096, &sparse, b"").await?;
-    let mut target: BTreeMap<String, TargetFile> = BTreeMap::new();
+    let mut target: BTreeMap<RepoPath, TargetFile> = BTreeMap::new();
     for (_, dir, tree) in &trees {
         for e in tree.entries() {
             let Some(fk) = e.file_kind() else { continue };
@@ -389,54 +947,57 @@ async fn checkout(client: &Client, wc: &mut WorkingCopy, rev: &str, force: bool)
             }
             let path = RepoPath::new(full)?;
             let id = match fk {
-                FileKind::GitLink(sha) => hex(&sha),
-                _ => e.content_id().unwrap().to_string(),
+                FileKind::GitLink(sha) => {
+                    let mut id = [0u8; 32];
+                    id[..20].copy_from_slice(&sha);
+                    id
+                }
+                _ => *e.content_id().unwrap().as_bytes(),
             };
-            target.insert(path_key(&path), TargetFile { path, kind: Kind::from_core(&fk), id, size: e.size, content: e.content_id() });
+            target.insert(path, TargetFile { kind: Kind::from_core(&fk), id, size: e.size, content: e.content_id() });
         }
     }
 
     // Remove files that are no longer present.
     let mut removed = 0;
-    for key in wc.state.files.keys().cloned().collect::<Vec<_>>() {
-        if !target.contains_key(&key) {
-            wc.remove_file(&key_path(&key)?)?;
-            wc.state.files.remove(&key);
+    for path in wc.state.files.keys().cloned().collect::<Vec<_>>() {
+        if !target.contains_key(&path) {
+            wc.remove_file(&path)?;
+            wc.state.files.remove(&path);
             removed += 1;
         }
     }
 
     // Write new or changed files, fetching each needed content once.
-    let mut wanted: HashMap<ContentId, Vec<String>> = HashMap::new();
+    let mut wanted: HashMap<ContentId, Vec<RepoPath>> = HashMap::new();
     let mut gitlinks = Vec::new();
-    for (key, t) in &target {
-        let cur = wc.state.files.get(key);
-        let on_disk = wc.fs_path(&t.path).symlink_metadata().is_ok();
-        // Unchanged and present: keep it (unless --force rewrites everything).
-        if !force && on_disk && cur.is_some_and(|c| c.kind == t.kind && c.id == t.id) {
+    for (path, t) in &target {
+        let cur = wc.state.files.get(path);
+        let unchanged = cur.is_some_and(|c| c.kind == t.kind && c.id == t.id);
+        if !force && unchanged && wc.fs_path(path).symlink_metadata().is_ok() {
             continue;
         }
         match t.content {
-            Some(c) => wanted.entry(c).or_default().push(key.clone()),
-            None => gitlinks.push(key.clone()),
+            Some(c) => wanted.entry(c).or_default().push(path.clone()),
+            None => gitlinks.push(path.clone()),
         }
     }
     let ids: Vec<ContentId> = wanted.keys().copied().collect();
-    let mut written: Vec<(String, Entry)> = Vec::new();
+    let mut written: Vec<(RepoPath, Entry)> = Vec::new();
     client
         .get_contents(&ids, |cid, data| {
-            for key in &wanted[&cid] {
-                let t = &target[key];
-                let md = wc.write_file(&t.path, t.kind, &data)?;
-                written.push((key.clone(), Entry { kind: t.kind, id: t.id.clone(), size: t.size, mtime_ns: mtime_ns(&md) }));
+            for path in &wanted[&cid] {
+                let t = &target[path];
+                let md = wc.write_file(path, t.kind, &data)?;
+                written.push((path.clone(), Entry { kind: t.kind, id: t.id, size: t.size, mtime_ns: mtime_ns(&md) }));
             }
             Ok(())
         })
         .await?;
-    for key in gitlinks {
-        let t = &target[&key];
-        let md = wc.write_file(&t.path, Kind::GitLink, &[])?;
-        written.push((key.clone(), Entry { kind: Kind::GitLink, id: t.id.clone(), size: 0, mtime_ns: mtime_ns(&md) }));
+    for path in gitlinks {
+        let t = &target[&path];
+        let md = wc.write_file(&path, Kind::GitLink, &[])?;
+        written.push((path.clone(), Entry { kind: Kind::GitLink, id: t.id, size: 0, mtime_ns: mtime_ns(&md) }));
     }
     let n_written = written.len();
     for (k, e) in written {
@@ -445,53 +1006,59 @@ async fn checkout(client: &Client, wc: &mut WorkingCopy, rev: &str, force: bool)
 
     wc.state.parent = Some(info.id);
     wc.state.root_tree = Some(info.root_tree);
-    wc.state.bookmark = client.list_refs(rev.as_bytes()).await?.iter().any(|r| r.name == rev.as_bytes()).then(|| rev.to_string());
+    let is_ref = client.list_refs(rev.as_bytes()).await?.iter().any(|r| r.name == rev.as_bytes());
+    // Follow the branch when checking one out; a bare changeset detaches.
+    wc.state.bookmark = is_ref.then(|| rev.to_string());
     wc.save_state()?;
     println!(
-        "checked out {}{}: {} files ({} written, {} removed)",
+        "checked out {}{}: {} files ({} written, {} removed) in {:.0} ms",
         info.id.short(),
         wc.state.bookmark.as_ref().map(|b| format!(" ({b})")).unwrap_or_default(),
         target.len(),
         n_written,
-        removed
+        removed,
+        started.elapsed().as_secs_f64() * 1000.0
     );
     Ok(())
 }
 
-async fn diff_wc(client: &Client, wc: &WorkingCopy, stat: bool) -> Result<()> {
-    let st = wc.status()?;
-    for e in st {
-        if e.change == Change::Untracked {
+async fn diff_wc(client: &Client, wc: &WorkingCopy, stat: bool, filters: &[RepoPath], st: &Style) -> Result<()> {
+    for mut e in wc.status()? {
+        if e.change == Change::Untracked || !WorkingCopy::matches(&e.path, filters) {
             continue;
         }
-        let key = path_key(&e.path);
-        let old = match wc.state.files.get(&key) {
-            Some(entry) if entry.kind != Kind::GitLink => {
-                let id = ContentId::parse(&entry.id)?;
-                let mut buf = None;
-                client.get_contents(&[id], |_, d| {
-                    buf = Some(d);
-                    Ok(())
-                })
-                .await?;
-                buf
-            }
-            _ => None,
-        };
-        let new = e.new.as_ref().map(|(_, d)| d.clone());
+        wc.load_change(&mut e)?;
         if stat {
-            println!("{} {}", if new.is_none() { "D" } else { "M" }, e.path);
+            let line = if e.new.is_none() { st.red(&format!("D {}", e.path)) } else { st.yellow(&format!("M {}", e.path)) };
+            println!("{line}");
             continue;
         }
-        let (a, b) = (old.unwrap_or_default(), new.unwrap_or_default());
-        match (std::str::from_utf8(&a), std::str::from_utf8(&b)) {
-            (Ok(a), Ok(b)) if !a.contains('\0') && !b.contains('\0') => {
-                let d = similar::TextDiff::from_lines(a, b);
-                print!("{}", d.unified_diff().header(&format!("a/{}", e.path), &format!("b/{}", e.path)));
+        let old = fetch_one(client, wc.state.files.get(&e.path).and_then(|x| x.content_id())).await?;
+        let new = e.new.as_ref().map(|(_, d)| d.clone()).unwrap_or_default();
+        print_unified(&e.path.to_string(), &old, &new, st);
+    }
+    Ok(())
+}
+
+async fn revert(client: &Client, wc: &mut WorkingCopy, filters: &[RepoPath]) -> Result<()> {
+    let mut n = 0;
+    for e in wc.status()? {
+        if !WorkingCopy::matches(&e.path, filters) {
+            continue;
+        }
+        match e.change {
+            Change::Untracked => continue,
+            Change::Modified | Change::Deleted => {
+                let entry = wc.state.files[&e.path];
+                let data = fetch_one(client, entry.content_id()).await?;
+                let md = wc.write_file(&e.path, entry.kind, &data)?;
+                wc.state.files.insert(e.path.clone(), Entry { mtime_ns: mtime_ns(&md), ..entry });
+                n += 1;
             }
-            _ => println!("Binary files a/{0} and b/{0} differ", e.path),
         }
     }
+    wc.save_state()?;
+    println!("reverted {n} file(s)");
     Ok(())
 }
 
@@ -516,14 +1083,49 @@ fn author() -> Vec<u8> {
     }
 }
 
-async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool) -> Result<()> {
-    let changes: Vec<_> = wc.status()?.into_iter().filter(|e| all || e.change != Change::Untracked).collect();
+fn local_tz_offset_min() -> i16 {
+    // `date +%z` is the portable way without a tz database dependency.
+    std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.len() != 5 {
+                return None;
+            }
+            let sign = if s.starts_with('-') { -1 } else { 1 };
+            let h: i16 = s[1..3].parse().ok()?;
+            let m: i16 = s[3..5].parse().ok()?;
+            Some(sign * (h * 60 + m))
+        })
+        .unwrap_or(0)
+}
+
+async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool, filters: &[RepoPath]) -> Result<()> {
+    let started = Instant::now();
+    let mut changes: Vec<_> = wc
+        .status()?
+        .into_iter()
+        .filter(|e| (all || e.change != Change::Untracked) && WorkingCopy::matches(&e.path, filters))
+        .collect();
     if changes.is_empty() {
         println!("nothing to commit");
         return Ok(());
     }
-    let datas: Vec<&[u8]> = changes.iter().filter_map(|e| e.new.as_ref().map(|(_, d)| d.as_slice())).collect();
-    client.upload(&datas).await?;
+    for e in changes.iter_mut() {
+        wc.load_change(e)?;
+    }
+    // Upload with delta hints: the previous version of each path.
+    let uploads: Vec<(ContentId, bytes::Bytes, Option<ContentId>)> = changes
+        .iter()
+        .filter_map(|e| {
+            let (_, data) = e.new.as_ref()?;
+            let base = wc.state.files.get(&e.path).and_then(|x| x.content_id());
+            Some((ContentId::hash(data), bytes::Bytes::copy_from_slice(data), base))
+        })
+        .collect();
+    client.upload_known(uploads).await?;
 
     let mut file_changes = BTreeMap::new();
     for e in &changes {
@@ -543,6 +1145,7 @@ async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool)
         file_changes.insert(e.path.clone(), fc);
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let tz = local_tz_offset_min();
     let mut msg = message.as_bytes().to_vec();
     if !msg.ends_with(b"\n") {
         msg.push(b'\n');
@@ -551,38 +1154,43 @@ async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool)
     let cs = Changeset {
         parents: wc.state.parent.into_iter().collect(),
         author: who.clone(),
-        author_time: Timestamp { unix_ms: now, tz_offset_min: 0 },
+        author_time: Timestamp { unix_ms: now, tz_offset_min: tz },
         committer: Some(who),
-        committer_time: Some(Timestamp { unix_ms: now, tz_offset_min: 0 }),
+        committer_time: Some(Timestamp { unix_ms: now, tz_offset_min: tz }),
         message: msg,
         file_changes,
         extra: BTreeMap::new(),
     };
     let info = client.create_changeset(&cs).await?;
 
-    // Advance the followed bookmark with a compare-and-swap.
+    // Advance the followed branch with a compare-and-swap.
+    let mut moved = None;
     if let Some(bm) = wc.state.bookmark.clone() {
         let expect = match wc.state.parent {
             Some(p) => Expect::Target(p.as_bytes().to_vec()),
             None => Expect::Absent(true),
         };
-        if !client.update_ref(&bm, expect, Some(info.id), "flux commit").await? {
-            eprintln!("warning: {bm} moved since checkout; {} was created but {bm} was not updated", info.id.short());
+        if client.update_ref(&bm, expect, Some(info.id), "flux commit").await? {
+            moved = Some(bm);
+        } else {
+            eprintln!(
+                "note: {bm} moved since you last synced; {} was created but {bm} was not updated.\n      Run `flux land --onto {bm}` to rebase and land it, or `flux review create`.",
+                info.id.short()
+            );
             wc.state.bookmark = None;
         }
     }
 
     for e in &changes {
-        let key = path_key(&e.path);
         match &e.new {
             None => {
-                wc.state.files.remove(&key);
+                wc.state.files.remove(&e.path);
             }
             Some((kind, data)) => {
                 let md = std::fs::symlink_metadata(wc.fs_path(&e.path))?;
                 wc.state.files.insert(
-                    key,
-                    Entry { kind: *kind, id: ContentId::hash(data).to_string(), size: data.len() as u64, mtime_ns: mtime_ns(&md) },
+                    e.path.clone(),
+                    Entry { kind: *kind, id: *ContentId::hash(data).as_bytes(), size: data.len() as u64, mtime_ns: mtime_ns(&md) },
                 );
             }
         }
@@ -591,11 +1199,99 @@ async fn commit(client: &Client, wc: &mut WorkingCopy, message: &str, all: bool)
     wc.state.root_tree = Some(info.root_tree);
     wc.save_state()?;
     println!(
-        "committed {} ({} file{}){}",
+        "committed {} ({} file{}){} in {:.0} ms",
         info.id.short(),
         changes.len(),
         if changes.len() == 1 { "" } else { "s" },
-        wc.state.bookmark.as_ref().map(|b| format!(" on {b}")).unwrap_or_default()
+        moved.map(|b| format!(" on {b}")).unwrap_or_default(),
+        started.elapsed().as_secs_f64() * 1000.0
     );
+    Ok(())
+}
+
+async fn review(cli: &Cli, wc: Option<WorkingCopy>, cmd: &ReviewCmd, st: &Style) -> Result<()> {
+    let client = client_for(cli, wc.as_ref()).await?;
+    let web = |n: i64| {
+        let server = cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).unwrap_or_default();
+        let repo = cli.repo.clone().or_else(|| wc.as_ref().map(|w| w.config.repo.clone())).unwrap_or_default();
+        format!("{}/{repo}/-/reviews/{n}", normalize_server(&server))
+    };
+    match cmd {
+        ReviewCmd::Create { title, message, head, target } => {
+            let head = expand_rev(head, wc.as_ref())?;
+            let title = match title {
+                Some(t) => t.clone(),
+                None => subject(&client.resolve(&head).await?.changeset.message),
+            };
+            let r = client.create_review(&title, message, &head, target).await?;
+            println!("opened review #{} {}", r.number, st.bold(&r.title));
+            println!("{}", st.dim(&web(r.number)));
+        }
+        ReviewCmd::List { state } => {
+            let rs = client.list_reviews(if state == "all" { "" } else { state }).await?;
+            if rs.is_empty() {
+                println!("{}", st.dim(&format!("no {state} reviews")));
+            }
+            for r in rs {
+                let badge = match r.state.as_str() {
+                    "open" => st.green("open  "),
+                    "landed" => st.paint("35", "landed"),
+                    _ => st.red("closed"),
+                };
+                println!("{} {badge} {}  {}", st.yellow(&format!("#{:<4}", r.number)), r.title, st.dim(&format!("{} · {}", r.author, ago(r.updated_ms))));
+            }
+        }
+        ReviewCmd::Show { number } => {
+            let d = client.get_review(*number).await?;
+            let r = d.review.context("missing review")?;
+            println!("{} {}  [{}]", st.yellow(&format!("#{}", r.number)), st.bold(&r.title), r.state);
+            println!("{}", st.dim(&format!("{} → {} · opened {}", r.author, r.target, ago(r.created_ms))));
+            if !r.body.is_empty() {
+                println!("\n{}\n", r.body);
+            }
+            println!("{}", st.bold("changesets"));
+            for i in d.stack {
+                let info: CsInfo = i.try_into()?;
+                print_oneline(&info, st);
+            }
+            println!("{}", st.bold("timeline"));
+            for e in d.events {
+                println!("  {} {} {}{}", st.dim(&ago(e.ts_ms)), st.bold(&e.author), e.kind, if e.body.is_empty() { String::new() } else { format!(": {}", e.body) });
+            }
+            println!("{}", st.dim(&web(r.number)));
+        }
+        ReviewCmd::Comment { number, message } => {
+            client.update_review(*number, "comment", message, "").await?;
+            println!("commented on #{number}");
+        }
+        ReviewCmd::Approve { number, message } => {
+            client.update_review(*number, "approve", message, "").await?;
+            println!("approved #{number}");
+        }
+        ReviewCmd::Update { number, head } => {
+            let head = expand_rev(head, wc.as_ref())?;
+            let r = client.update_review(*number, "update", "", &head).await?;
+            println!("#{number} now points at {}", ChangesetId::from_slice(&r.head)?.short());
+        }
+        ReviewCmd::Land { number } => {
+            let started = Instant::now();
+            let r = client.land_review(*number).await?;
+            let head = ChangesetId::from_slice(&r.new_head)?;
+            println!(
+                "landed #{number}{}: {} ({:.0} ms)",
+                if r.fast_forward { " (fast-forward)".to_string() } else { format!(" (rebased {}, merged {} file(s))", r.rebased.len(), r.merged_files) },
+                st.yellow(&head.short()),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        ReviewCmd::Close { number } => {
+            client.update_review(*number, "close", "", "").await?;
+            println!("closed #{number}");
+        }
+        ReviewCmd::Reopen { number } => {
+            client.update_review(*number, "reopen", "", "").await?;
+            println!("reopened #{number}");
+        }
+    }
     Ok(())
 }

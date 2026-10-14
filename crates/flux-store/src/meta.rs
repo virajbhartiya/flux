@@ -205,6 +205,8 @@ pub trait MetaStore: Send + Sync + 'static {
     // derived data
     async fn get_derived(&self, repo: RepoId, ty: DerivedTypeId, ids: &[ChangesetId]) -> StoreResult<Vec<Option<Vec<u8>>>>;
     async fn put_derived(&self, repo: RepoId, ty: DerivedTypeId, entries: &[(ChangesetId, Vec<u8>)]) -> StoreResult<()>;
+    /// Every changeset that has a value of this derived type.
+    async fn derived_ids(&self, repo: RepoId, ty: DerivedTypeId) -> StoreResult<Vec<ChangesetId>>;
 
     // content metadata (global across repos: content is content-addressed)
     async fn get_content_meta(&self, ids: &[ContentId]) -> StoreResult<Vec<Option<ContentMeta>>>;
@@ -251,6 +253,13 @@ pub trait MetaStore: Send + Sync + 'static {
         line: Option<i64>,
     ) -> StoreResult<i64>;
     async fn review_events(&self, repo: RepoId, number: i64) -> StoreResult<Vec<ReviewEvent>>;
+
+    // operations
+    /// Write a consistent snapshot of the metadata to `path` (SQLite: an
+    /// online `VACUUM INTO`). Postgres deployments use pg_dump/PITR instead.
+    async fn backup_to(&self, path: &std::path::Path) -> StoreResult<()>;
+    /// Number of changesets in a repository.
+    async fn changeset_count(&self, repo: RepoId) -> StoreResult<u64>;
 }
 
 /// Turn a hex prefix into an inclusive-exclusive byte range `[lo, hi)`.

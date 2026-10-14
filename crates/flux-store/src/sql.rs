@@ -457,6 +457,15 @@ macro_rules! sql_store {
                 Ok(())
             }
 
+            async fn derived_ids(&self, repo: RepoId, ty: DerivedTypeId) -> StoreResult<Vec<ChangesetId>> {
+                let rows = sqlx::query("SELECT cs_id FROM derived WHERE repo_id = $1 AND type_id = $2")
+                    .bind(repo.0)
+                    .bind(ty)
+                    .fetch_all(&self.pool)
+                    .await?;
+                rows.into_iter().map(|r| cs_id(r.try_get::<&[u8], _>(0)?)).collect()
+            }
+
             async fn get_content_meta(&self, ids: &[ContentId]) -> StoreResult<Vec<Option<ContentMeta>>> {
                 let mut found = std::collections::HashMap::new();
                 for chunk in ids.chunks(IN_CHUNK) {
@@ -563,6 +572,19 @@ macro_rules! sql_store {
                 Ok(ordered(ids, &found))
             }
 
+            async fn backup_to(&self, path: &std::path::Path) -> StoreResult<()> {
+                Self::backup_impl(&self.pool, path).await
+            }
+
+            async fn changeset_count(&self, repo: RepoId) -> StoreResult<u64> {
+                let n: i64 = sqlx::query("SELECT COUNT(*) FROM changesets WHERE repo_id = $1")
+                    .bind(repo.0)
+                    .fetch_one(&self.pool)
+                    .await?
+                    .try_get(0)?;
+                Ok(n as u64)
+            }
+
             async fn graph_tail(&self, repo: RepoId, after: LogSeq, limit: u32) -> StoreResult<Vec<GraphRow>> {
                 let rows = sqlx::query(
                     "SELECT log_seq, cs_id, gen FROM changesets WHERE repo_id = $1 AND log_seq > $2 ORDER BY log_seq LIMIT $3",
@@ -581,30 +603,31 @@ macro_rules! sql_store {
                         parents: vec![],
                     });
                 }
-                if let (Some(first), Some(last)) = (out.first().map(|r| r.seq), out.last().map(|r| r.seq)) {
-                    let rows = sqlx::query(
-                        "SELECT p.child, p.parent, p.idx FROM changeset_parents p \
-                         JOIN changesets c ON c.repo_id = p.repo_id AND c.cs_id = p.child \
-                         WHERE p.repo_id = $1 AND c.log_seq >= $2 AND c.log_seq <= $3",
-                    )
-                    .bind(repo.0)
-                    .bind(first)
-                    .bind(last)
-                    .fetch_all(&self.pool)
-                    .await?;
-                    let pos: std::collections::HashMap<ChangesetId, usize> =
-                        out.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
-                    let mut edges: Vec<(usize, i32, ChangesetId)> = Vec::with_capacity(rows.len());
-                    for r in rows {
+                // Parents by child id in batches: always an index lookup on
+                // (repo_id, child), whatever the planner's statistics say.
+                let pos: std::collections::HashMap<ChangesetId, usize> =
+                    out.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+                let mut edges: Vec<(usize, i32, ChangesetId)> = Vec::new();
+                let ids: Vec<ChangesetId> = out.iter().map(|r| r.id).collect();
+                for chunk in ids.chunks(IN_CHUNK) {
+                    let q = format!(
+                        "SELECT child, parent, idx FROM changeset_parents WHERE repo_id = $1 AND child IN ({})",
+                        placeholders(2, chunk.len())
+                    );
+                    let mut query = sqlx::query(&q).bind(repo.0);
+                    for id in chunk {
+                        query = query.bind(id.as_bytes().as_slice());
+                    }
+                    for r in query.fetch_all(&self.pool).await? {
                         let child = cs_id(r.try_get::<&[u8], _>(0)?)?;
                         if let Some(&i) = pos.get(&child) {
                             edges.push((i, r.try_get(2)?, cs_id(r.try_get::<&[u8], _>(1)?)?));
                         }
                     }
-                    edges.sort_by_key(|e| (e.0, e.1));
-                    for (i, _, p) in edges {
-                        out[i].parents.push(p);
-                    }
+                }
+                edges.sort_by_key(|e| (e.0, e.1));
+                for (i, _, p) in edges {
+                    out[i].parents.push(p);
                 }
                 Ok(out)
             }
@@ -898,6 +921,14 @@ impl SqliteStore {
         Ok(Self { pool })
     }
 
+    async fn backup_impl(pool: &sqlx::SqlitePool, path: &std::path::Path) -> StoreResult<()> {
+        if path.exists() {
+            return Err(StoreError::Backend(anyhow::anyhow!("{} already exists", path.display())));
+        }
+        sqlx::query("VACUUM INTO $1").bind(path.to_string_lossy().into_owned()).execute(pool).await?;
+        Ok(())
+    }
+
     /// SQLite serializes writers; `BEGIN` is deferred, so issue a write first
     /// to acquire the RESERVED lock before reading the log head.
     async fn lock_log(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, repo: RepoId) -> StoreResult<()> {
@@ -915,6 +946,12 @@ impl PostgresStore {
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(32).connect(url).await?;
         sqlx::migrate!("./migrations/postgres").run(&pool).await?;
         Ok(Self { pool })
+    }
+
+    async fn backup_impl(_pool: &sqlx::PgPool, _path: &std::path::Path) -> StoreResult<()> {
+        Err(StoreError::Backend(anyhow::anyhow!(
+            "Postgres metadata is backed up with pg_dump or point-in-time recovery, not flux-server backup"
+        )))
     }
 
     /// Serialize log-sequence assignment per repo (SPEC §5.1.2). The lock is

@@ -101,15 +101,15 @@ async fn revisions() {
         ids.push(id);
         prev = vec![id];
     }
-    flux.update_ref(repo, b"main", RefExpect::Absent, Some(ids[3]), "t".into()).await.unwrap();
+    flux.update_ref(repo, b"main", RefExpect::Absent, Some(ids[3]), "test", "t".into()).await.unwrap();
     assert_eq!(flux.resolve_rev(repo, "main").await.unwrap(), ids[3]);
     assert_eq!(flux.resolve_rev(repo, "main~2").await.unwrap(), ids[1]);
     assert_eq!(flux.resolve_rev(repo, "main^~1").await.unwrap(), ids[1]);
     assert_eq!(flux.resolve_rev(repo, &ids[2].to_hex()[..10]).await.unwrap(), ids[2]);
     assert_eq!(flux.resolve_rev(repo, &ids[2].short()).await.unwrap(), ids[2]);
     assert!(flux.resolve_rev(repo, "main~9").await.is_err());
-    assert!(flux.update_ref(repo, b"bad~name", RefExpect::Any, Some(ids[0]), "t".into()).await.is_err());
-    assert!(flux.update_ref(repo, b"x", RefExpect::Any, Some(ChangesetId::hash(b"ghost")), "t".into()).await.is_err());
+    assert!(flux.update_ref(repo, b"bad~name", RefExpect::Any, Some(ids[0]), "test", "t".into()).await.is_err());
+    assert!(flux.update_ref(repo, b"x", RefExpect::Any, Some(ChangesetId::hash(b"ghost")), "test", "t".into()).await.is_err());
 }
 
 #[tokio::test]

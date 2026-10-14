@@ -2,3 +2,4 @@
 *.db
 *.db-*
 /.flux-data
+.playwright-mcp/

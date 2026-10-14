@@ -1,6 +1,6 @@
 //! Server-side operations, independent of the RPC layer (SPEC §7).
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use flux_core::{Changeset, ChangesetId, ContentId, FileChange, FileKind, RepoPath, TreeEntry, TreeId};
@@ -22,6 +22,10 @@ pub enum FluxError {
     FailedPrecondition(String),
     #[error("{0}")]
     AlreadyExists(String),
+    #[error("{0}")]
+    Unauthenticated(String),
+    #[error("{0}")]
+    PermissionDenied(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -58,6 +62,8 @@ impl From<FluxError> for Status {
             FluxError::InvalidArgument(m) => Status::invalid_argument(m),
             FluxError::FailedPrecondition(m) => Status::failed_precondition(m),
             FluxError::AlreadyExists(m) => Status::already_exists(m),
+            FluxError::Unauthenticated(m) => Status::unauthenticated(m),
+            FluxError::PermissionDenied(m) => Status::permission_denied(m),
             FluxError::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 Status::internal(e.to_string())
@@ -78,15 +84,91 @@ pub struct Loaded {
     pub changeset: Changeset,
 }
 
+/// Something that happened in a repository (streamed to watchers).
+#[derive(Debug, Clone)]
+pub enum Event {
+    RefMoved { repo: String, name: Vec<u8>, old: Option<ChangesetId>, new: Option<ChangesetId>, actor: String },
+    Changesets { repo: String, count: usize, last: ChangesetId },
+    Review { repo: String, number: i64, kind: String },
+}
+
+impl Event {
+    pub fn repo(&self) -> &str {
+        match self {
+            Event::RefMoved { repo, .. } | Event::Changesets { repo, .. } | Event::Review { repo, .. } => repo,
+        }
+    }
+}
+
 pub struct Flux {
     pub meta: Arc<dyn MetaStore>,
     pub blobs: BlobStore,
     repos: moka::future::Cache<String, RepoId>,
+    repo_names: moka::sync::Cache<RepoId, String>,
+    /// Immutable changesets, by (repo, id).
+    changesets: moka::sync::Cache<(RepoId, ChangesetId), Arc<Loaded>>,
+    pub(crate) graphs: std::sync::Mutex<std::collections::HashMap<RepoId, Arc<crate::history::RepoGraph>>>,
+    pub(crate) lastmod_locks: std::sync::Mutex<std::collections::HashMap<RepoId, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) lastmod_done: std::sync::Mutex<std::collections::HashMap<RepoId, Arc<std::sync::Mutex<HashSet<ChangesetId>>>>>,
+    pub(crate) blame_cache: moka::sync::Cache<(RepoId, ChangesetId, Vec<u8>), Arc<crate::history::Blame>>,
+    events: tokio::sync::broadcast::Sender<Event>,
+    pub auth_mode: crate::auth::AuthMode,
+    pub(crate) token_cache: moka::sync::Cache<[u8; 32], flux_store::User>,
+    pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
 }
 
 impl Flux {
     pub fn new(meta: Arc<dyn MetaStore>, blobs: BlobStore) -> Self {
-        Self { meta, blobs, repos: moka::future::Cache::new(10_000) }
+        Self {
+            meta,
+            blobs,
+            repos: moka::future::Cache::new(10_000),
+            repo_names: moka::sync::Cache::new(10_000),
+            changesets: moka::sync::Cache::builder()
+                .weigher(|_, l: &Arc<Loaded>| (l.canonical.len() * 2 + 256) as u32)
+                .max_capacity(256 << 20)
+                .build(),
+            graphs: Default::default(),
+            lastmod_locks: Default::default(),
+            lastmod_done: Default::default(),
+            blame_cache: moka::sync::Cache::builder()
+                .weigher(|_, b: &Arc<crate::history::Blame>| (b.ranges.len() * 48 + 64) as u32)
+                .max_capacity(64 << 20)
+                .build(),
+            events: tokio::sync::broadcast::channel(4096).0,
+            auth_mode: crate::auth::AuthMode::Open,
+            token_cache: moka::sync::Cache::builder().max_capacity(10_000).time_to_live(std::time::Duration::from_secs(60)).build(),
+            file_lists: moka::sync::Cache::builder()
+                .weigher(|_, l: &crate::search::FileList| (l.len() * 80 + 64) as u32)
+                .max_capacity(256 << 20)
+                .build(),
+        }
+    }
+
+    pub fn with_auth_mode(mut self, mode: crate::auth::AuthMode) -> Self {
+        self.auth_mode = mode;
+        self
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    pub fn publish(&self, e: Event) {
+        let _ = self.events.send(e);
+    }
+
+    /// Name of a repository id (for events).
+    pub async fn repo_name(&self, repo: RepoId) -> String {
+        if let Some(n) = self.repo_names.get(&repo) {
+            return n;
+        }
+        if let Ok(repos) = self.meta.list_repos().await {
+            for r in repos {
+                self.repo_names.insert(r.id, r.name);
+            }
+        }
+        self.repo_names.get(&repo).unwrap_or_default()
     }
 
     pub async fn repo(&self, name: &str) -> FluxResult<RepoId> {
@@ -95,6 +177,7 @@ impl Flux {
         }
         let info = self.meta.get_repo(name).await?.ok_or_else(|| FluxError::NotFound(format!("repository {name:?} not found")))?;
         self.repos.insert(name.to_string(), info.id).await;
+        self.repo_names.insert(info.id, name.to_string());
         Ok(info.id)
     }
 
@@ -126,27 +209,44 @@ impl Flux {
 
     // ───────────── changesets ─────────────
 
-    pub async fn load(&self, repo: RepoId, ids: &[ChangesetId]) -> FluxResult<Vec<Option<Loaded>>> {
-        let stored = self.meta.get_changesets(repo, ids).await?;
-        stored
-            .into_iter()
-            .map(|s| {
-                s.map(|s| {
-                    let changeset = Changeset::decode_verified(&s.body, &s.id)
-                        .map_err(|e| FluxError::Internal(anyhow::anyhow!("corrupt changeset {}: {e}", s.id)))?;
-                    Ok(Loaded { id: s.id, gen_num: s.gen_num, log_seq: s.log_seq, canonical: s.body, changeset })
-                })
-                .transpose()
-            })
-            .collect()
+    /// Load changesets (cached: they are immutable).
+    pub async fn load_arc(&self, repo: RepoId, ids: &[ChangesetId]) -> FluxResult<Vec<Option<Arc<Loaded>>>> {
+        let mut out: Vec<Option<Arc<Loaded>>> = ids.iter().map(|id| self.changesets.get(&(repo, *id))).collect();
+        let missing: Vec<ChangesetId> = ids.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(i, _)| *i).collect();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let stored = self.meta.get_changesets(repo, &missing).await?;
+        let mut found = std::collections::HashMap::new();
+        for s in stored.into_iter().flatten() {
+            let changeset = Changeset::decode_verified(&s.body, &s.id)
+                .map_err(|e| FluxError::Internal(anyhow::anyhow!("corrupt changeset {}: {e}", s.id)))?;
+            let l = Arc::new(Loaded { id: s.id, gen_num: s.gen_num, log_seq: s.log_seq, canonical: s.body, changeset });
+            self.changesets.insert((repo, s.id), l.clone());
+            found.insert(s.id, l);
+        }
+        for (slot, id) in out.iter_mut().zip(ids) {
+            if slot.is_none() {
+                *slot = found.get(id).cloned();
+            }
+        }
+        Ok(out)
     }
 
-    pub async fn load_one(&self, repo: RepoId, id: &ChangesetId) -> FluxResult<Loaded> {
-        self.load(repo, std::slice::from_ref(id))
+    pub async fn load(&self, repo: RepoId, ids: &[ChangesetId]) -> FluxResult<Vec<Option<Loaded>>> {
+        Ok(self.load_arc(repo, ids).await?.into_iter().map(|o| o.map(|a| (*a).clone())).collect())
+    }
+
+    pub async fn load_one_arc(&self, repo: RepoId, id: &ChangesetId) -> FluxResult<Arc<Loaded>> {
+        self.load_arc(repo, std::slice::from_ref(id))
             .await?
             .pop()
             .flatten()
             .ok_or_else(|| FluxError::NotFound(format!("changeset {id} not found")))
+    }
+
+    pub async fn load_one(&self, repo: RepoId, id: &ChangesetId) -> FluxResult<Loaded> {
+        Ok((*self.load_one_arc(repo, id).await?).clone())
     }
 
     /// Root tree of a changeset, deriving it (and any underived ancestors) if
@@ -306,6 +406,7 @@ impl Flux {
         self.meta.put_derived(repo, TREE_V1, &derived).await?;
         mark("derived", &mut phases);
         tracing::debug!(n = batch.len(), ?phases, "create_changesets");
+        self.after_create(repo, &rows, &seqs).await;
 
         Ok(batch
             .iter()
@@ -381,6 +482,30 @@ impl Flux {
             }
         }
         Ok(())
+    }
+
+    /// Batched [`Flux::info`]: one derived-tree and one git-map query.
+    pub async fn infos(&self, repo: RepoId, items: &[Arc<Loaded>]) -> FluxResult<Vec<v1::ChangesetInfo>> {
+        let ids: Vec<ChangesetId> = items.iter().map(|l| l.id).collect();
+        let trees = self.meta.get_derived(repo, TREE_V1, &ids).await?;
+        let gits = self.meta.cs_to_git(repo, &ids).await?;
+        let mut out = Vec::with_capacity(items.len());
+        for ((l, t), g) in items.iter().zip(trees).zip(gits) {
+            let tree = match t {
+                Some(t) => TreeId::from_slice(&t).map_err(|e| FluxError::Internal(e.into()))?,
+                None => self.root_tree(repo, &l.id).await?,
+            };
+            out.push(v1::ChangesetInfo {
+                id: l.id.as_bytes().to_vec(),
+                generation: l.gen_num,
+                root_tree: tree.as_bytes().to_vec(),
+                log_seq: l.log_seq,
+                canonical: l.canonical.clone(),
+                changeset: Some(flux_proto::changeset_to_pb(&l.changeset)),
+                git_sha1: g.map(|g| g.to_vec()).unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     pub async fn info(&self, repo: RepoId, loaded: &Loaded) -> FluxResult<v1::ChangesetInfo> {
@@ -466,59 +591,6 @@ impl Flux {
 
     // ───────────── history ─────────────
 
-    /// Ancestors of `start` in descending generation order.
-    pub async fn log(
-        &self,
-        repo: RepoId,
-        start: ChangesetId,
-        limit: usize,
-        first_parent: bool,
-        path: Option<&RepoPath>,
-        mut emit: impl FnMut(Loaded) -> bool,
-    ) -> FluxResult<()> {
-        let mut heap: BinaryHeap<(u64, ChangesetId)> = BinaryHeap::new();
-        let mut seen: HashSet<ChangesetId> = HashSet::new();
-        let first = self.load_one(repo, &start).await?;
-        heap.push((first.gen_num, start));
-        seen.insert(start);
-        let mut emitted = 0;
-        while let Some((_, id)) = heap.pop() {
-            let cs = self.load_one(repo, &id).await?;
-            let parents: Vec<ChangesetId> =
-                if first_parent { cs.changeset.parents.iter().take(1).copied().collect() } else { cs.changeset.parents.clone() };
-            let new: Vec<ChangesetId> = parents.into_iter().filter(|p| seen.insert(*p)).collect();
-            if !new.is_empty() {
-                for (p, g) in new.iter().zip(self.meta.get_gens(repo, &new).await?) {
-                    heap.push((g.unwrap_or(0), *p));
-                }
-            }
-            let touches = match path {
-                None => true,
-                Some(path) => self.touches_path(repo, &cs, path).await?,
-            };
-            if touches {
-                emitted += 1;
-                if !emit(cs) || emitted >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn touches_path(&self, repo: RepoId, cs: &Loaded, path: &RepoPath) -> FluxResult<bool> {
-        if cs.changeset.parents.len() <= 1 {
-            // Non-merge: the listed changes are exactly the first-parent diff.
-            // (A listed no-op deletion can over-report; that's acceptable.)
-            return Ok(cs.changeset.file_changes.keys().any(|p| p.starts_with(path) || path.starts_with(p)));
-        }
-        // Merges list paths where parents disagree even if unchanged relative
-        // to the first parent, so compare against the first parent's state.
-        let here = self.entry_at(repo, &cs.id, path).await?;
-        let there = self.entry_at(repo, &cs.changeset.parents[0], path).await?;
-        Ok(here != there)
-    }
-
     pub async fn entry_at(&self, repo: RepoId, id: &ChangesetId, path: &RepoPath) -> FluxResult<Option<TreeEntry>> {
         let root = self.root_tree(repo, id).await?;
         Ok(lookup_path(&self.blobs, root, path).await?)
@@ -532,17 +604,23 @@ impl Flux {
         name: &[u8],
         expect: RefExpect,
         new: Option<ChangesetId>,
+        actor: &str,
         reason: String,
     ) -> FluxResult<(CasOutcome, Option<RefValue>)> {
         validate_ref_name(name)?;
         if let Some(target) = new {
             self.load_one(repo, &target).await?;
         }
-        let outcome = self.meta.cas_ref(repo, name, expect, new, RefLogEntry { actor: "anonymous".into(), reason }).await?;
+        let old = self.meta.get_ref(repo, name).await?.map(|r| r.target);
+        let outcome = self.meta.cas_ref(repo, name, expect, new, RefLogEntry { actor: actor.into(), reason }).await?;
         let current = match &outcome {
             CasOutcome::Mismatch { current } => *current,
             _ => None,
         };
+        if !matches!(outcome, CasOutcome::Mismatch { .. }) {
+            let repo_name = self.repo_name(repo).await;
+            self.publish(Event::RefMoved { repo: repo_name, name: name.to_vec(), old, new, actor: actor.into() });
+        }
         Ok((outcome, current))
     }
 }

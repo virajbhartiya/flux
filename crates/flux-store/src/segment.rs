@@ -407,6 +407,50 @@ impl SegmentStore {
         Ok(())
     }
 
+    /// Copy a consistent snapshot of the store into `dest` (online). Sealed
+    /// segments are immutable, so they are hard-linked when possible; the
+    /// active segment is copied up to its last synced length (a valid
+    /// prefix: records are append-only and CRC-checked on open).
+    pub fn snapshot_to(&self, dest: &Path) -> std::io::Result<SegmentStats> {
+        std::fs::create_dir_all(dest)?;
+        self.sync()?;
+        let (active_seq, synced) = {
+            let w = self.writer.lock().unwrap();
+            (w.seq, w.synced)
+        };
+        let mut copied = SegmentStats::default();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().unwrap_or_default();
+            let Some(seq) = name.strip_prefix("seg-").and_then(|r| r.get(..8)).and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                continue;
+            }
+            let to = dest.join(&name);
+            if seq == active_seq && name.ends_with(".pack") {
+                let mut src = File::open(entry.path())?;
+                let mut dst = File::create(&to)?;
+                std::io::copy(&mut (&mut src).take(synced), &mut dst)?;
+                dst.sync_all()?;
+                copied.bytes += synced;
+            } else if seq < active_seq {
+                if std::fs::hard_link(entry.path(), &to).is_err() {
+                    std::fs::copy(entry.path(), &to)?;
+                }
+                if name.ends_with(".pack") {
+                    copied.bytes += entry.metadata()?.len();
+                }
+            }
+            if name.ends_with(".pack") {
+                copied.segments += 1;
+            }
+        }
+        copied.objects = self.stats().objects;
+        Ok(copied)
+    }
+
     pub fn stats(&self) -> SegmentStats {
         // Lock order: writer, then state (same as put_batch).
         let w = self.writer.lock().unwrap();

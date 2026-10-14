@@ -16,6 +16,22 @@ flux-store.workspace = true
 flux-derive.workspace = true
 flux-proto.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
+similar = "2"
+axum = { version = "0.8", features = ["http1", "http2", "tokio", "query", "form"] }
+maud = "0.27"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "html", "parsing", "regex-onig"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br", "compression-zstd"] }
+serde.workspace = true
+serde_json.workspace = true
+diffy = "0.4"
+getrandom = "0.3"
+hex.workspace = true
+rayon = "1"
+regex = "1"
+sha2.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
