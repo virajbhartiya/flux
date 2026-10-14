@@ -62,6 +62,7 @@ pub async fn open_with(cfg: &StorageConfig, auth: auth::AuthMode) -> anyhow::Res
 /// derive history indexes for every ref head, so the first page views and
 /// `log -- path` queries are fast.
 pub fn warm(flux: &Arc<Flux>) {
+    warm_git(flux);
     let flux = flux.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
@@ -79,6 +80,51 @@ pub fn warm(flux: &Arc<Flux>) {
             }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "caches warm");
+    });
+}
+
+/// Keep git objects generated for every ref head, at startup and as refs
+/// move, so a first `git clone` or `fetch` never waits for history to be
+/// converted. Moves are batched briefly; generation is idempotent.
+fn warm_git(flux: &Arc<Flux>) {
+    let flux = flux.clone();
+    let mut rx = flux.subscribe();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut generated = 0usize;
+        if let Ok(repos) = flux.meta.list_repos().await {
+            for r in repos {
+                let Ok(refs) = flux.meta.list_refs(r.id, b"", 10_000).await else { continue };
+                let heads: Vec<_> = refs.into_iter().map(|(_, v)| v.target).collect();
+                match flux.git_commit_shas(r.id, &heads).await {
+                    Ok(_) => generated += heads.len(),
+                    Err(e) => tracing::warn!(repo = %r.name, error = %e, "warm: git object generation failed"),
+                }
+            }
+        }
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, heads = generated, "git objects warm");
+        loop {
+            let mut moved = std::collections::BTreeSet::new();
+            match rx.recv().await {
+                Ok(core::Event::RefMoved { repo, new: Some(cs), .. }) => {
+                    moved.insert((repo, cs));
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            while let Ok(e) = rx.try_recv() {
+                if let core::Event::RefMoved { repo, new: Some(cs), .. } = e {
+                    moved.insert((repo, cs));
+                }
+            }
+            for (name, cs) in moved {
+                let Ok(repo) = flux.repo(&name).await else { continue };
+                if let Err(e) = flux.git_commit_shas(repo, &[cs]).await {
+                    tracing::warn!(repo = %name, error = %e, "git object generation failed");
+                }
+            }
+        }
     });
 }
 

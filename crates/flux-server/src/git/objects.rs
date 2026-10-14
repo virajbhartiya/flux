@@ -170,6 +170,9 @@ pub struct GitCaches {
     pub commits: moka::sync::Cache<(RepoId, ChangesetId), Sha>,
     /// Tree mappings not yet persisted (written in batches).
     pending_trees: std::sync::Mutex<Vec<(TreeId, Sha)>>,
+    /// One history generation at a time: concurrent requests (or the
+    /// background warmer) wait and then find the work done.
+    generating: std::sync::Mutex<HashMap<RepoId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for GitCaches {
@@ -185,6 +188,7 @@ impl GitCaches {
             blobs: moka::sync::Cache::new(4_000_000),
             commits: moka::sync::Cache::new(4_000_000),
             pending_trees: Default::default(),
+            generating: Default::default(),
         }
     }
 }
@@ -335,6 +339,8 @@ impl Flux {
         roots: &[ChangesetId],
         known: &mut HashMap<ChangesetId, Sha>,
     ) -> FluxResult<()> {
+        let lock = self.git.generating.lock().unwrap().entry(repo).or_default().clone();
+        let _one_at_a_time = lock.lock().await;
         // Collect unmapped ancestors (graph order is topological).
         let g = self.repo_graph(repo).await?;
         let mut need: Vec<u32> = Vec::new();
