@@ -18,5 +18,5 @@ WORKDIR /var/lib/flux
 ENV FLUX_LISTEN=0.0.0.0:7878 FLUX_DATA_DIR=/var/lib/flux/data
 EXPOSE 7878
 VOLUME ["/var/lib/flux"]
-HEALTHCHECK --interval=10s --timeout=3s CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/7878 && printf 'GET /-/readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ready <&3"]
+HEALTHCHECK --interval=10s --timeout=3s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7878 && printf 'GET /-/readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ready <&3"]
 ENTRYPOINT ["/usr/bin/tini", "--", "flux-server"]
