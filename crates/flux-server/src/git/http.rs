@@ -40,15 +40,9 @@ pub enum Op {
 /// `.../git-receive-pack`.
 pub fn route(rest: &str) -> Option<(String, Op)> {
     let rest = rest.trim_start_matches('/');
-    let (base, op) = if let Some(b) = rest.strip_suffix("/info/refs") {
-        (b, Op::InfoRefs)
-    } else if let Some(b) = rest.strip_suffix("/git-upload-pack") {
-        (b, Op::UploadPack)
-    } else if let Some(b) = rest.strip_suffix("/git-receive-pack") {
-        (b, Op::ReceivePack)
-    } else {
-        return None;
-    };
+    let (base, op) = [("/info/refs", Op::InfoRefs), ("/git-upload-pack", Op::UploadPack), ("/git-receive-pack", Op::ReceivePack)]
+        .into_iter()
+        .find_map(|(suffix, op)| Some((rest.strip_suffix(suffix)?, op)))?;
     let repo = base.strip_suffix(".git").unwrap_or(base);
     (!repo.is_empty()).then(|| (repo.to_string(), op))
 }
