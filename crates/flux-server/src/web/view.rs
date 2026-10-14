@@ -9,7 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use super::{Req, Web, security_headers};
 
-pub const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#6d5dfc"/><path d="M9 22c4-1 5-4 7-8s4-6 7-6" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round"/><circle cx="9" cy="22" r="2.5" fill="#fff"/><circle cx="23" cy="8" r="2.5" fill="#fff"/></svg>"##;
+pub const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="#e2512a"/><path d="M13.5 25.5V13.2c0-3.2 2-5.2 5.2-5.2h2.3M9.5 15.5h9" stroke="#fffaf3" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="22.5" cy="23.5" r="2.4" fill="#1c1a16"/></svg>"##;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -19,6 +19,7 @@ pub enum Tab {
     Branches,
     Activity,
     Search,
+    Settings,
 }
 
 pub struct RepoNav<'a> {
@@ -27,6 +28,13 @@ pub struct RepoNav<'a> {
     /// Revision for code links (branch name or changeset id).
     pub rev: &'a str,
     pub open_reviews: usize,
+    pub description: String,
+    pub default_branch: String,
+    pub changesets: u64,
+    pub branches: usize,
+    /// `scheme://host` this page was requested through (for clone URLs).
+    pub origin: String,
+    pub is_admin: bool,
 }
 
 // ───────────── icons (inline SVG, 16px) ─────────────
@@ -63,6 +71,13 @@ pub fn icon(name: &str) -> Markup {
         "lock" => "M4.5 7V5a3.5 3.5 0 0 1 7 0v2M3.5 7h9v7h-9Z",
         "edit" => "M10.5 2.5l3 3L6 13H3v-3Zm-2 2 3 3",
         "plus" => "M8 3v10M3 8h10",
+        "gear" => {
+            "M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5ZM8 1.5v1.75M8 12.75v1.75M1.5 8h1.75M12.75 8h1.75M3.4 3.4l1.25 1.25M11.35 11.35l1.25 1.25M3.4 12.6l1.25-1.25M11.35 4.65l1.25-1.25"
+        }
+        "users" => {
+            "M6 7.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM1.5 13.5c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4M11 7.25a2 2 0 1 0 0-4M12.5 13.5c0-1.75-.75-3-2-3.5"
+        }
+        "repo" => "M3 2.5h8.5a1 1 0 0 1 1 1v10H4a1 1 0 0 1-1-1Zm0 9.25a1 1 0 0 1 1-1h8.5M6 5h4",
         _ => "M2 2h12v12H2Z",
     };
     html! {
@@ -229,54 +244,40 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                 meta name="color-scheme" content="light dark";
                 title { (title) " · flux" }
                 link rel="icon" href="/-/static/favicon.svg" type="image/svg+xml";
+                link rel="preload" href="/-/static/fonts/sans.woff2" as="font" type="font/woff2" crossorigin;
+                link rel="preload" href="/-/static/fonts/serif.woff2" as="font" type="font/woff2" crossorigin;
                 link rel="stylesheet" href=(web.css_path);
                 script src=(web.js_path) defer {}
             }
             body {
                 header.top {
                     div.top-inner {
-                        a.brand href="/" { (PreEscaped(FAVICON)) span { "flux" } }
+                        a.brand href="/" aria-label="flux home" { (PreEscaped(FAVICON)) span { "flux" } }
                         @if let Some(n) = &nav {
-                            span.sep { "/" }
-                            a.repo-name href=(repo_url(n.repo)) { (n.repo) }
+                            span.crumb-sep { "/" }
+                            a.top-repo href=(repo_url(n.repo)) { (n.repo) }
                         }
                         div.spacer {}
-                        @if let Some(n) = &nav {
-                            form.top-search action=(format!("/{}/-/search", enc(n.repo))) method="get" {
-                                (icon("search"))
-                                input type="search" name="q" placeholder="Search code…  ( / )" aria-label="Search code" autocomplete="off";
-                                input type="hidden" name="rev" value=(n.rev);
-                            }
-                            button.btn.ghost.finder-btn type="button" data-finder=(format!("/{}/-/files/{}", enc(n.repo), enc(n.rev))) title="Go to file (t)" {
-                                (icon("file")) span.hide-sm { "Go to file" } kbd { "t" }
-                            }
+                        button.palette-btn type="button" data-palette aria-label="Search or jump to" {
+                            (icon("search")) span.hide-sm { "Search or jump to…" } span.spacer {} kbd { "⌘" } kbd { "K" }
                         }
-                        button.btn.ghost.theme-toggle type="button" title="Toggle theme" aria-label="Toggle theme" { (icon("sun")) }
+                        button.btn.ghost.icon-only.theme-toggle type="button" title="Toggle theme" aria-label="Toggle theme" { (icon("sun")) }
                         @match (&user, mode) {
                             (Some(u), _) => {
                                 form.inline action="/-/logout" method="post" {
                                     span.user { (avatar(u, "", false)) span.hide-sm { (u) } }
-                                    button.btn.ghost type="submit" { "Sign out" }
+                                    button.btn.ghost.small type="submit" { "Sign out" }
                                 }
                             }
                             (None, crate::auth::AuthMode::Open) => {}
-                            (None, _) => { a.btn href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" } }
+                            (None, _) => { a.btn.small href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" } }
                         }
                     }
                 }
                 @if let Some(n) = &nav {
-                    nav.repo-tabs {
-                        div.tabs-inner {
-                            (tab(n, Tab::Code, "code", "Code", &format!("/{}/-/tree/{}", enc(n.repo), enc(n.rev))))
-                            (tab(n, Tab::Commits, "history", "Changes", &format!("/{}/-/commits/{}", enc(n.repo), enc(n.rev))))
-                            (tab(n, Tab::Reviews, "review", &format!("Reviews{}", if n.open_reviews > 0 { format!(" · {}", n.open_reviews) } else { String::new() }), &format!("/{}/-/reviews", enc(n.repo))))
-                            (tab(n, Tab::Branches, "branch", "Branches", &format!("/{}/-/branches", enc(n.repo))))
-                            (tab(n, Tab::Activity, "pulse", "Activity", &format!("/{}/-/activity", enc(n.repo))))
-                            (tab(n, Tab::Search, "search", "Search", &format!("/{}/-/search?rev={}", enc(n.repo), enc(n.rev))))
-                        }
-                    }
+                    (repo_head(n))
                 }
-                main #main data-repo=[nav.as_ref().map(|n| n.repo)] data-rev=[nav.as_ref().map(|n| n.rev)] {
+                main #main data-repo=[nav.as_ref().map(|n| n.repo)] data-rev=[nav.as_ref().map(|n| n.rev)] data-files=[nav.as_ref().map(|n| format!("/{}/-/files/{}", enc(n.repo), enc(n.rev)))] {
                     div #live-banner hidden {}
                     (body)
                 }
@@ -287,11 +288,11 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                     span.dot { "·" }
                     a href="https://github.com/virajbhartiya/flux" { "source" }
                 }
-                div #finder hidden {
-                    div.finder-box {
-                        input #finder-input type="text" placeholder="Go to file…" autocomplete="off" spellcheck="false";
-                        ul #finder-list {}
-                        div.finder-hint { kbd { "↑" } kbd { "↓" } " navigate " kbd { "↵" } " open " kbd { "esc" } " close" }
+                div #palette.overlay hidden {
+                    div.palette role="dialog" aria-label="Command palette" {
+                        div.palette-input { (icon("search")) input #palette-input type="text" placeholder="Search files, branches, repositories, commands…" autocomplete="off" spellcheck="false"; }
+                        ul #palette-list {}
+                        div.palette-hint { kbd { "↑" } kbd { "↓" } " navigate" span.dot { "·" } kbd { "↵" } " open" span.dot { "·" } kbd { "t" } " files" span.dot { "·" } kbd { "esc" } " close" }
                     }
                 }
             }
@@ -300,9 +301,59 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
     html_response(req, markup)
 }
 
-fn tab(n: &RepoNav<'_>, which: Tab, icon_name: &str, label: &str, href: &str) -> Markup {
+fn repo_head(n: &RepoNav<'_>) -> Markup {
+    let (owner, name) = match n.repo.rsplit_once('/') {
+        Some((o, r)) => (Some(o), r),
+        None => (None, n.repo),
+    };
+    let flux_cmd = format!("flux attach {} {}", n.origin, n.repo);
+    let git_url = format!("{}/{}.git", n.origin, n.repo);
     html! {
-        a.tab.active[n.tab == which] href=(href) { (icon(icon_name)) span { (label) } }
+        section.repo-head {
+            div.repo-head-inner {
+                div.repo-title {
+                    h1 { @if let Some(o) = owner { span.owner { (o) " / " } } (name) }
+                    details.clone {
+                        summary.btn.accent { (icon("code")) "Clone" span.caret {} }
+                        div.clone-menu {
+                            h4 { "flux · sparse working copy" }
+                            div.cmd { code { (flux_cmd) } button.copy-btn type="button" data-copy=(flux_cmd) title="Copy" { (icon("copy")) } }
+                            h4 { "git · clone over HTTP" }
+                            div.cmd { code { "git clone " (git_url) } button.copy-btn type="button" data-copy=(format!("git clone {git_url}")) title="Copy" { (icon("copy")) } }
+                            p.muted.small { "Pushes from git land through the same compare-and-swap as flux, and appear here instantly." }
+                        }
+                    }
+                }
+                @if n.description.is_empty() {
+                    p.repo-desc.faint { "No description" @if n.is_admin { " · " a.link href=(format!("/{}/-/settings", enc(n.repo))) { "add one" } } }
+                } @else {
+                    p.repo-desc { (n.description) }
+                }
+                div.repo-chips {
+                    span { (icon("branch")) b { (n.default_branch) } }
+                    span { (icon("history")) b { (count(n.changesets)) } " changes" }
+                    span { (icon("branch")) b { (n.branches) } " branches" }
+                    @if n.open_reviews > 0 { span { (icon("review")) b { (n.open_reviews) } " open reviews" } }
+                }
+                nav.repo-tabs {
+                    (tab(n, Tab::Code, "code", "Code", None, &format!("/{}/-/tree/{}", enc(n.repo), enc(n.rev))))
+                    (tab(n, Tab::Commits, "history", "Changes", None, &format!("/{}/-/commits/{}", enc(n.repo), enc(n.rev))))
+                    (tab(n, Tab::Reviews, "review", "Reviews", (n.open_reviews > 0).then_some(n.open_reviews), &format!("/{}/-/reviews", enc(n.repo))))
+                    (tab(n, Tab::Branches, "branch", "Branches", None, &format!("/{}/-/branches", enc(n.repo))))
+                    (tab(n, Tab::Activity, "pulse", "Activity", None, &format!("/{}/-/activity", enc(n.repo))))
+                    (tab(n, Tab::Search, "search", "Search", None, &format!("/{}/-/search?rev={}", enc(n.repo), enc(n.rev))))
+                    @if n.is_admin {
+                        (tab(n, Tab::Settings, "gear", "Settings", None, &format!("/{}/-/settings", enc(n.repo))))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tab(n: &RepoNav<'_>, which: Tab, icon_name: &str, label: &str, badge: Option<usize>, href: &str) -> Markup {
+    html! {
+        a.tab.active[n.tab == which] href=(href) { (icon(icon_name)) span { (label) } @if let Some(b) = badge { span.count { (b) } } }
     }
 }
 

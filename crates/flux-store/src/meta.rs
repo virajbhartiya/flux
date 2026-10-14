@@ -175,6 +175,9 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn create_repo(&self, name: &str) -> StoreResult<RepoId>;
     async fn get_repo(&self, name: &str) -> StoreResult<Option<RepoInfo>>;
     async fn list_repos(&self) -> StoreResult<Vec<RepoInfo>>;
+    /// Replace a repository's JSON config (description, default branch,
+    /// path ACL rules, ...).
+    async fn set_repo_config(&self, repo: RepoId, config: &str) -> StoreResult<()>;
 
     // changesets
     /// Insert changesets in order. Idempotent: existing ids keep their

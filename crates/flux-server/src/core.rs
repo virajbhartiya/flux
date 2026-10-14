@@ -113,6 +113,7 @@ pub struct Flux {
     pub(crate) blame_cache: moka::sync::Cache<(RepoId, ChangesetId, Vec<u8>), Arc<crate::history::Blame>>,
     events: tokio::sync::broadcast::Sender<Event>,
     derived_cache: moka::sync::Cache<(RepoId, i32, ChangesetId), [u8; 32]>,
+    pub(crate) repo_configs: moka::sync::Cache<RepoId, Arc<crate::repo_config::RepoConfig>>,
     pub auth_mode: crate::auth::AuthMode,
     pub(crate) token_cache: moka::sync::Cache<[u8; 32], flux_store::User>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
@@ -138,6 +139,10 @@ impl Flux {
                 .build(),
             events: tokio::sync::broadcast::channel(4096).0,
             derived_cache: moka::sync::Cache::new(2_000_000),
+            repo_configs: moka::sync::Cache::builder()
+                .time_to_live(std::time::Duration::from_secs(5))
+                .max_capacity(10_000)
+                .build(),
             auth_mode: crate::auth::AuthMode::Open,
             token_cache: moka::sync::Cache::builder()
                 .max_capacity(10_000)

@@ -76,6 +76,7 @@ async fn pages_render() {
         "/-/login".into(),
         "/demo/-/edit/main/src/main.rs".into(),
         "/demo/-/new/main/src".into(),
+        "/demo/-/settings".into(),
     ] {
         let (status, body, headers) = get(&app, &uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
@@ -137,6 +138,48 @@ async fn pages_render() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let (_, body, _) = get(&app, "/-/repos.json").await;
+    assert!(body.contains("\"demo\""));
+    let (_, body, _) = get(&app, "/demo/-/refs.json").await;
+    assert!(body.contains("\"main\""));
+
+    // Inline review comment, then it renders in the review's diff.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/demo/-/reviews/1/comment")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("host", "localhost")
+                .header("origin", "http://localhost")
+                .body(Body::from("path=src%2Fmain.rs&line=1&body=Nice+line"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (_, body, _) = get(&app, "/demo/-/reviews/1").await;
+    assert!(body.contains("Nice line") && body.contains("src/main.rs:1"));
+
+    // Settings round trip.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/demo/-/settings")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("host", "localhost")
+                .header("origin", "http://localhost")
+                .body(Body::from("description=A+demo+repo&default_branch=main&acl=secrets+%7C+admins+%7C+admins"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cfg = flux.repo_config(repo).await.unwrap();
+    assert_eq!(cfg.description, "A demo repo");
+    assert_eq!(cfg.acl[0].path, "secrets");
+    let (_, body, _) = get(&app, "/demo").await;
+    assert!(body.contains("A demo repo"));
 
     let (status, body, _) = get(&app, "/-/metrics").await;
     assert_eq!(status, StatusCode::OK);

@@ -81,10 +81,16 @@ struct RepoCtx {
     name: String,
     id: RepoId,
     refs: Arc<Vec<(String, ChangesetId)>>,
+    config: Arc<crate::repo_config::RepoConfig>,
 }
 
 impl RepoCtx {
     fn default_branch(&self) -> Option<&str> {
+        if let Some(b) = self.config.default_branch.as_deref()
+            && self.is_ref(b)
+        {
+            return Some(b);
+        }
         ["main", "master", "trunk"]
             .iter()
             .find(|b| self.refs.iter().any(|(n, _)| n == *b))
@@ -125,7 +131,8 @@ async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
             r
         }
     };
-    Ok(RepoCtx { name: name.to_string(), id, refs })
+    let config = web.flux.repo_config(id).await?;
+    Ok(RepoCtx { name: name.to_string(), id, refs, config })
 }
 
 async fn open_reviews(flux: &Flux, repo: RepoId) -> usize {
@@ -165,64 +172,121 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
     req.principal.require_read()?;
     let repos = web.flux.meta.list_repos().await?;
     let mut cards = Vec::new();
+    let mut feed: Vec<(String, flux_store::RefLogRow)> = Vec::new();
     for r in &repos {
         let refs = web.flux.meta.list_refs(r.id, b"", 1000).await?;
+        let cfg = web.flux.repo_config(r.id).await?;
         let head = refs
             .iter()
-            .find(|(n, _)| n == b"main")
+            .find(|(n, _)| cfg.default_branch.as_deref().is_some_and(|d| n == d.as_bytes()))
+            .or_else(|| refs.iter().find(|(n, _)| n == b"main" || n == b"master"))
             .or_else(|| refs.first())
             .map(|(n, v)| (String::from_utf8_lossy(n).into_owned(), v.target));
         let latest = match &head {
             Some((_, id)) => web.flux.load_one_arc(r.id, id).await.ok(),
             None => None,
         };
-        cards.push((r.name.clone(), refs.len(), head, latest));
+        for row in web.flux.meta.ref_log(r.id, None, 8).await? {
+            feed.push((r.name.clone(), row));
+        }
+        cards.push((r.name.clone(), cfg.description.clone(), refs.len(), head, latest));
     }
-    cards.sort_by_key(|c| std::cmp::Reverse(c.3.as_ref().map(|l| l.changeset.author_time.unix_ms).unwrap_or(0)));
+    cards.sort_by_key(|c| std::cmp::Reverse(c.4.as_ref().map(|l| l.changeset.author_time.unix_ms).unwrap_or(0)));
+    feed.sort_by_key(|f| std::cmp::Reverse(f.1.ts_ms));
+    feed.truncate(14);
+    let who = req.principal.user.as_ref().map(|u| u.name.clone());
     let body = html! {
-        div.container {
-            div.page-head.row {
-                div {
-                    h1 { "Repositories" }
-                    p.muted { (repos.len()) " repositories on this server" }
+        div.container.wide {
+            div.hero {
+                h1 {
+                    @match &who { Some(u) => { "Welcome back, " em { (u) } "." } None => { "Every change, " em { "instantly" } "." } }
                 }
-                div.spacer {}
-                @if req.principal.is_admin() {
-                    form.inline-form method="post" action="/-/repos" {
-                        input type="text" name="name" placeholder="new-repo" pattern="[A-Za-z0-9._/-]+" required;
-                        button.btn.primary type="submit" { (icon("plus")) "New repository" }
+                p { (repos.len()) " repositor" @if repos.len() == 1 { "y" } @else { "ies" } " on this server. Press " kbd { "⌘" } kbd { "K" } " to jump anywhere." }
+            }
+            div.split-layout {
+                div {
+                    div.page-head.row {
+                        h2 { "Repositories" }
+                        div.spacer {}
+                        @if req.principal.is_admin() {
+                            form.inline-form method="post" action="/-/repos" {
+                                input type="text" name="name" placeholder="new-repository" pattern="[A-Za-z0-9._/-]+" required aria-label="Repository name";
+                                button.btn.primary type="submit" { (icon("plus")) "Create" }
+                            }
+                        }
+                    }
+                    @if cards.is_empty() {
+                        (empty_state("No repositories yet", html! {
+                            p { "Create one above, then import history or start committing:" }
+                            pre.cmd { "flux-import-git --server " (req.origin) " --repo demo import /path/to/repo.git --create" }
+                        }))
+                    }
+                    div.repo-grid.reveal {
+                        @for (name, desc, nrefs, head, latest) in &cards {
+                            a.repo-card href=(view::repo_url(name)) {
+                                div.repo-card-title { (name) }
+                                div.repo-card-desc { @if desc.is_empty() { span.faint { "No description" } } @else { (desc) } }
+                                @if let Some(l) = latest {
+                                    div.repo-card-msg { (subject(&l.changeset.message)) }
+                                    div.repo-card-meta {
+                                        @let (n, e) = person(&l.changeset.author);
+                                        (avatar(&n, &e, false)) span { (n) } span.dot { "·" } (time(l.changeset.author_time.unix_ms))
+                                    }
+                                } @else {
+                                    div.repo-card-msg.muted { "Empty repository" }
+                                }
+                                div.repo-card-foot {
+                                    span { (icon("branch")) (nrefs) " branches" }
+                                    @if let Some((b, _)) = head { span.pill { (b) } }
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            @if cards.is_empty() {
-                (empty_state("No repositories yet", html! {
-                    p { "Create one with the CLI, then import history or start committing:" }
-                    pre.cmd { "flux repo create demo --server http://HOST\nflux-import-git --repo demo import /path/to/repo.git --create" }
-                }))
-            }
-            div.repo-grid {
-                @for (name, nrefs, head, latest) in &cards {
-                    a.repo-card href=(view::repo_url(name)) {
-                        div.repo-card-title { (icon("code")) strong { (name) } }
-                        @if let Some(l) = latest {
-                            div.repo-card-msg { (subject(&l.changeset.message)) }
-                            div.repo-card-meta {
-                                @let (n, e) = person(&l.changeset.author);
-                                (avatar(&n, &e, false)) span { (n) } span.dot { "·" } (time(l.changeset.author_time.unix_ms))
+                aside.side {
+                    section {
+                        h3 { "Latest activity" }
+                        @if feed.is_empty() { p.muted.small { "Nothing yet." } }
+                        ul.feed {
+                            @for (repo, r) in &feed {
+                                li {
+                                    (avatar(&r.actor, "", false))
+                                    div.what {
+                                        strong { (r.actor) }
+                                        @match (r.old, r.new) { (None, Some(_)) => { " created " } (Some(_), None) => { " deleted " } _ => { " moved " } }
+                                        code { (String::from_utf8_lossy(&r.name)) }
+                                        " in " a.link href=(view::repo_url(repo)) { (repo) }
+                                        div.muted { (r.reason) " · " (time(r.ts_ms)) }
+                                    }
+                                }
                             }
-                        } @else {
-                            div.repo-card-msg.muted { "Empty repository" }
                         }
-                        div.repo-card-foot {
-                            span { (icon("branch")) (nrefs) " branches" }
-                            @if let Some((b, _)) = head { span.pill { (b) } }
-                        }
+                    }
+                    section {
+                        h3 { "Get started" }
+                        p.muted.small { "Work in a sparse checkout:" }
+                        pre.cmd { "flux attach " (req.origin) " REPO" }
+                        p.muted.small { "Or use plain git:" }
+                        pre.cmd { "git clone " (req.origin) "/REPO.git" }
                     }
                 }
             }
         }
     };
-    Ok(page(&web, &req, "Repositories", None, body))
+    Ok(page(&web, &req, "Home", None, body))
+}
+
+pub async fn repos_json(State(web): State<WebState>, req: Req) -> WebResult {
+    req.principal.require_read()?;
+    let repos: Vec<String> = web.flux.meta.list_repos().await?.into_iter().map(|r| r.name).collect();
+    Ok(json_response(serde_json::json!({ "repos": repos }), "private, max-age=10"))
+}
+
+fn json_response(v: serde_json::Value, cache: &'static str) -> Response {
+    let mut r = v.to_string().into_response();
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    r
 }
 
 #[derive(Deserialize)]
@@ -387,6 +451,11 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
             files_json(&web, &ctx, &rev).await
         }
         "events" => Ok(events(&web, &ctx)),
+        "refs.json" => {
+            let names: Vec<&str> = ctx.refs.iter().map(|(n, _)| n.as_str()).collect();
+            Ok(json_response(serde_json::json!({ "refs": names }), "private, max-age=5"))
+        }
+        "settings" => settings(&web, &req, &ctx).await,
         "edit" => {
             let (rev, rest) = ctx.split_rev(args);
             let path = path_from(rest)?.ok_or_else(|| WebError::BadRequest("missing path".into()))?;
@@ -412,8 +481,23 @@ fn parse_num(s: &str) -> WebResult<i64> {
     s.parse().map_err(|_| WebError::NotFound(format!("no review {s:?}")))
 }
 
-async fn nav<'a>(web: &WebState, ctx: &'a RepoCtx, tab: Tab, rev: &'a str) -> RepoNav<'a> {
-    RepoNav { repo: &ctx.name, tab, rev, open_reviews: open_reviews(&web.flux, ctx.id).await }
+async fn nav<'a>(web: &WebState, req: &Req, ctx: &'a RepoCtx, tab: Tab, rev: &'a str) -> RepoNav<'a> {
+    let changesets = match web.flux.repo_graph(ctx.id).await {
+        Ok(g) => g.graph.read().unwrap().len() as u64,
+        Err(_) => 0,
+    };
+    RepoNav {
+        repo: &ctx.name,
+        tab,
+        rev,
+        open_reviews: open_reviews(&web.flux, ctx.id).await,
+        description: ctx.config.description.clone(),
+        default_branch: ctx.default_branch().unwrap_or("main").to_string(),
+        changesets,
+        branches: ctx.refs.len(),
+        origin: req.origin.clone(),
+        is_admin: req.principal.is_admin(),
+    }
 }
 
 async fn empty_repo(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
@@ -428,7 +512,7 @@ async fn empty_repo(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
             }))
         }
     };
-    let n = nav(web, ctx, Tab::Code, "main").await;
+    let n = nav(web, req, ctx, Tab::Code, "main").await;
     Ok(page(web, req, &ctx.name, Some(n), body))
 }
 
@@ -532,72 +616,180 @@ async fn tree(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Option<
     };
     let history_url = url(&ctx.name, "commits", rev, path.as_ref());
     let total_files = t.total_files();
-    let body = html! {
-        div.container {
-            div.toolbar {
-                (ref_picker(ctx, rev, "tree", path.as_ref()))
-                (breadcrumbs(&ctx.name, rev, path.as_ref()))
-                div.spacer {}
-                span.muted.small { (view::count(total_files)) " files · " (view::size(t.total_size())) }
-                @if req.principal.can_write() {
-                    a.btn.small href=(url(&ctx.name, "new", rev, path.as_ref())) { (icon("plus")) "Add file" }
-                }
+    let main_col = html! {
+        div.toolbar {
+            (ref_picker(ctx, rev, "tree", path.as_ref()))
+            (breadcrumbs(&ctx.name, rev, path.as_ref()))
+            div.spacer {}
+            span.muted.small.hide-sm { (view::count(total_files)) " files · " (view::size(t.total_size())) }
+            button.btn.small type="button" data-palette-files title="Go to file (t)" { (icon("file")) "Go to file" kbd { "t" } }
+            @if req.principal.can_write() {
+                a.btn.small href=(url(&ctx.name, "new", rev, path.as_ref())) { (icon("plus")) "Add file" }
             }
-            div.card.files {
-                @match latest_id.and_then(|id| loaded.get(&id)) {
-                    Some(l) => (commit_bar(ctx, l, rev, &history_url)),
-                    None => div.commit-bar.muted { "Indexing history…" },
-                }
-                table.file-table {
-                    tbody {
-                        @if let Some(p) = &path {
-                            tr {
-                                td.name colspan="3" {
-                                    a.up href=(url(&ctx.name, "tree", rev, p.parent().as_ref())) { (icon("dir")) " .." }
-                                }
+        }
+        div.card.files {
+            @match latest_id.and_then(|id| loaded.get(&id)) {
+                Some(l) => (commit_bar(ctx, l, rev, &history_url)),
+                None => div.commit-bar.muted { span.skeleton {} },
+            }
+            table.file-table {
+                tbody.reveal {
+                    @if let Some(p) = &path {
+                        tr {
+                            td.name colspan="3" {
+                                a.up href=(url(&ctx.name, "tree", rev, p.parent().as_ref())) { (icon("dir")) " .." }
                             }
                         }
-                        @for e in &entries {
-                            @let child = match &path { Some(p) => p.join(e.name.as_bytes()).ok(), None => RepoPath::new(e.name.as_bytes()).ok() };
-                            @let action = if e.is_dir() { "tree" } else { "blob" };
-                            @let lme = lm.as_ref().and_then(|n| n.get(e.name.as_bytes()));
-                            @let cl = lme.and_then(|x| loaded.get(&x.cs));
-                            tr {
-                                td.name {
-                                    a href=(url(&ctx.name, action, rev, child.as_ref())) class=(if e.is_dir() { "dir" } else { "f" }) {
-                                        (icon(kind_icon(e)))
-                                        span { (String::from_utf8_lossy(e.name.as_bytes())) }
-                                    }
+                    }
+                    @for e in &entries {
+                        @let child = match &path { Some(p) => p.join(e.name.as_bytes()).ok(), None => RepoPath::new(e.name.as_bytes()).ok() };
+                        @let action = if e.is_dir() { "tree" } else { "blob" };
+                        @let lme = lm.as_ref().and_then(|n| n.get(e.name.as_bytes()));
+                        @let cl = lme.and_then(|x| loaded.get(&x.cs));
+                        tr {
+                            td.name {
+                                a href=(url(&ctx.name, action, rev, child.as_ref())) class=(if e.is_dir() { "dir" } else { "f" }) {
+                                    (icon(kind_icon(e)))
+                                    span { (String::from_utf8_lossy(e.name.as_bytes())) }
                                 }
-                                td.msg {
-                                    @if let Some(l) = cl {
-                                        a href=(url(&ctx.name, "commit", &l.id.to_hex(), None)) { (subject(&l.changeset.message)) }
-                                    } @else if lm.is_none() {
-                                        span.skeleton {}
-                                    }
+                            }
+                            td.msg {
+                                @if let Some(l) = cl {
+                                    a href=(url(&ctx.name, "commit", &l.id.to_hex(), None)) { (subject(&l.changeset.message)) }
+                                } @else if lm.is_none() {
+                                    span.skeleton {}
                                 }
-                                td.when {
-                                    @if let Some(l) = cl { (time(l.changeset.author_time.unix_ms)) }
-                                }
+                            }
+                            td.when {
+                                @if let Some(l) = cl { (time(l.changeset.author_time.unix_ms)) }
                             }
                         }
                     }
                 }
             }
-            @if let Some((name, html_out)) = &readme_html {
-                div.card.readme {
-                    div.card-head { (icon("file")) " " (name) }
-                    article.markdown { (PreEscaped(html_out)) }
-                }
+        }
+        @if let Some((name, html_out)) = &readme_html {
+            div.card.readme {
+                div.card-head { (icon("file")) " " (name) }
+                article.markdown { (PreEscaped(html_out)) }
             }
         }
+    };
+    let body = if path.is_none() {
+        let side = repo_sidebar(web, ctx, rev, &cs, root, t.total_size(), total_files).await?;
+        html! { div.container.wide { div.split-layout { div { (main_col) } (side) } } }
+    } else {
+        html! { div.container { (main_col) } }
     };
     let title = match &path {
         Some(p) => format!("{p} at {} · {}", rev_label(rev), ctx.name),
         None => ctx.name.clone(),
     };
-    let n = nav(web, ctx, Tab::Code, rev).await;
+    let n = nav(web, req, ctx, Tab::Code, rev).await;
     Ok(page(web, req, &title, Some(n), body))
+}
+
+/// The repository home sidebar: about, languages, contributors, activity
+/// and open reviews.
+async fn repo_sidebar(
+    web: &WebState,
+    ctx: &RepoCtx,
+    rev: &str,
+    cs: &ChangesetId,
+    root: TreeId,
+    total_size: u64,
+    total_files: u64,
+) -> WebResult<Markup> {
+    let flux = &web.flux;
+    let langs = match web.langs.get(&root) {
+        Some(l) => l,
+        None => {
+            let files = flux.file_list(root).await?;
+            let l = Arc::new(super::lang::breakdown(&files));
+            web.langs.insert(root, l.clone());
+            l
+        }
+    };
+    // Contributors to the last 300 changes.
+    let recent = flux.log_page(ctx.id, cs, &[], None, true, 0, 300).await?;
+    let mut authors: Vec<(String, String, usize)> = Vec::new();
+    for l in &recent {
+        let (n, e) = person(&l.changeset.author);
+        match authors.iter_mut().find(|a| a.0 == n) {
+            Some(a) => a.2 += 1,
+            None => authors.push((n, e, 1)),
+        }
+    }
+    authors.sort_by_key(|a| std::cmp::Reverse(a.2));
+    let log = flux.meta.ref_log(ctx.id, None, 6).await?;
+    let reviews = flux.meta.list_reviews(ctx.id, Some("open"), 5).await?;
+    let mut offsets = Vec::with_capacity(langs.len());
+    let mut x = 0.0f64;
+    for (_, _, pct) in langs.iter() {
+        offsets.push(x);
+        x += pct;
+    }
+    Ok(html! {
+        aside.side {
+            section {
+                h3 { "About" }
+                @if !ctx.config.description.is_empty() { p { (ctx.config.description) } }
+                p.muted.small { (view::count(total_files)) " files · " (view::size(total_size)) " at " code { (rev_label(rev)) } }
+            }
+            @if !langs.is_empty() {
+                section {
+                    h3 { "Languages" }
+                    svg.langbar viewBox="0 0 100 8" preserveAspectRatio="none" width="100%" height="8" aria-hidden="true" {
+                        @for ((_, color, pct), x) in langs.iter().zip(&offsets) {
+                            rect x=(format!("{x:.3}")) y="0" width=(format!("{:.3}", (pct - 0.4).max(0.3))) height="8" fill=(color) {}
+                        }
+                    }
+                    ul.langs {
+                        @for (name, color, pct) in langs.iter() {
+                            li { svg width="9" height="9" aria-hidden="true" { circle cx="4.5" cy="4.5" r="4.5" fill=(color) {} } b { (name) } span.faint { (format!("{pct:.1}%")) } }
+                        }
+                    }
+                }
+            }
+            @if !authors.is_empty() {
+                section {
+                    h3 { "Contributors" span.faint { " · recent" } }
+                    div.contributors {
+                        @for (n, e, c) in authors.iter().take(18) {
+                            span title=(format!("{n} · {c} of the last {} changes", recent.len())) { (avatar(n, e, true)) }
+                        }
+                    }
+                }
+            }
+            @if !reviews.is_empty() {
+                section {
+                    h3 { "Open reviews" }
+                    ul.feed {
+                        @for r in &reviews {
+                            li { (icon("review")) div.what { a href=(format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)) { (r.title) } div.muted { "#" (r.number) " by " (r.author) " · " (time(r.updated_ms)) } } }
+                        }
+                    }
+                }
+            }
+            @if !log.is_empty() {
+                section {
+                    h3 { "Activity" }
+                    ul.feed {
+                        @for r in &log {
+                            li {
+                                (avatar(&r.actor, "", false))
+                                div.what {
+                                    strong { (r.actor) } " moved " code { (String::from_utf8_lossy(&r.name)) }
+                                    div.muted { (r.reason) " · " (time(r.ts_ms)) }
+                                }
+                            }
+                        }
+                    }
+                    a.link.small href=(format!("/{}/-/activity", enc(&ctx.name))) { "All activity →" }
+                }
+            }
+        }
+    })
 }
 
 fn is_image(path: &RepoPath) -> Option<&'static str> {
@@ -750,7 +942,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
             @if hl_pending { div.hl-pending hidden {} }
         }
     };
-    let n = nav(web, ctx, Tab::Code, rev).await;
+    let n = nav(web, req, ctx, Tab::Code, rev).await;
     Ok(page(web, req, &format!("{path} at {} · {}", rev_label(rev), ctx.name), Some(n), body))
 }
 
@@ -870,17 +1062,22 @@ async fn blame(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoP
             @if hl_pending { div.hl-pending hidden {} }
         }
     };
-    let n = nav(web, ctx, Tab::Code, rev).await;
+    let n = nav(web, req, ctx, Tab::Code, rev).await;
     Ok(page(web, req, &format!("Blame {path} · {}", ctx.name), Some(n), body))
 }
 
 // ───────────── history ─────────────
 
 fn commit_row(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool) -> Markup {
+    commit_row_with(ctx, l, rev_for_tree, None)
+}
+
+fn commit_row_with(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool, graph: Option<Markup>) -> Markup {
     let (n, e) = person(&l.changeset.author);
     let id = l.id.to_hex();
     html! {
         li.commit {
+            @if let Some(g) = graph { (g) }
             (avatar(&n, &e, false))
             div.commit-main {
                 a.commit-title href=(url(&ctx.name, "commit", &id, None)) { (subject(&l.changeset.message)) }
@@ -899,20 +1096,145 @@ fn commit_row(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool) -> Markup {
     }
 }
 
-fn commit_list(ctx: &RepoCtx, items: &[Arc<Loaded>]) -> Markup {
-    let mut groups: Vec<(i64, Vec<&Arc<Loaded>>)> = Vec::new();
+const LANE_COLORS: [&str; 8] = ["#e2512a", "#2a5db0", "#2c7a4b", "#7146b8", "#a26500", "#1f8a9c", "#b5446e", "#5f6370"];
+const ROW_H: f64 = 60.0;
+const LANE_W: f64 = 13.0;
+/// Lanes beyond this are not drawn (busy histories stay readable).
+const MAX_LANES: usize = 6;
+
+/// History graph: one small SVG per row. Lanes hold the changeset each
+/// column is waiting for; a node consumes its lane and hands it to its
+/// first parent, opening (or joining) lanes for other parents.
+fn graph_rows(items: &[Arc<Loaded>]) -> Vec<Markup> {
+    let mut lanes: Vec<Option<ChangesetId>> = Vec::new();
+    struct Row {
+        col: usize,
+        before: Vec<Option<ChangesetId>>,
+        after: Vec<Option<ChangesetId>>,
+        id: ChangesetId,
+        parents: Vec<ChangesetId>,
+    }
+    let mut rows = Vec::with_capacity(items.len());
+    let mut width = 1;
     for l in items {
+        let id = l.id;
+        let col = match lanes.iter().position(|x| *x == Some(id)) {
+            Some(c) => c,
+            None => match lanes.iter().position(Option::is_none) {
+                Some(free) => free,
+                None => {
+                    lanes.push(None);
+                    lanes.len() - 1
+                }
+            },
+        };
+        let before = lanes.clone();
+        // Every lane waiting for this node ends here.
+        for slot in lanes.iter_mut() {
+            if *slot == Some(id) {
+                *slot = None;
+            }
+        }
+        let parents = l.changeset.parents.clone();
+        if let Some(p0) = parents.first() {
+            if lanes.contains(&Some(*p0)) {
+                // Another lane already continues to this parent.
+            } else {
+                lanes[col] = Some(*p0);
+            }
+        }
+        for p in parents.iter().skip(1) {
+            if !lanes.contains(&Some(*p)) {
+                match lanes.iter().position(Option::is_none) {
+                    Some(free) => lanes[free] = Some(*p),
+                    None => lanes.push(Some(*p)),
+                }
+            }
+        }
+        while lanes.last() == Some(&None) {
+            lanes.pop();
+        }
+        width = width.max(before.len()).max(lanes.len()).max(col + 1);
+        rows.push(Row { col, before, after: lanes.clone(), id, parents });
+    }
+    let width = width.min(MAX_LANES);
+    let x = |i: usize| 9.0 + i as f64 * LANE_W;
+    let w = x(width.saturating_sub(1)) + 9.0;
+    let shown = |i: usize| i < MAX_LANES;
+    let color = |i: usize| LANE_COLORS[i % LANE_COLORS.len()];
+    let curve = |x1: f64, y1: f64, x2: f64, y2: f64| {
+        if (x1 - x2).abs() < 0.1 {
+            format!("M{x1} {y1}V{y2}")
+        } else {
+            let my = (y1 + y2) / 2.0;
+            format!("M{x1} {y1}C{x1} {my},{x2} {my},{x2} {y2}")
+        }
+    };
+    rows.iter()
+        .map(|r| {
+            let mid = ROW_H / 2.0;
+            let mut paths: Vec<(String, &str)> = Vec::new();
+            for (j, slot) in r.before.iter().enumerate() {
+                match slot {
+                    Some(v) if *v == r.id && shown(j) && shown(r.col) => {
+                        paths.push((curve(x(j), 0.0, x(r.col), mid), color(j)));
+                    }
+                    Some(v) if *v == r.id => {}
+                    Some(v) => {
+                        if let Some(k) = r.after.iter().position(|a| a == &Some(*v))
+                            && shown(j)
+                            && shown(k)
+                        {
+                            paths.push((curve(x(j), 0.0, x(k), ROW_H), color(j)));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            for p in &r.parents {
+                if let Some(k) = r.after.iter().position(|a| a == &Some(*p))
+                    && shown(k)
+                    && shown(r.col)
+                {
+                    paths.push((curve(x(r.col), mid, x(k), ROW_H), color(k)));
+                }
+            }
+            let col = r.col.min(MAX_LANES - 1);
+            let merge = r.parents.len() > 1;
+            html! {
+                svg.graph width=(format!("{w}")) height=(format!("{ROW_H}")) viewBox=(format!("0 0 {w} {ROW_H}")) aria-hidden="true" {
+                    @for (d, c) in &paths { path d=(d) stroke=(c) {} }
+                    circle cx=(format!("{}", x(col))) cy=(format!("{mid}")) r=(if merge { "4" } else { "4.5" }) fill=(if merge { "var(--surface)" } else { color(col) }) stroke=(color(col)) {}
+                }
+            }
+        })
+        .collect()
+}
+
+fn commit_list(ctx: &RepoCtx, items: &[Arc<Loaded>]) -> Markup {
+    commit_list_inner(ctx, items, false)
+}
+
+fn commit_list_graph(ctx: &RepoCtx, items: &[Arc<Loaded>]) -> Markup {
+    commit_list_inner(ctx, items, true)
+}
+
+fn commit_list_inner(ctx: &RepoCtx, items: &[Arc<Loaded>], graph: bool) -> Markup {
+    let mut graphs: Vec<Option<Markup>> =
+        if graph { graph_rows(items).into_iter().map(Some).collect() } else { vec![None; items.len()] };
+    let mut groups: Vec<(i64, Vec<(&Arc<Loaded>, Option<Markup>)>)> = Vec::new();
+    for (l, g) in items.iter().zip(graphs.drain(..)) {
         let d = view::day_key(l.changeset.author_time.unix_ms);
         match groups.last_mut() {
-            Some((k, v)) if *k == d => v.push(l),
-            _ => groups.push((d, vec![l])),
+            Some((k, v)) if *k == d => v.push((l, g)),
+            _ => groups.push((d, vec![(l, g)])),
         }
     }
     html! {
-        @for (_, group) in &groups {
+        @for (_, group) in groups {
             div.day {
-                div.day-label { (icon("commit")) "Changes on " (view::day_label(group[0].changeset.author_time.unix_ms)) }
-                ul.commits.card { @for l in group { (commit_row(ctx, l, true)) } }
+                div.day-label { (view::day_label(group[0].0.changeset.author_time.unix_ms)) }
+                ul.commits.card { @for (l, g) in group { (commit_row_with(ctx, l, true, g)) } }
             }
         }
     }
@@ -938,14 +1260,14 @@ async fn commits(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Opti
                 }
             }
             @if items.is_empty() { (empty_state("No changes", html! { p { "Nothing has touched this path yet." } })) }
-            (commit_list(ctx, items))
+            (if path.is_none() { commit_list_graph(ctx, items) } else { commit_list(ctx, items) })
             div.pager {
                 @if page_no > 0 { a.btn href=(format!("{base}?page={}", page_no - 1)) { "← Newer" } }
                 @if more { a.btn href=(format!("{base}?page={}", page_no + 1)) { "Older →" } }
             }
         }
     };
-    let n = nav(web, ctx, Tab::Commits, rev).await;
+    let n = nav(web, req, ctx, Tab::Commits, rev).await;
     Ok(page(web, req, &format!("Changes · {}", ctx.name), Some(n), body))
 }
 
@@ -956,6 +1278,8 @@ struct RenderedFile {
     new: Option<flux_derive::TreeFile>,
     diff: Option<FileDiff>,
     note: Option<String>,
+    old_hl: Option<Arc<Vec<String>>>,
+    new_hl: Option<Arc<Vec<String>>>,
 }
 
 /// Diff two trees into renderable file diffs, fetching contents in
@@ -984,14 +1308,23 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
         futures::stream::iter(futs).buffered(32).collect().await;
     let mut budget = DIFF_LINE_BUDGET;
     let mut out = Vec::with_capacity(entries.len());
+    let mut hl_jobs: Vec<(usize, bool, flux_core::ContentId, String, String)> = Vec::new();
     for (i, e) in entries.into_iter().enumerate() {
         let status = match (&e.old, &e.new) {
             (None, Some(_)) => "added",
             (Some(_), None) => "deleted",
             _ => "modified",
         };
-        let mut rf =
-            RenderedFile { path: e.path.clone(), status, old: e.old.clone(), new: e.new.clone(), diff: None, note: None };
+        let mut rf = RenderedFile {
+            path: e.path.clone(),
+            status,
+            old: e.old.clone(),
+            new: e.new.clone(),
+            diff: None,
+            note: None,
+            old_hl: None,
+            new_hl: None,
+        };
         let Some(Ok((a, b))) = fetched.get(i) else {
             rf.note = Some("Too many files; diff not shown.".into());
             out.push(rf);
@@ -1015,13 +1348,124 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
             let n: usize = d.hunks.iter().map(|h| h.lines.len()).sum();
             budget = budget.saturating_sub(n);
             rf.diff = Some(d);
+            // Highlight both sides (cached by content id; bounded below).
+            let p = e.path.to_string();
+            if let Some((id, _)) = a {
+                hl_jobs.push((out.len(), false, *id, p.clone(), String::from_utf8_lossy(&a_bytes).into_owned()));
+            }
+            if let Some((id, _)) = b {
+                hl_jobs.push((out.len(), true, *id, p, String::from_utf8_lossy(&b_bytes).into_owned()));
+            }
         }
         out.push(rf);
+    }
+    // Run highlighting concurrently with an overall time budget; files that
+    // aren't done render plain now (and come back highlighted next time).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(120);
+    let mut tasks = Vec::new();
+    for (idx, new_side, id, path, text) in hl_jobs {
+        if let Some(v) = web.hl.cached(id, &path, &text) {
+            if new_side {
+                out[idx].new_hl = Some(v)
+            } else {
+                out[idx].old_hl = Some(v)
+            }
+            continue;
+        }
+        if !web.hl.has_grammar(&path, &text) {
+            continue;
+        }
+        let w = web.clone();
+        tasks.push((idx, new_side, tokio::task::spawn_blocking(move || w.hl.lines(id, &path, &text))));
+    }
+    for (idx, new_side, task) in tasks {
+        if let Ok(Ok(Some(v))) = tokio::time::timeout_at(deadline, task).await {
+            if new_side { out[idx].new_hl = Some(v) } else { out[idx].old_hl = Some(v) }
+        }
     }
     Ok(out)
 }
 
+/// HTML for each diff line: syntax highlighted when available, with
+/// word-level emphasis on lines that pair up within a change block.
+fn diff_line_html(f: &RenderedFile, h: &super::diff::Hunk) -> Vec<String> {
+    use super::diff::{escape_html, word_ranges, wrap_ranges};
+    let base = |l: &super::diff::Line| -> String {
+        let hl = match l.kind {
+            LineKind::Del => l.old.and_then(|n| f.old_hl.as_ref().and_then(|v| v.get(n as usize - 1).cloned())),
+            _ => l.new.and_then(|n| f.new_hl.as_ref().and_then(|v| v.get(n as usize - 1).cloned())),
+        };
+        hl.unwrap_or_else(|| escape_html(&l.text))
+    };
+    let mut html: Vec<String> = h.lines.iter().map(base).collect();
+    let mut i = 0;
+    while i < h.lines.len() {
+        if h.lines[i].kind != LineKind::Del {
+            i += 1;
+            continue;
+        }
+        let ds = i;
+        while i < h.lines.len() && h.lines[i].kind == LineKind::Del {
+            i += 1;
+        }
+        let as_ = i;
+        while i < h.lines.len() && h.lines[i].kind == LineKind::Add {
+            i += 1;
+        }
+        let (nd, na) = (as_ - ds, i - as_);
+        if na == 0 || nd.max(na) > 3 * nd.min(na) {
+            continue;
+        }
+        for k in 0..nd.min(na) {
+            if let Some((ra, rb)) = word_ranges(&h.lines[ds + k].text, &h.lines[as_ + k].text) {
+                html[ds + k] = wrap_ranges(&html[ds + k], &ra);
+                html[as_ + k] = wrap_ranges(&html[as_ + k], &rb);
+            }
+        }
+    }
+    html
+}
+
+/// Inline review comments rendered into a diff.
+struct Comments<'a> {
+    /// POST target for new comments.
+    action: String,
+    can_write: bool,
+    /// (path, line) → comments. Positive lines are new-side line numbers,
+    /// negative ones old-side.
+    threads: HashMap<(String, i64), Vec<&'a flux_store::ReviewEvent>>,
+}
+
+fn thread_row(c: &Comments<'_>, path: &str, line: i64, events: &[&flux_store::ReviewEvent]) -> Markup {
+    html! {
+        tr.thread {
+            td colspan="3" {
+                div.thread-box {
+                    @for e in events {
+                        div.c {
+                            div.c-head { (avatar(&e.author, "", false)) strong { (e.author) } span.faint { (time(e.ts_ms)) } }
+                            div.markdown { (PreEscaped(markdown::render(&e.body, None))) }
+                        }
+                    }
+                    @if c.can_write {
+                        form method="post" action=(c.action) {
+                            input type="hidden" name="path" value=(path);
+                            input type="hidden" name="line" value=(line);
+                            textarea name="body" rows="2" placeholder="Reply…" required {}
+                            div.form-actions { button.btn.small.primary type="submit" { "Reply" } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn diff_view(ctx: &RepoCtx, rev: &str, files: &[RenderedFile]) -> Markup {
+    diff_view_with(ctx, rev, files, None)
+}
+
+fn diff_view_with(ctx: &RepoCtx, rev: &str, files: &[RenderedFile], comments: Option<&Comments<'_>>) -> Markup {
     let added: u32 = files.iter().filter_map(|f| f.diff.as_ref()).map(|d| d.added).sum();
     let deleted: u32 = files.iter().filter_map(|f| f.diff.as_ref()).map(|d| d.deleted).sum();
     html! {
@@ -1063,15 +1507,25 @@ fn diff_view(ctx: &RepoCtx, rev: &str, files: &[RenderedFile]) -> Markup {
                 }
                 @if let Some(d) = &f.diff {
                     @if !d.hunks.is_empty() {
-                        table.diff {
+                        @let path_s = f.path.to_string();
+                        @let commentable = comments.is_some_and(|c| c.can_write);
+                        table.diff.commentable[commentable] data-comment-url=[comments.map(|c| c.action.clone())] data-path=(path_s) {
                             @for h in &d.hunks {
+                                @let lines_html = diff_line_html(f, h);
                                 tbody {
                                     tr.hunk { td.ln {} td.ln {} td.lc { "@@ -" (h.old_start) " +" (h.new_start) " @@" } }
-                                    @for l in &h.lines {
+                                    @for (l, lh) in h.lines.iter().zip(&lines_html) {
+                                        @let key = if l.kind == LineKind::Del { -(l.old.unwrap_or(0) as i64) } else { l.new.unwrap_or(0) as i64 };
                                         tr class=(match l.kind { LineKind::Add => "l-add", LineKind::Del => "l-del", LineKind::Context => "l-ctx" }) {
                                             td.ln data-line=[l.old] {}
                                             td.ln data-line=[l.new] {}
-                                            td.lc { span.mark { (match l.kind { LineKind::Add => "+", LineKind::Del => "-", LineKind::Context => " " }) } (l.text) }
+                                            td.lc {
+                                                @if commentable { button.add-comment type="button" data-line=(key) title="Comment on this line" { "+" } }
+                                                span.mark { (match l.kind { LineKind::Add => "+", LineKind::Del => "-", LineKind::Context => " " }) } (PreEscaped(lh))
+                                            }
+                                        }
+                                        @if let Some(c) = comments {
+                                            @if let Some(t) = c.threads.get(&(path_s.clone(), key)) { (thread_row(c, &path_s, key, t)) }
                                         }
                                     }
                                 }
@@ -1133,7 +1587,7 @@ async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResul
             (diff_view(ctx, &hex, &files))
         }
     };
-    let n = nav(web, ctx, Tab::Commits, rev).await;
+    let n = nav(web, req, ctx, Tab::Commits, rev).await;
     Ok(page(web, req, &format!("{} · {}", subject(&l.changeset.message), ctx.name), Some(n), body))
 }
 
@@ -1176,7 +1630,7 @@ async fn compare(web: &WebState, req: &Req, ctx: &RepoCtx, spec: &str) -> WebRes
             }
         }
     };
-    let n = nav(web, ctx, Tab::Commits, &head).await;
+    let n = nav(web, req, ctx, Tab::Commits, &head).await;
     Ok(page(web, req, &format!("Compare {base}...{head} · {}", ctx.name), Some(n), body))
 }
 
@@ -1241,7 +1695,7 @@ async fn branches(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
         }
     };
     let rev = default.unwrap_or_else(|| "main".into());
-    let n = nav(web, ctx, Tab::Branches, &rev).await;
+    let n = nav(web, req, ctx, Tab::Branches, &rev).await;
     Ok(page(web, req, &format!("Branches · {}", ctx.name), Some(n), body))
 }
 
@@ -1288,7 +1742,7 @@ async fn activity(web: &WebState, req: &Req, ctx: &RepoCtx, before: Option<i64>)
         }
     };
     let rev = ctx.default_branch().unwrap_or("main").to_string();
-    let n = nav(web, ctx, Tab::Activity, &rev).await;
+    let n = nav(web, req, ctx, Tab::Activity, &rev).await;
     Ok(page(web, req, &format!("Activity · {}", ctx.name), Some(n), body))
 }
 
@@ -1359,7 +1813,7 @@ async fn search(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String, St
             }
         }
     };
-    let n = nav(web, ctx, Tab::Search, &rev).await;
+    let n = nav(web, req, ctx, Tab::Search, &rev).await;
     Ok(page(web, req, &format!("Search · {}", ctx.name), Some(n), body))
 }
 
@@ -1502,7 +1956,7 @@ async fn reviews(web: &WebState, req: &Req, ctx: &RepoCtx, state: &str) -> WebRe
         }
     };
     let rev = ctx.default_branch().unwrap_or("main").to_string();
-    let n = nav(web, ctx, Tab::Reviews, &rev).await;
+    let n = nav(web, req, ctx, Tab::Reviews, &rev).await;
     Ok(page(web, req, &format!("Reviews · {}", ctx.name), Some(n), body))
 }
 
@@ -1534,7 +1988,7 @@ async fn new_review(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String
             }
         }
     };
-    let n = nav(web, ctx, Tab::Reviews, &target).await;
+    let n = nav(web, req, ctx, Tab::Reviews, &target).await;
     Ok(page(web, req, &format!("New review · {}", ctx.name), Some(n), body))
 }
 
@@ -1592,7 +2046,20 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                 a.active[files_tab] href=(format!("{base_url}/files")) { (icon("code")) "Changes" span.count { (d.stack.len()) } }
             }
             @if let Some(files) = &files {
-                (diff_view(ctx, &r.head.to_hex(), files))
+                @let comments = Comments {
+                    action: format!("{base_url}/comment"),
+                    can_write,
+                    threads: {
+                        let mut m: HashMap<(String, i64), Vec<&flux_store::ReviewEvent>> = HashMap::new();
+                        for e in d.events.iter().filter(|e| e.kind == "comment") {
+                            if let (Some(p), Some(line)) = (&e.path, e.line) {
+                                m.entry((String::from_utf8_lossy(p).into_owned(), line)).or_default().push(e);
+                            }
+                        }
+                        m
+                    },
+                };
+                (diff_view_with(ctx, &r.head.to_hex(), files, Some(&comments)))
             } @else {
                 div.review-grid {
                     div.timeline {
@@ -1611,7 +2078,13 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                             @match e.kind.as_str() {
                                 "comment" => {
                                     div.card.comment {
-                                        div.comment-head { (avatar(&e.author, "", false)) strong { (e.author) } span.muted { " commented " (time(e.ts_ms)) } }
+                                        div.comment-head {
+                                            (avatar(&e.author, "", false)) strong { (e.author) } span.muted { " commented " (time(e.ts_ms)) }
+                                            @if let (Some(p), Some(line)) = (&e.path, e.line) {
+                                                div.spacer {}
+                                                a.comment-loc href=(format!("{base_url}/files")) { (String::from_utf8_lossy(p)) ":" (line.abs()) @if line < 0 { " (old)" } }
+                                            }
+                                        }
                                         div.comment-body { article.markdown { (PreEscaped(markdown::render(&e.body, None))) } }
                                     }
                                 }
@@ -1683,14 +2156,22 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
             }
         }
     };
-    let n = nav(web, ctx, Tab::Reviews, &target).await;
+    let n = nav(web, req, ctx, Tab::Reviews, &target).await;
     Ok(page(web, req, &format!("{} · Review #{}", r.title, r.number), Some(n), body))
 }
 
 #[derive(Deserialize, Default)]
 pub struct ReviewForm {
     #[serde(default)]
+    description: String,
+    #[serde(default)]
+    default_branch: String,
+    #[serde(default)]
+    acl: String,
+    #[serde(default)]
     path: String,
+    #[serde(default)]
+    line: String,
     #[serde(default)]
     base: String,
     #[serde(default)]
@@ -1743,14 +2224,80 @@ pub async fn repo_post(
             flux.land_review(ctx.id, n, &actor).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
+        ["reviews", n, "comment"] if !f.path.is_empty() => {
+            let n = parse_num(n)?;
+            let line: i64 = f.line.trim().parse().map_err(|_| WebError::BadRequest("bad line".into()))?;
+            flux.comment_review_at(ctx.id, n, &actor, &f.body, f.path.trim().as_bytes(), line).await?;
+            Ok(Redirect::to(&format!("/{}/-/reviews/{n}/files", enc(&ctx.name))).into_response())
+        }
         ["reviews", n, action @ ("comment" | "approve" | "close" | "reopen")] => {
             let n = parse_num(n)?;
             flux.update_review(ctx.id, n, action, &actor, &f.body, None).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
         ["edit"] => save_edit(&web, &ctx, &actor, f).await,
+        ["settings"] => {
+            req.principal.require_admin()?;
+            let mut acl = Vec::new();
+            for line in f.acl.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                let parts: Vec<&str> = line.split('|').map(str::trim).collect();
+                let list = |i: usize| -> Vec<String> {
+                    parts
+                        .get(i)
+                        .map(|s| s.split([',', ' ']).filter(|x| !x.is_empty()).map(str::to_string).collect())
+                        .unwrap_or_default()
+                };
+                acl.push(crate::repo_config::AclRule {
+                    path: parts[0].trim_matches('/').to_string(),
+                    read: list(1),
+                    write: list(2),
+                });
+            }
+            let cfg = crate::repo_config::RepoConfig {
+                description: f.description.trim().to_string(),
+                default_branch: Some(f.default_branch.trim().to_string()).filter(|b| !b.is_empty()),
+                acl,
+            };
+            flux.set_repo_config(ctx.id, &cfg).await?;
+            Ok(Redirect::to(&format!("/{}/-/settings?saved=1", enc(&ctx.name))).into_response())
+        }
         _ => Err(WebError::NotFound("no such action".into())),
     }
+}
+
+async fn settings(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
+    req.principal.require_admin()?;
+    let saved = query_map(&req.query).contains_key("saved");
+    let acl_text: String = ctx
+        .config
+        .acl
+        .iter()
+        .map(|r| format!("{} | {} | {}", r.path, r.read.join(", "), r.write.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let default = ctx.default_branch().unwrap_or("main").to_string();
+    let body = html! {
+        div.container.narrow {
+            div.page-head { h1 { "Settings" } p.muted { "Repository details and path permissions." } }
+            @if saved { div.card.cta { div { (icon("check")) " Saved." } } }
+            form.card.form method="post" action=(format!("/{}/-/settings", enc(&ctx.name))) {
+                label { "Description" input type="text" name="description" value=(ctx.config.description) placeholder="What lives in this repository?"; }
+                label { "Default branch"
+                    select name="default_branch" {
+                        @for (n, _) in ctx.refs.iter() { option value=(n) selected[*n == default] { (n) } }
+                    }
+                }
+                label {
+                    "Path permissions"
+                    span.hint { "One rule per line: " code { "path/prefix | readers | writers" } ". Principals are user names, " code { "*" } " (anyone with repository access) or " code { "admins" } ". The most specific rule wins; paths without a rule follow the repository's access." }
+                    textarea.mono name="acl" rows="6" placeholder="infra/secrets | admins | admins\nservices/payments | * | alice, bob" { (acl_text) }
+                }
+                div.form-actions { button.btn.primary type="submit" { "Save settings" } }
+            }
+        }
+    };
+    let n = nav(web, req, ctx, Tab::Settings, &default).await;
+    Ok(page(web, req, &format!("Settings · {}", ctx.name), Some(n), body))
 }
 
 /// Edit (or create) a file in the browser.
@@ -1809,7 +2356,7 @@ async fn edit_form(
             }
         }
     };
-    let n = nav(web, ctx, Tab::Code, rev).await;
+    let n = nav(web, req, ctx, Tab::Code, rev).await;
     Ok(page(web, req, &format!("Edit · {}", ctx.name), Some(n), body))
 }
 

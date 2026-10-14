@@ -109,7 +109,7 @@
     const a = ev.target.closest && ev.target.closest("a");
     if (!eligible(a, ev)) return;
     ev.preventDefault();
-    closeFinder();
+    closePalette();
     navigate(a.href, true);
   });
   window.addEventListener("popstate", () => navigate(location.href, false));
@@ -145,8 +145,6 @@
     if (ev.target.closest && ev.target.closest(".theme-toggle")) toggleTheme();
     const fold = ev.target.closest && ev.target.closest(".fold");
     if (fold) fold.closest(".diff-file").classList.toggle("folded");
-    const finderBtn = ev.target.closest && ev.target.closest(".finder-btn");
-    if (finderBtn) openFinder();
     const live = ev.target.closest && ev.target.closest("#live-banner button");
     if (live) {
       cache.clear();
@@ -200,109 +198,198 @@
     }
   }, true);
   document.addEventListener("click", (ev) => {
-    $$("details.picker[open]").forEach((d) => { if (!d.contains(ev.target)) d.open = false; });
+    $$("details.picker[open], details.clone[open]").forEach((d) => { if (!d.contains(ev.target)) d.open = false; });
   });
 
-  // ── file finder (t) ────────────────────────────────────────────────
-  let files = null, filesUrl = null, results = [], sel = 0;
-  function finderUrl() {
-    const b = $(".finder-btn");
-    return b ? b.dataset.finder : null;
+  // ── command palette (⌘K) and file finder (t) ─────────────────────
+  // One overlay, several sources: commands for the current page, every
+  // repository, the repository's branches and its files. Everything is
+  // fetched once and filtered locally, so typing never waits on the network.
+  const pal = { mode: "all", items: [], sel: 0, data: {} };
+  function ctx() {
+    const m = $("main");
+    return m ? { repo: m.dataset.repo, rev: m.dataset.rev, files: m.dataset.files } : {};
   }
-  async function openFinder() {
-    const url = finderUrl();
-    if (!url) return;
-    $("#finder").hidden = false;
-    const input = $("#finder-input");
-    input.value = "";
-    input.focus();
-    if (filesUrl !== url) {
-      files = null;
-      filesUrl = url;
-      $("#finder-list").innerHTML = "<li class='muted pad'>Loading…</li>";
-      try {
-        const r = await fetch(url, { credentials: "same-origin" });
-        files = (await r.json()).paths;
-      } catch (_) { files = []; }
-    }
-    renderFinder("");
+  async function getJSON(url) {
+    if (pal.data[url]) return pal.data[url];
+    const p = fetch(url, { credentials: "same-origin" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    pal.data[url] = p;
+    return p;
   }
-  function closeFinder() { const f = $("#finder"); if (f) f.hidden = true; }
-  function score(path, q) {
+  function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+  function score(text, q) {
     let s = 0, qi = 0, prev = -2;
-    const lower = path.toLowerCase(), base = path.lastIndexOf("/") + 1;
-    const hits = [];
+    const lower = text.toLowerCase(), base = text.lastIndexOf("/") + 1, hits = [];
     for (let i = 0; i < lower.length && qi < q.length; i++) {
       if (lower[i] === q[qi]) {
         let v = 1;
         if (prev === i - 1) v += 5;
-        if (i === 0 || "/_-.".includes(path[i - 1])) v += 4;
+        if (i === 0 || "/_-. ".includes(text[i - 1])) v += 4;
         if (i >= base) v += 2;
         s += v; prev = i; qi++; hits.push(i);
       }
     }
-    return qi === q.length ? [s * 100 - path.length, hits] : null;
+    return qi === q.length ? [s * 100 - text.length, hits] : null;
   }
-  function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
-  function renderFinder(q) {
-    const list = $("#finder-list");
-    if (!files) return;
-    q = q.replace(/\s+/g, "").toLowerCase();
-    if (!q) results = files.slice(0, 50).map((p) => [p, []]);
-    else {
-      const scored = [];
-      for (const p of files) { const r = score(p, q); if (r) scored.push([r[0], p, r[1]]); }
-      scored.sort((a, b) => b[0] - a[0]);
-      results = scored.slice(0, 50).map((x) => [x[1], x[2]]);
+  function marked(text, hits) {
+    const set = new Set(hits);
+    let out = "";
+    for (let k = 0; k < text.length; k++) out += set.has(k) ? "<b>" + esc(text[k]) + "</b>" : esc(text[k]);
+    return out;
+  }
+  const ICONS = {
+    file: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M3.75 1.5h5.3L13 5.45v8.8c0 .4-.35.75-.75.75h-8.5A.75.75 0 0 1 3 14.25V2.25c0-.4.35-.75.75-.75Zm5 .75v3.5h3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+    branch: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M4.5 4.25v7.5M11.5 4.25v1c0 2.75-7 2.25-7 5.5M6 2.75a1.5 1.5 0 1 1-3 0 1.5 1.5 0 1 1 3 0ZM6 13.25a1.5 1.5 0 1 1-3 0 1.5 1.5 0 1 1 3 0ZM13 2.75a1.5 1.5 0 1 1-3 0 1.5 1.5 0 1 1 3 0Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>',
+    repo: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M3 2.5h8.5a1 1 0 0 1 1 1v10H4a1 1 0 0 1-1-1Zm0 9.25a1 1 0 0 1 1-1h8.5M6 5h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+    go: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    search: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M7 2a5 5 0 1 0 0 10A5 5 0 0 0 7 2Zm3.6 8.6L14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    commit: '<svg class="icon" viewBox="0 0 16 16" width="16" height="16"><path d="M8 5.25a2.75 2.75 0 1 0 0 5.5 2.75 2.75 0 0 0 0-5.5ZM1 8h4.25m5.5 0H15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+  };
+  function commands(c) {
+    const r = c.repo ? "/" + encodeURI(c.repo) : null;
+    const rev = c.rev ? encodeURIComponent(c.rev) : "main";
+    const list = [];
+    if (r) {
+      list.push(["Go to code", r + "/-/tree/" + rev, "g c"], ["Go to changes", r + "/-/commits/" + rev, "g h"],
+        ["Go to reviews", r + "/-/reviews", "g r"], ["Go to branches", r + "/-/branches", "g b"],
+        ["Go to activity", r + "/-/activity", "g a"], ["Search code", r + "/-/search?rev=" + rev, "/"],
+        ["New review", r + "/-/reviews/new", ""], ["Repository settings", r + "/-/settings", ""]);
     }
-    sel = 0;
-    const repo = $("main").dataset.repo, rev = $("main").dataset.rev;
-    list.innerHTML = results.map(([p, hits], i) => {
-      const set = new Set(hits);
-      let out = "";
-      for (let k = 0; k < p.length; k++) out += set.has(k) ? "<b>" + esc(p[k]) + "</b>" : esc(p[k]);
-      const href = "/" + encodeURI(repo) + "/-/blob/" + encodeURIComponent(rev) + "/" + p.split("/").map(encodeURIComponent).join("/");
-      return `<li class="${i === 0 ? "on" : ""}"><a href="${href}">${out}</a></li>`;
-    }).join("") || "<li class='muted pad'>No matching files</li>";
+    list.push(["All repositories", "/", "g g"], ["Toggle light / dark theme", "#theme", ""]);
+    return list;
   }
-  document.addEventListener("input", (ev) => { if (ev.target.id === "finder-input") renderFinder(ev.target.value); });
-  document.addEventListener("click", (ev) => { if (ev.target.id === "finder") closeFinder(); });
+  async function openPalette(mode) {
+    pal.mode = mode;
+    const o = $("#palette");
+    if (!o) return;
+    o.hidden = false;
+    const input = $("#palette-input");
+    input.value = "";
+    input.placeholder = mode === "files" ? "Go to file…" : "Search files, branches, repositories, commands…";
+    input.focus();
+    renderPalette();
+    const c = ctx();
+    const loads = [];
+    if (c.files) loads.push(getJSON(c.files));
+    if (mode === "all") {
+      loads.push(getJSON("/-/repos.json"));
+      if (c.repo) loads.push(getJSON("/" + encodeURI(c.repo) + "/-/refs.json"));
+    }
+    await Promise.all(loads);
+    if (!o.hidden) renderPalette();
+  }
+  function closePalette() { const o = $("#palette"); if (o) o.hidden = true; }
+  async function renderPalette() {
+    const c = ctx();
+    const raw = $("#palette-input").value.trim();
+    const q = raw.replace(/\s+/g, "").toLowerCase();
+    const groups = [];
+    const files = c.files ? await pal.data[c.files] : null;
+    const blobUrl = (p) => "/" + encodeURI(c.repo) + "/-/blob/" + encodeURIComponent(c.rev) + "/" + p.split("/").map(encodeURIComponent).join("/");
+    const rank = (arr, text, n) => {
+      if (!q) return arr.slice(0, n).map((x) => [x, []]);
+      const scored = [];
+      for (const x of arr) { const r = score(text(x), q); if (r) scored.push([r[0], x, r[1]]); }
+      scored.sort((a, b) => b[0] - a[0]);
+      return scored.slice(0, n).map((s) => [s[1], s[2]]);
+    };
+    if (pal.mode === "files") {
+      if (files) groups.push(["Files", rank(files.paths, (p) => p, 60).map(([p, h]) => ({ html: marked(p, h), href: blobUrl(p), icon: "file", mono: true }))]);
+    } else {
+      if (c.repo && /^(cs_)?[0-9a-f]{6,64}$/i.test(raw)) {
+        groups.push(["Changeset", [{ html: "Go to changeset <b>" + esc(raw) + "</b>", href: "/" + encodeURI(c.repo) + "/-/commit/" + raw.replace(/^cs_/, ""), icon: "commit" }]]);
+      }
+      groups.push(["Commands", rank(commands(c), (x) => x[0], q ? 5 : 8).map(([x, h]) => ({ html: marked(x[0], h), href: x[1], icon: "go", key: x[2] }))]);
+      if (files) groups.push(["Files", rank(files.paths, (p) => p, q ? 8 : 0).map(([p, h]) => ({ html: marked(p, h), href: blobUrl(p), icon: "file", mono: true }))]);
+      const refs = c.repo ? await pal.data["/" + encodeURI(c.repo) + "/-/refs.json"] : null;
+      if (refs) groups.push(["Branches", rank(refs.refs, (r) => r, q ? 5 : 0).map(([r, h]) => ({ html: marked(r, h), href: "/" + encodeURI(c.repo) + "/-/tree/" + encodeURIComponent(r), icon: "branch", mono: true }))]);
+      const repos = await pal.data["/-/repos.json"];
+      if (repos) groups.push(["Repositories", rank(repos.repos, (r) => r, q ? 5 : 4).map(([r, h]) => ({ html: marked(r, h), href: "/" + encodeURI(r), icon: "repo" }))]);
+      if (c.repo && raw) groups.push(["Search", [{ html: "Search code for <b>" + esc(raw) + "</b>", href: "/" + encodeURI(c.repo) + "/-/search?q=" + encodeURIComponent(raw) + "&rev=" + encodeURIComponent(c.rev || ""), icon: "search" }]]);
+    }
+    pal.items = [];
+    let html = "";
+    for (const [name, items] of groups) {
+      if (!items.length) continue;
+      html += `<li class="group">${name}</li>`;
+      for (const it of items) {
+        const i = pal.items.length;
+        pal.items.push(it);
+        html += `<li data-i="${i}" class="${i === 0 ? "on" : ""}"><a href="${it.href}" class="${it.mono ? "mono" : ""}">${ICONS[it.icon] || ""}<span>${it.html}</span>${it.key ? `<span class="k">${esc(it.key)}</span>` : ""}</a></li>`;
+      }
+    }
+    pal.sel = 0;
+    $("#palette-list").innerHTML = html || "<li class='muted pad'>Nothing matches</li>";
+  }
+  function palMove(d) {
+    const lis = $$("#palette-list li[data-i]");
+    if (!lis.length) return;
+    lis[pal.sel] && lis[pal.sel].classList.remove("on");
+    pal.sel = (pal.sel + d + lis.length) % lis.length;
+    lis[pal.sel].classList.add("on");
+    lis[pal.sel].scrollIntoView({ block: "nearest" });
+    const a = $("a", lis[pal.sel]);
+    if (a && a.getAttribute("href") !== "#theme") fetchPage(a.href);
+  }
+  function palGo() {
+    const it = pal.items[pal.sel];
+    if (!it) return;
+    closePalette();
+    if (it.href === "#theme") return toggleTheme();
+    navigate(new URL(it.href, location.href).toString(), true);
+  }
+  document.addEventListener("input", (ev) => { if (ev.target.id === "palette-input") renderPalette(); });
+  document.addEventListener("click", (ev) => {
+    if (ev.target.id === "palette") return closePalette();
+    if (ev.target.closest && ev.target.closest("[data-palette]")) { ev.preventDefault(); openPalette("all"); return; }
+    if (ev.target.closest && ev.target.closest("[data-palette-files]")) { ev.preventDefault(); openPalette("files"); return; }
+    const a = ev.target.closest && ev.target.closest("#palette-list a");
+    if (a) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      pal.sel = +a.parentElement.dataset.i;
+      palGo();
+    }
+  }, true);
 
   // ── keyboard ───────────────────────────────────────────────────────
+  let gPending = 0;
   document.addEventListener("keydown", (ev) => {
-    const finderOpen = !$("#finder").hidden;
-    if (finderOpen) {
-      const items = $$("#finder-list li");
-      if (ev.key === "Escape") { closeFinder(); return; }
-      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-        ev.preventDefault();
-        if (!items.length) return;
-        items[sel] && items[sel].classList.remove("on");
-        sel = (sel + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
-        items[sel].classList.add("on");
-        items[sel].scrollIntoView({ block: "nearest" });
-        const a = $("a", items[sel]); if (a) fetchPage(a.href);
-        return;
-      }
-      if (ev.key === "Enter") {
-        ev.preventDefault();
-        const a = items[sel] && $("a", items[sel]);
-        if (a) { closeFinder(); navigate(a.href, true); }
-      }
+    const palOpen = $("#palette") && !$("#palette").hidden;
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      palOpen ? closePalette() : openPalette("all");
+      return;
+    }
+    if (palOpen) {
+      if (ev.key === "Escape") { ev.preventDefault(); closePalette(); }
+      else if (ev.key === "ArrowDown" || (ev.ctrlKey && ev.key === "n")) { ev.preventDefault(); palMove(1); }
+      else if (ev.key === "ArrowUp" || (ev.ctrlKey && ev.key === "p")) { ev.preventDefault(); palMove(-1); }
+      else if (ev.key === "Enter") { ev.preventDefault(); palGo(); }
       return;
     }
     const t = ev.target;
     if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || ev.metaKey || ev.ctrlKey || ev.altKey) return;
-    if (ev.key === "t") { ev.preventDefault(); openFinder(); }
+    const c = ctx();
+    if (gPending && Date.now() - gPending < 900) {
+      gPending = 0;
+      const r = c.repo ? "/" + encodeURI(c.repo) : null;
+      const rev = encodeURIComponent(c.rev || "main");
+      const dest = { g: "/", c: r && r + "/-/tree/" + rev, h: r && r + "/-/commits/" + rev, r: r && r + "/-/reviews", b: r && r + "/-/branches", a: r && r + "/-/activity" }[ev.key];
+      if (dest) { ev.preventDefault(); navigate(new URL(dest, location.href).toString(), true); }
+      return;
+    }
+    if (ev.key === "g") { gPending = Date.now(); return; }
+    if (ev.key === "t" && c.files) { ev.preventDefault(); openPalette("files"); }
     else if (ev.key === "/") {
-      const s = $(".top-search input") || $(".search-row input");
+      const s = $(".search-row input");
       if (s) { ev.preventDefault(); s.focus(); s.select(); }
+      else if (c.repo) { ev.preventDefault(); navigate(new URL("/" + encodeURI(c.repo) + "/-/search?rev=" + encodeURIComponent(c.rev || ""), location.href).toString(), true); }
     } else if (ev.key === "y") {
-      // Permalink: pin the current branch URL to its changeset.
       const btn = $("[data-copy-url]");
       if (btn) { history.replaceState({}, "", btn.dataset.copyUrl + location.hash); copy(location.href, btn); }
     } else if (ev.key === "Escape") {
-      $$("details.picker[open]").forEach((d) => (d.open = false));
+      $$("details[open]").forEach((d) => (d.open = false));
     }
   });
 
@@ -340,9 +427,61 @@
     });
   }
 
+  // ── inline review comments ─────────────────────────────────────────
+  document.addEventListener("click", (ev) => {
+    const b = ev.target.closest && ev.target.closest(".add-comment");
+    if (!b) return;
+    ev.preventDefault();
+    const row = b.closest("tr");
+    const table = b.closest("table");
+    if (row.nextElementSibling && row.nextElementSibling.classList.contains("draft")) {
+      $("textarea", row.nextElementSibling).focus();
+      return;
+    }
+    const tr = document.createElement("tr");
+    tr.className = "thread draft";
+    const td = document.createElement("td");
+    td.colSpan = 3;
+    const box = document.createElement("div");
+    box.className = "thread-box";
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = table.dataset.commentUrl;
+    for (const [k, v] of [["path", table.dataset.path], ["line", b.dataset.line]]) {
+      const i = document.createElement("input");
+      i.type = "hidden"; i.name = k; i.value = v;
+      form.append(i);
+    }
+    const ta = document.createElement("textarea");
+    ta.name = "body"; ta.rows = 3; ta.required = true;
+    ta.placeholder = "Comment on line " + Math.abs(+b.dataset.line) + " (Markdown)";
+    const actions = document.createElement("div");
+    actions.className = "form-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button"; cancel.className = "btn small"; cancel.textContent = "Cancel";
+    cancel.onclick = () => tr.remove();
+    const submit = document.createElement("button");
+    submit.type = "submit"; submit.className = "btn small primary"; submit.textContent = "Comment";
+    actions.append(cancel, submit);
+    form.append(ta, actions);
+    box.append(form);
+    td.append(box);
+    tr.append(td);
+    row.after(tr);
+    ta.focus();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter" && ev.target.tagName === "TEXTAREA" && ev.target.form) {
+      ev.preventDefault();
+      ev.target.form.requestSubmit();
+    }
+  });
+
   // ── diff view mode (unified / split) ──────────────────────────────
   // Split tables are built client-side from the unified rows: context lines
   // go on both sides, runs of deletions pair up with the following additions.
+  // Drop the +/- marker and the comment button from a unified cell.
+  const clean = (html) => html.replace(/<button class="add-comment"[^>]*>\+<\/button>/, "").replace(/^\s*<span class="mark">.<\/span>/, "");
   function buildSplit(table) {
     const out = document.createElement("table");
     out.className = "diff split-table";
@@ -376,8 +515,15 @@
           i++;
           continue;
         }
+        if (r.classList.contains("thread")) {
+          const t = r.cloneNode(true);
+          t.cells[0].colSpan = 4;
+          tb.append(t);
+          i++;
+          continue;
+        }
         if (r.classList.contains("l-ctx")) {
-          const html = r.cells[2].innerHTML.replace(/^<span class="mark">.<\/span>/, "");
+          const html = clean(r.cells[2].innerHTML);
           tr.append(...cell("", r.cells[0].dataset.line, html), ...cell("", r.cells[1].dataset.line, html));
           tb.append(tr);
           i++;
@@ -390,7 +536,7 @@
         for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
           const t = document.createElement("tr");
           const d = dels[k], a = adds[k];
-          const strip = (row) => row.cells[2].innerHTML.replace(/^<span class="mark">.<\/span>/, "");
+          const strip = (row) => clean(row.cells[2].innerHTML);
           t.append(...(d ? cell("s-del", d.cells[0].dataset.line, strip(d)) : cell("s-empty", null, null)));
           t.append(...(a ? cell("s-add", a.cells[1].dataset.line, strip(a)) : cell("s-empty", null, null)));
           tb.append(t);

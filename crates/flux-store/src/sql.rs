@@ -151,6 +151,11 @@ macro_rules! sql_store {
                     .collect()
             }
 
+            async fn set_repo_config(&self, repo: RepoId, config: &str) -> StoreResult<()> {
+                sqlx::query("UPDATE repos SET config = $1 WHERE repo_id = $2").bind(config).bind(repo.0).execute(&self.pool).await?;
+                Ok(())
+            }
+
             async fn put_changesets(&self, repo: RepoId, batch: &[NewChangeset]) -> StoreResult<Vec<LogSeq>> {
                 let mut tx = self.pool.begin().await?;
                 Self::lock_log(&mut tx, repo).await?;

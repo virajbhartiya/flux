@@ -343,6 +343,30 @@ impl Flux {
         Ok(r)
     }
 
+    /// A comment anchored to a line of the review's diff. `line > 0` is a
+    /// new-side line number, `line < 0` an old-side one.
+    pub async fn comment_review_at(
+        &self,
+        repo: RepoId,
+        number: i64,
+        actor: &str,
+        body: &str,
+        path: &[u8],
+        line: i64,
+    ) -> FluxResult<()> {
+        let r = self.review(repo, number).await?;
+        if body.trim().is_empty() {
+            return Err(FluxError::InvalidArgument("empty comment".into()));
+        }
+        if line == 0 || path.is_empty() {
+            return Err(FluxError::InvalidArgument("a line comment needs a path and a line".into()));
+        }
+        self.meta.add_review_event(repo, number, "comment", actor, body, Some(r.head), Some(path), Some(line)).await?;
+        self.meta.update_review(repo, number, ReviewUpdate::default()).await?;
+        self.review_event(repo, number, "comment").await;
+        Ok(())
+    }
+
     pub async fn land_review(self: &Arc<Self>, repo: RepoId, number: i64, actor: &str) -> FluxResult<LandResult> {
         let r = self.review(repo, number).await?;
         if r.state != "open" {

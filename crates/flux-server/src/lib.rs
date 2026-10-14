@@ -9,6 +9,7 @@ pub mod history;
 pub mod land;
 pub mod metrics;
 pub mod ops;
+pub mod repo_config;
 pub mod search;
 pub mod web;
 

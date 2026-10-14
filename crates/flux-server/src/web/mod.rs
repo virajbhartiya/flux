@@ -14,6 +14,7 @@
 
 mod diff;
 pub mod highlight;
+mod lang;
 mod markdown;
 mod pages;
 mod view;
@@ -41,6 +42,7 @@ pub struct Web {
     pub css_path: String,
     pub js_path: String,
     pub refs: moka::sync::Cache<flux_store::RepoId, Arc<Vec<(String, flux_core::ChangesetId)>>>,
+    pub langs: moka::sync::Cache<flux_core::TreeId, Arc<Vec<(String, String, f64)>>>,
     pub started: Instant,
 }
 
@@ -57,6 +59,7 @@ impl Web {
             css,
             flux,
             hl: highlight::Highlighter::default(),
+            langs: moka::sync::Cache::new(10_000),
             refs: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_millis(1500)).max_capacity(10_000).build(),
             started: Instant::now(),
         })
@@ -83,9 +86,11 @@ pub fn router(flux: Arc<Flux>) -> Router {
     Router::new()
         .route("/", get(pages::home))
         .route("/-/static/{file}", get(static_asset))
+        .route("/-/static/fonts/{file}", get(font_asset))
         .route("/-/login", get(pages::login_form).post(pages::login))
         .route("/-/logout", post(pages::logout))
         .route("/-/repos", post(pages::create_repo))
+        .route("/-/repos.json", get(pages::repos_json))
         .route("/-/healthz", get(|| async { "ok" }))
         .route("/-/readyz", get(pages::readyz))
         .route("/-/metrics", get(pages::metrics))
@@ -123,9 +128,29 @@ async fn static_asset(State(web): State<WebState>, axum::extract::Path(file): ax
     WebError::NotFound("no such asset".into()).into_response()
 }
 
+async fn font_asset(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    let data: &'static [u8] = match file.as_str() {
+        "sans.woff2" => include_bytes!("assets/fonts/sans.woff2"),
+        "serif.woff2" => include_bytes!("assets/fonts/serif.woff2"),
+        "serif-italic.woff2" => include_bytes!("assets/fonts/serif-italic.woff2"),
+        "mono.woff2" => include_bytes!("assets/fonts/mono.woff2"),
+        _ => return WebError::NotFound("no such font".into()).into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("font/woff2")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable")),
+        ],
+        data,
+    )
+        .into_response()
+}
+
 /// Per-request context: start time and the caller.
 pub struct Req {
     pub started: Instant,
+    /// `scheme://host` as seen by the client.
+    pub origin: String,
     pub principal: Principal,
     pub path: String,
     pub query: String,
@@ -156,8 +181,11 @@ impl FromRequestParts<WebState> for Req {
             // A stale cookie shouldn't lock anyone out: treat as anonymous.
             Err(_) => Principal { user: None, mode: web.flux.auth_mode },
         };
+        let host = parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
+        let scheme = parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");
         Ok(Req {
             started,
+            origin: format!("{scheme}://{host}"),
             principal,
             path: parts.uri.path().to_string(),
             query: parts.uri.query().unwrap_or("").to_string(),
