@@ -73,6 +73,17 @@ pub struct ContentMeta {
     pub is_binary: bool,
 }
 
+/// A cached git pack for a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPack {
+    /// The pack bytes, stored as content.
+    pub content: ContentId,
+    pub objects: u32,
+    /// Ref heads the pack covers (everything reachable from them).
+    pub tips: Vec<ChangesetId>,
+    pub created_ms: i64,
+}
+
 /// One node of the commit graph, in log order (parents always precede
 /// children).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +239,9 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn git_commits_lookup(&self, repo: RepoId, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ChangesetId>>>;
     async fn git_commits_of(&self, repo: RepoId, ids: &[ChangesetId]) -> StoreResult<Vec<Option<[u8; 20]>>>;
     async fn content_by_sha1(&self, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ContentId>>>;
+    async fn git_pack_get(&self, repo: RepoId) -> StoreResult<Option<GitPack>>;
+    /// Replace the repository's cached pack.
+    async fn git_pack_put(&self, repo: RepoId, pack: &GitPack) -> StoreResult<()>;
 
     // commit graph
     /// Changesets with `log_seq > after`, in log order, with their parents.

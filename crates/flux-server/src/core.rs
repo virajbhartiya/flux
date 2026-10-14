@@ -278,6 +278,20 @@ impl Flux {
 
     /// Root tree of a changeset, deriving it (and any underived ancestors) if
     /// the mapping is missing, e.g. after a crash between insert and derive.
+    /// Root trees of many changesets: one metadata query for the derived
+    /// ones, `root_tree` (which derives) for the rest.
+    pub async fn root_trees(&self, repo: RepoId, ids: &[ChangesetId]) -> FluxResult<Vec<TreeId>> {
+        let found = self.meta.get_derived(repo, TREE_V1, ids).await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, v) in ids.iter().zip(found) {
+            out.push(match v {
+                Some(v) => TreeId::from_slice(&v).map_err(|e| FluxError::Internal(e.into()))?,
+                None => self.root_tree(repo, id).await?,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn root_tree(&self, repo: RepoId, id: &ChangesetId) -> FluxResult<TreeId> {
         if let Some(v) = self.derived_get(repo, TREE_V1, id).await? {
             return Ok(TreeId::from_bytes(v));

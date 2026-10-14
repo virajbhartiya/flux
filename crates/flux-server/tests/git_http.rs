@@ -96,3 +96,56 @@ async fn push_clone_fetch_roundtrip() {
     let l = flux.load_one(repo, &main.target).await.unwrap();
     assert_eq!(l.changeset.message, b"third\n");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clones_use_the_cached_pack_plus_a_tail() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = flux_server::StorageConfig::data_dir(&dir.path().join("data")).unwrap();
+    let flux = flux_server::open(&cfg).await.unwrap();
+    flux.create_repo("r").await.unwrap();
+    let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
+    let url = format!("http://{addr}/r.git");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let commit_and_push = |n: std::ops::Range<u32>| {
+        let (src, url) = (src.clone(), url.clone());
+        tokio::task::spawn_blocking(move || {
+            if !src.join(".git").exists() {
+                git(&src, &["init", "-q", "-b", "main"]);
+            }
+            for i in n {
+                std::fs::write(src.join(format!("f{}.txt", i % 3)), format!("version {i}\n")).unwrap();
+                git(&src, &["add", "-A"]);
+                git(&src, &["commit", "-qm", &format!("c{i}")]);
+            }
+            git(&src, &["push", "-q", &url, "main"]);
+            git(&src, &["rev-parse", "HEAD"])
+        })
+    };
+    let clone_head = |name: &'static str| {
+        let (root, url) = (dir.path().to_path_buf(), url.clone());
+        tokio::task::spawn_blocking(move || {
+            let dest = root.join(name);
+            git(&root, &["clone", "-q", &url, dest.to_str().unwrap()]);
+            git(&dest, &["fsck", "--strict"]);
+            git(&dest, &["rev-parse", "HEAD"])
+        })
+    };
+
+    let head = commit_and_push(0..5).await.unwrap();
+    let repo = flux.repo("r").await.unwrap();
+    flux.git_refresh_pack(repo).await.unwrap();
+    let pack = flux.meta.git_pack_get(repo).await.unwrap().expect("pack cached");
+    assert_eq!(pack.objects, 5 + 5 + 5, "5 commits, 5 root trees, 5 file versions");
+    assert_eq!(clone_head("c1").await.unwrap(), head, "clone served from the cached pack");
+
+    // Newer commits arrive as a generated tail after the cached objects.
+    let head = commit_and_push(5..9).await.unwrap();
+    assert_eq!(clone_head("c2").await.unwrap(), head, "cached pack plus tail");
+}

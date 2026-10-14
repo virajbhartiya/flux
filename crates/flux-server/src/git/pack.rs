@@ -254,6 +254,27 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     e.finish().expect("in-memory finish")
 }
 
+/// An object compressed for a pack, independent of where it lands, so
+/// encoding (delta search and deflate) can run in parallel.
+pub struct Encoded {
+    kind: Kind,
+    sha: Sha,
+    /// Uncompressed size of the object or delta.
+    size: usize,
+    body: Vec<u8>,
+    delta_base: Option<Sha>,
+}
+
+/// Compress `data`, as a delta against `base` when that is smaller.
+pub fn encode(kind: Kind, sha: Sha, data: &[u8], base: Option<(&Sha, &[u8])>) -> Encoded {
+    if let Some((bsha, bdata)) = base
+        && let Some(delta) = make_delta(bdata, data)
+    {
+        return Encoded { kind, sha, size: delta.len(), body: deflate(&delta), delta_base: Some(*bsha) };
+    }
+    Encoded { kind, sha, size: data.len(), body: deflate(data), delta_base: None }
+}
+
 impl PackWriter {
     pub fn new(count: u32) -> (Self, Vec<u8>) {
         let mut head = Vec::with_capacity(12);
@@ -272,34 +293,62 @@ impl PackWriter {
         bytes
     }
 
-    /// Encode one object, as a delta against `base` when that's smaller
-    /// and the base was already written to this pack.
-    pub fn object(&mut self, kind: Kind, sha: Sha, data: &[u8], base: Option<(&Sha, &[u8])>) -> Vec<u8> {
-        let start = self.pos;
-        if let Some((bsha, bdata)) = base
-            && let Some(&boff) = self.offsets.get(bsha)
-            && let Some(delta) = make_delta(bdata, data)
-        {
-            let mut out = type_size_header(6, delta.len());
-            // OFS_DELTA: offset encoded big-endian base-128 with +1 bias.
-            let mut off = start - boff;
-            let mut enc = vec![(off & 0x7f) as u8];
-            off >>= 7;
-            while off > 0 {
-                off -= 1;
-                enc.push(0x80 | (off & 0x7f) as u8);
-                off >>= 7;
-            }
-            enc.reverse();
-            out.extend_from_slice(&enc);
-            out.extend_from_slice(&deflate(&delta));
-            self.offsets.insert(sha, start);
-            return self.emit(out);
+    /// Append objects already encoded as a pack body (a cached pack without
+    /// its header and trailer). Its offsets are not indexed, so later
+    /// objects never delta against it.
+    pub fn raw(&mut self, body: &[u8]) {
+        self.hasher.update(body);
+        self.pos += body.len() as u64;
+    }
+
+    /// Split a complete pack into `(object count, body)`.
+    pub fn split(pack: &[u8]) -> Option<(u32, &[u8])> {
+        if pack.len() < 32 || &pack[..4] != b"PACK" {
+            return None;
         }
-        let mut out = type_size_header(kind as u8, data.len());
-        out.extend_from_slice(&deflate(data));
-        self.offsets.insert(sha, start);
-        self.emit(out)
+        let count = u32::from_be_bytes(pack[8..12].try_into().ok()?);
+        Some((count, &pack[12..pack.len() - 20]))
+    }
+
+    /// Append an encoded object. A delta's base must already be in this
+    /// pack (OFS_DELTA) unless `thin` allows naming one the client has
+    /// (REF_DELTA).
+    pub fn place(&mut self, e: Encoded, thin: bool) -> Result<Vec<u8>, String> {
+        let start = self.pos;
+        let mut out = Vec::with_capacity(e.body.len() + 32);
+        match e.delta_base {
+            Some(bsha) => match self.offsets.get(&bsha) {
+                Some(&boff) => {
+                    out.extend(type_size_header(6, e.size));
+                    // OFS_DELTA: offset encoded big-endian base-128 with +1 bias.
+                    let mut off = start - boff;
+                    let mut enc = vec![(off & 0x7f) as u8];
+                    off >>= 7;
+                    while off > 0 {
+                        off -= 1;
+                        enc.push(0x80 | (off & 0x7f) as u8);
+                        off >>= 7;
+                    }
+                    enc.reverse();
+                    out.extend_from_slice(&enc);
+                }
+                None if thin => {
+                    out.extend(type_size_header(7, e.size));
+                    out.extend_from_slice(&bsha);
+                }
+                None => return Err(format!("delta base {} is not in the pack", super::objects::hex(&bsha))),
+            },
+            None => out.extend(type_size_header(e.kind as u8, e.size)),
+        }
+        out.extend_from_slice(&e.body);
+        self.offsets.insert(e.sha, start);
+        Ok(self.emit(out))
+    }
+
+    /// Encode and append in one step (tests and small packs).
+    pub fn object(&mut self, kind: Kind, sha: Sha, data: &[u8], base: Option<(&Sha, &[u8])>) -> Vec<u8> {
+        let base = base.filter(|(b, _)| self.offsets.contains_key(*b));
+        self.place(encode(kind, sha, data, base), false).expect("base checked")
     }
 
     pub fn finish(self) -> Vec<u8> {

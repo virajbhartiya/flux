@@ -153,6 +153,13 @@ async fn derived_content_git() {
         s.put_content_meta(&[(cid, meta)]).await.unwrap();
         assert_eq!(s.get_content_meta(&[cid]).await.unwrap(), vec![Some(meta)]);
 
+        assert_eq!(s.git_pack_get(repo).await.unwrap(), None);
+        let mut pack = GitPack { content: ContentId::hash(b"pack"), objects: 3, tips: vec![a], created_ms: 5 };
+        s.git_pack_put(repo, &pack).await.unwrap();
+        assert_eq!(s.git_pack_get(repo).await.unwrap(), Some(pack.clone()));
+        pack.objects = 4;
+        s.git_pack_put(repo, &pack).await.unwrap();
+        assert_eq!(s.git_pack_get(repo).await.unwrap().unwrap().objects, 4, "replaced");
         s.git_map_put(repo, &[(a, [7; 20])]).await.unwrap();
         assert_eq!(s.git_to_cs(repo, &[[7; 20], [8; 20]]).await.unwrap(), vec![Some(a), None]);
         assert_eq!(s.cs_to_git(repo, &[a]).await.unwrap(), vec![Some([7; 20])]);

@@ -19,8 +19,8 @@ use bytes::Bytes;
 use flux_core::{Changeset, ChangesetId, ContentId, FileChange, FileKind, RepoPath, Timestamp, TreeId};
 use flux_store::{RefExpect, RepoId};
 
-use super::objects::{EMPTY_TREE, Kind, Sha, Target, encode_commit, hex, parse_hex};
-use super::pack::{PackObject, PackWriter, flush, pkt, pkt_str, read_pack, read_pkts, sideband};
+use super::objects::{EMPTY_TREE, Kind, Sha, encode_commit, hash_object, hex, parse_hex};
+use super::pack::{PackObject, PackWriter, encode, flush, pkt, pkt_str, read_pack, read_pkts, sideband};
 use crate::auth::Principal;
 use crate::core::{Flux, FluxError, FluxResult, is_protected_ref};
 
@@ -227,6 +227,7 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
         }
     }
     let side_band = caps.split(' ').any(|c| c == "side-band-64k" || c == "side-band");
+    let thin = caps.split(' ').any(|c| c == "thin-pack");
     let no_progress = caps.split(' ').any(|c| c == "no-progress");
     // Map haves we know.
     let have_cs: Vec<(Sha, ChangesetId)> = {
@@ -255,12 +256,35 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
             None => return Err(FluxError::InvalidArgument(format!("not our ref {}", hex(w)))),
         }
     }
-    let plan = plan_pack(flux, repo, &want_cs, &have_cs.iter().map(|x| x.1).collect::<Vec<_>>()).await?;
+    let started = std::time::Instant::now();
+    // A clone starts from the cached pack (if any) and only generates what
+    // is newer than it.
+    let cached = if have_cs.is_empty() {
+        flux.git_cached_pack(repo).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ignoring cached git pack");
+            None
+        })
+    } else {
+        None
+    };
+    let (plan, prefix) = match cached {
+        Some((pack, body)) => (plan_pack(flux, repo, &want_cs, &pack.tips, false).await?, Some((pack.objects, body))),
+        None => (plan_pack(flux, repo, &want_cs, &have_cs.iter().map(|x| x.1).collect::<Vec<_>>(), thin).await?, None),
+    };
+    tracing::info!(
+        objects = plan.len(),
+        cached = prefix.as_ref().map_or(0, |p| p.0),
+        plan_ms = started.elapsed().as_millis() as u64,
+        "upload-pack planned"
+    );
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     let _ = tx.send(Ok(Bytes::from(out))).await;
     let flux = flux.clone();
     tokio::spawn(async move {
-        if let Err(e) = stream_pack(&flux, repo, plan, side_band, no_progress, &tx).await {
+        let started = std::time::Instant::now();
+        let result = stream_pack(&flux, repo, plan, prefix, side_band, no_progress, thin, &tx).await;
+        tracing::info!(stream_ms = started.elapsed().as_millis() as u64, ok = result.is_ok(), "upload-pack streamed");
+        if let Err(e) = result {
             let mut msg = Vec::new();
             if side_band {
                 sideband(&mut msg, 3, format!("flux: {e}\n").as_bytes());
@@ -274,21 +298,50 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
 
 /// One object to send: its git identity, where its data comes from, and an
 /// optional delta base (an earlier object in the same pack).
-struct Planned {
+///
+/// Planning works on flux ids only; git SHA-1s come from hashing each
+/// object's bytes while the pack is encoded (in parallel).
+pub(crate) struct Planned {
     kind: Kind,
-    sha: Sha,
     src: Src,
-    base: Option<(Sha, Src)>,
+    base: Option<Src>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Src {
     Commit(ChangesetId),
     Tree(TreeId),
     Blob(ContentId),
 }
 
-async fn plan_pack(flux: &Flux, repo: RepoId, wants: &[ChangesetId], haves: &[ChangesetId]) -> FluxResult<Vec<Planned>> {
+/// What the client will have once the pack arrives.
+#[derive(Default)]
+struct Have {
+    trees: HashSet<TreeId>,
+    blobs: HashSet<ContentId>,
+    /// Of those, the ones the client already had (not in the pack).
+    ext_trees: HashSet<TreeId>,
+    ext_blobs: HashSet<ContentId>,
+    /// Deltas may name objects outside the pack (client sent `thin-pack`).
+    thin: bool,
+}
+
+impl Have {
+    fn tree_base(&self, t: &TreeId) -> bool {
+        self.trees.contains(t) && (self.thin || !self.ext_trees.contains(t))
+    }
+    fn blob_base(&self, c: &ContentId) -> bool {
+        self.blobs.contains(c) && (self.thin || !self.ext_blobs.contains(c))
+    }
+}
+
+pub(crate) async fn plan_pack(
+    flux: &Arc<Flux>,
+    repo: RepoId,
+    wants: &[ChangesetId],
+    haves: &[ChangesetId],
+    thin: bool,
+) -> FluxResult<Vec<Planned>> {
     let (g, _) = flux.graph_index(repo, &wants[0]).await?;
     let mut iw = Vec::new();
     for w in wants {
@@ -304,24 +357,65 @@ async fn plan_pack(flux: &Flux, repo: RepoId, wants: &[ChangesetId], haves: &[Ch
     };
     commits.reverse(); // oldest first, so delta bases precede
     // Everything reachable from what the client has is already there.
-    let mut seen_trees: HashSet<TreeId> = HashSet::new();
-    let mut seen_blobs: HashSet<ContentId> = HashSet::new();
+    let mut have = Have { thin, ..Default::default() };
     for h in haves.iter().take(8) {
         let root = flux.root_tree(repo, h).await?;
-        mark_tree(flux, root, &mut seen_trees, &mut seen_blobs).await?;
+        mark_tree(flux, root, &mut have.ext_trees, &mut have.ext_blobs).await?;
     }
+    have.trees = have.ext_trees.clone();
+    have.blobs = have.ext_blobs.clone();
     let mut plan = Vec::new();
-    let shas = flux.git_commit_shas(repo, &commits).await?;
-    for (cs, sha) in commits.iter().zip(shas) {
-        plan.push(Planned { kind: Kind::Commit, sha, src: Src::Commit(*cs), base: None });
-        let root = flux.root_tree(repo, cs).await?;
-        let parent_root = match flux.load_one_arc(repo, cs).await?.changeset.parents.first() {
-            Some(p) => Some(flux.root_tree(repo, p).await?),
-            None => None,
-        };
-        plan_tree(flux, root, parent_root, &mut seen_trees, &mut seen_blobs, &mut plan).await?;
+    // Generate any missing commit mappings up front (one pass, batched).
+    flux.git_commit_shas(repo, &commits).await?;
+    let prefetch = tokio::spawn(prefetch_trees(flux.clone(), repo, commits.clone()));
+    for chunk in commits.chunks(1024) {
+        let loaded = flux.load_arc(repo, chunk).await?;
+        let firsts: Vec<Option<ChangesetId>> = chunk
+            .iter()
+            .zip(&loaded)
+            .map(|(cs, l)| {
+                l.as_ref()
+                    .map(|l| l.changeset.parents.first().copied())
+                    .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("changeset {cs} missing")))
+            })
+            .collect::<FluxResult<_>>()?;
+        // Root trees of the chunk and of each first parent, in one batch.
+        let mut ids: Vec<ChangesetId> = chunk.to_vec();
+        ids.extend(firsts.iter().flatten());
+        let roots: HashMap<ChangesetId, TreeId> = ids.iter().copied().zip(flux.root_trees(repo, &ids).await?).collect();
+        for (cs, first) in chunk.iter().zip(firsts) {
+            plan.push(Planned { kind: Kind::Commit, src: Src::Commit(*cs), base: None });
+            plan_tree(flux, roots[cs], first.map(|p| roots[&p]), &mut have, &mut plan).await?;
+        }
     }
+    prefetch.abort();
     Ok(plan)
+}
+
+/// Load the trees the planner is about to walk, many at a time and ahead
+/// of it, so its (necessarily sequential) walk mostly hits the tree cache.
+async fn prefetch_trees(flux: Arc<Flux>, repo: RepoId, commits: Vec<ChangesetId>) {
+    use futures::StreamExt as _;
+    let mut seen: HashSet<TreeId> = HashSet::new();
+    for chunk in commits.chunks(256) {
+        let Ok(mut level) = flux.root_trees(repo, chunk).await else { return };
+        while !level.is_empty() {
+            level.retain(|t| seen.insert(*t));
+            let futs: Vec<_> = level
+                .iter()
+                .map(|t| {
+                    let (blobs, t) = (flux.blobs.clone(), *t);
+                    async move { blobs.get_tree(&t).await }
+                })
+                .collect();
+            let trees: Vec<_> = futures::stream::iter(futs).buffer_unordered(64).collect().await;
+            level = trees
+                .into_iter()
+                .filter_map(|t| t.ok().flatten())
+                .flat_map(|t| t.entries().iter().filter_map(|e| e.tree_id()).collect::<Vec<_>>())
+                .collect();
+        }
+    }
 }
 
 async fn mark_tree(flux: &Flux, root: TreeId, trees: &mut HashSet<TreeId>, blobs: &mut HashSet<ContentId>) -> FluxResult<()> {
@@ -344,52 +438,48 @@ async fn mark_tree(flux: &Flux, root: TreeId, trees: &mut HashSet<TreeId>, blobs
     Ok(())
 }
 
-async fn plan_tree(
-    flux: &Flux,
-    root: TreeId,
-    base: Option<TreeId>,
-    trees: &mut HashSet<TreeId>,
-    blobs: &mut HashSet<ContentId>,
-    plan: &mut Vec<Planned>,
-) -> FluxResult<()> {
-    // Iterative walk pairing each directory with its previous version.
-    let mut stack: Vec<(TreeId, Option<TreeId>)> = vec![(root, base)];
-    while let Some((t, b)) = stack.pop() {
-        if !trees.insert(t) {
-            continue;
-        }
-        let sha = flux.git_tree_sha(t).await?;
-        let base_obj = match b {
-            Some(bt) if trees.contains(&bt) => Some((flux.git_tree_sha(bt).await?, Src::Tree(bt))),
-            _ => None,
-        };
-        plan.push(Planned { kind: Kind::Tree, sha, src: Src::Tree(t), base: base_obj });
-        let tree = flux.blobs.get_tree(&t).await?.ok_or_else(|| FluxError::Internal(anyhow::anyhow!("tree {t} missing")))?;
-        let old = match b {
-            Some(bt) => flux.blobs.get_tree(&bt).await?,
-            None => None,
-        };
-        let entries = flux.git_tree_entries(&tree).await?;
-        for e in entries {
-            let prev = old.as_ref().and_then(|o| o.get(&e.name).cloned());
-            match e.target {
-                Target::Tree(sub) => stack.push((sub, prev.and_then(|p| p.tree_id()))),
-                Target::Blob(c) => {
-                    if blobs.insert(c) {
-                        let base = match prev.and_then(|p| p.content_id()) {
-                            Some(pc) if pc != c && blobs.contains(&pc) => {
-                                Some((flux.git_blob_shas(&[pc]).await?[0], Src::Blob(pc)))
-                            }
-                            _ => None,
-                        };
-                        plan.push(Planned { kind: Kind::Blob, sha: e.sha, src: Src::Blob(c), base });
-                    }
+async fn plan_tree(flux: &Flux, root: TreeId, base: Option<TreeId>, have: &mut Have, plan: &mut Vec<Planned>) -> FluxResult<()> {
+    // Breadth-first, pairing each directory with its previous version; each
+    // level's trees are fetched concurrently.
+    let mut level: Vec<(TreeId, Option<TreeId>)> = vec![(root, base)];
+    while !level.is_empty() {
+        level.retain(|(t, _)| have.trees.insert(*t));
+        let fetched = futures::future::try_join_all(level.iter().map(|(t, b)| async move {
+            let tree = flux.blobs.get_tree(t).await?.ok_or_else(|| FluxError::Internal(anyhow::anyhow!("tree {t} missing")))?;
+            let old = match b {
+                Some(bt) => flux.blobs.get_tree(bt).await?,
+                None => None,
+            };
+            FluxResult::Ok((tree, old))
+        }))
+        .await?;
+        let mut next = Vec::new();
+        for ((t, b), (tree, old)) in level.iter().zip(fetched) {
+            let base_src = b.filter(|bt| have.tree_base(bt)).map(Src::Tree);
+            plan.push(Planned { kind: Kind::Tree, src: Src::Tree(*t), base: base_src });
+            for e in tree.entries() {
+                let prev = old.as_ref().and_then(|o| o.get(e.name.as_bytes()).cloned());
+                if let Some(sub) = e.tree_id() {
+                    next.push((sub, prev.and_then(|p| p.tree_id())));
+                } else if let Some(c) = e.content_id()
+                    && have.blobs.insert(c)
+                {
+                    let base = prev.and_then(|p| p.content_id()).filter(|pc| *pc != c && have.blob_base(pc)).map(Src::Blob);
+                    plan.push(Planned { kind: Kind::Blob, src: Src::Blob(c), base });
                 }
-                Target::Gitlink => {}
             }
         }
+        level = next;
     }
     Ok(())
+}
+
+fn kind_of(src: Src) -> Kind {
+    match src {
+        Src::Commit(_) => Kind::Commit,
+        Src::Tree(_) => Kind::Tree,
+        Src::Blob(_) => Kind::Blob,
+    }
 }
 
 async fn object_bytes(flux: &Flux, repo: RepoId, src: Src) -> FluxResult<Vec<u8>> {
@@ -405,14 +495,21 @@ async fn object_bytes(flux: &Flux, repo: RepoId, src: Src) -> FluxResult<Vec<u8>
     })
 }
 
-async fn stream_pack(
-    flux: &Flux,
+/// Objects fetched and encoded concurrently (in order); placement into the
+/// pack is sequential since offsets and the checksum depend on order.
+const PACK_PIPELINE: usize = 64;
+
+pub(crate) async fn stream_pack(
+    flux: &Arc<Flux>,
     repo: RepoId,
     plan: Vec<Planned>,
+    prefix: Option<(u32, Bytes)>,
     side_band: bool,
     no_progress: bool,
+    thin: bool,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> FluxResult<()> {
+    use futures::StreamExt as _;
     let send = |data: Vec<u8>| async move {
         let mut framed = Vec::with_capacity(data.len() + 16);
         if side_band {
@@ -424,37 +521,60 @@ async fn stream_pack(
     };
     if side_band && !no_progress {
         let mut m = Vec::new();
-        sideband(&mut m, 2, format!("flux: sending {} objects\n", plan.len()).as_bytes());
+        let cached = prefix.as_ref().map_or(0, |p| p.0 as usize);
+        sideband(&mut m, 2, format!("flux: sending {} objects ({cached} cached)\n", plan.len() + cached).as_bytes());
         let _ = tx.send(Ok(Bytes::from(m))).await;
     }
-    let (mut w, head) = PackWriter::new(plan.len() as u32);
+    let total = plan.len() as u32 + prefix.as_ref().map_or(0, |p| p.0);
+    let (mut w, head) = PackWriter::new(total);
     send(head).await?;
-    let mut buf = Vec::with_capacity(256 << 10);
-    // Small LRU of recent object bytes to serve as delta bases.
-    let mut recent: HashMap<Sha, Arc<Vec<u8>>> = HashMap::new();
-    let mut order: std::collections::VecDeque<Sha> = std::collections::VecDeque::new();
-    for p in plan {
-        let data = object_bytes(flux, repo, p.src).await?;
-        let base_data = match &p.base {
-            Some((bsha, bsrc)) => match recent.get(bsha) {
-                Some(d) => Some(d.clone()),
-                None => Some(Arc::new(object_bytes(flux, repo, *bsrc).await?)),
-            },
-            None => None,
-        };
-        let bytes =
-            w.object(p.kind, p.sha, &data, p.base.as_ref().map(|(s, _)| s).zip(base_data.as_deref().map(|v| v.as_slice())));
-        buf.extend_from_slice(&bytes);
-        if p.kind != Kind::Commit && data.len() <= (1 << 20) {
-            recent.insert(p.sha, Arc::new(data));
-            order.push_back(p.sha);
-            if order.len() > 4096
-                && let Some(old) = order.pop_front()
-            {
-                recent.remove(&old);
-            }
+    if let Some((_, body)) = prefix {
+        w.raw(&body);
+        for chunk in body.chunks(1 << 20) {
+            send(chunk.to_vec()).await?;
         }
-        if buf.len() >= 256 << 10 {
+    }
+    // Recently produced objects, as delta bases for the ones that follow.
+    type Obj = (Sha, Arc<Vec<u8>>);
+    let recent: Arc<moka::sync::Cache<Src, Obj>> = Arc::new(
+        moka::sync::Cache::builder()
+            .weigher(|_, v: &Obj| v.1.len().min(u32::MAX as usize) as u32)
+            .max_capacity(256 << 20)
+            .build(),
+    );
+    let mut encoded = futures::stream::iter(plan)
+        .map(|p| {
+            let (flux, recent) = (flux.clone(), recent.clone());
+            tokio::spawn(async move {
+                let data = Arc::new(object_bytes(&flux, repo, p.src).await?);
+                let base = match p.base {
+                    Some(b) => Some(match recent.get(&b) {
+                        Some(o) => o,
+                        None => {
+                            let d = object_bytes(&flux, repo, b).await?;
+                            (hash_object(kind_of(b), &d), Arc::new(d))
+                        }
+                    }),
+                    None => None,
+                };
+                let enc = tokio::task::spawn_blocking(move || {
+                    let sha = hash_object(p.kind, &data);
+                    if p.kind != Kind::Commit && data.len() <= (1 << 20) {
+                        recent.insert(p.src, (sha, data.clone()));
+                    }
+                    encode(p.kind, sha, &data, base.as_ref().map(|(s, d)| (s, d.as_slice())))
+                })
+                .await
+                .map_err(|e| FluxError::Internal(e.into()))?;
+                FluxResult::Ok(enc)
+            })
+        })
+        .buffered(PACK_PIPELINE);
+    let mut buf = Vec::with_capacity(512 << 10);
+    while let Some(enc) = encoded.next().await {
+        let enc = enc.map_err(|e| FluxError::Internal(e.into()))??;
+        buf.extend_from_slice(&w.place(enc, thin).map_err(|e| FluxError::Internal(anyhow::anyhow!(e)))?);
+        if buf.len() >= 512 << 10 {
             send(std::mem::take(&mut buf)).await?;
         }
     }

@@ -168,6 +168,8 @@ pub struct GitCaches {
     pub trees: moka::sync::Cache<TreeId, Sha>,
     pub blobs: moka::sync::Cache<ContentId, Sha>,
     pub commits: moka::sync::Cache<(RepoId, ChangesetId), Sha>,
+    /// Cached clone pack bodies by repository: `(content id, body)`.
+    pub packs: moka::sync::Cache<RepoId, (ContentId, bytes::Bytes)>,
     /// Tree mappings not yet persisted (written in batches).
     pending_trees: std::sync::Mutex<Vec<(TreeId, Sha)>>,
     /// One history generation at a time: concurrent requests (or the
@@ -187,6 +189,10 @@ impl GitCaches {
             trees: moka::sync::Cache::new(4_000_000),
             blobs: moka::sync::Cache::new(4_000_000),
             commits: moka::sync::Cache::new(4_000_000),
+            packs: moka::sync::Cache::builder()
+                .weigher(|_, v: &(ContentId, bytes::Bytes)| v.1.len().min(u32::MAX as usize) as u32)
+                .max_capacity(2 << 30)
+                .build(),
             pending_trees: Default::default(),
             generating: Default::default(),
         }

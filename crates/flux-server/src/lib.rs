@@ -85,7 +85,8 @@ pub fn warm(flux: &Arc<Flux>) {
 
 /// Keep git objects generated for every ref head, at startup and as refs
 /// move, so a first `git clone` or `fetch` never waits for history to be
-/// converted. Moves are batched briefly; generation is idempotent.
+/// converted, and keep each repository's cached clone pack fresh. Moves are
+/// batched briefly; generation is idempotent.
 fn warm_git(flux: &Arc<Flux>) {
     let flux = flux.clone();
     let mut rx = flux.subscribe();
@@ -99,6 +100,9 @@ fn warm_git(flux: &Arc<Flux>) {
                 match flux.git_commit_shas(r.id, &heads).await {
                     Ok(_) => generated += heads.len(),
                     Err(e) => tracing::warn!(repo = %r.name, error = %e, "warm: git object generation failed"),
+                }
+                if let Err(e) = flux.git_refresh_pack(r.id).await {
+                    tracing::warn!(repo = %r.name, error = %e, "warm: git pack build failed");
                 }
             }
         }
@@ -118,10 +122,17 @@ fn warm_git(flux: &Arc<Flux>) {
                     moved.insert((repo, cs));
                 }
             }
+            let mut repos = std::collections::BTreeMap::new();
             for (name, cs) in moved {
                 let Ok(repo) = flux.repo(&name).await else { continue };
                 if let Err(e) = flux.git_commit_shas(repo, &[cs]).await {
                     tracing::warn!(repo = %name, error = %e, "git object generation failed");
+                }
+                repos.insert(name, repo);
+            }
+            for (name, repo) in repos {
+                if let Err(e) = flux.git_refresh_pack(repo).await {
+                    tracing::warn!(repo = %name, error = %e, "git pack build failed");
                 }
             }
         }

@@ -579,7 +579,10 @@ For each changeset, it computes git tree objects bottom-up, reusing parent git t
 **As built.** `flux-server` serves git smart HTTP (protocol v0/v1) at `/<repo>.git` on the main port:
 - `upload-pack` with `multi_ack_detailed`, `side-band-64k` and `ofs-delta`. Packs are streamed as they are generated; trees and blobs are deltified against the previous version of the same path.
 - `receive-pack` imports pushed commits as changesets, merges included (`Retain` entries keep parent 0's side). It then checks that the regenerated commit hashes to the pushed SHA-1, and keeps the verbatim commit in `extra["git.commit"]` when it does not. Ref updates are compare-and-swap; protected refs accept fast-forwards only, and non-admins land rebased work through flux.
-- Generated objects are memoized: `git_trees` (flux tree → SHA-1) and `git_commits` (changeset ↔ SHA-1, per repository). The first fetch of an imported history generates the whole mapping (about 4 minutes for git.git); later fetches only generate new objects.
+- Generated objects are memoized: `git_trees` (flux tree → SHA-1) and `git_commits` (changeset ↔ SHA-1, per repository). The server generates them in the background at startup and whenever a ref moves, so no request waits for history conversion (git.git: under 2 minutes, once).
+- **Cached clone packs** (`git_packs`): the server keeps one full-history pack per repository and serves a clone as that pack followed by a freshly generated tail for newer commits, under a single header and checksum. The pack is rebuilt in the background once more than 2,000 commits fall outside it (at most every 10 minutes). Clone of git.git: 8.7 s end to end, 1.6 s of it on the server.
+- Without a cached pack, objects are planned on flux ids and then fetched, hashed, deltified and compressed 64 at a time; only placement into the pack is sequential.
+- Thin packs: incremental fetches may send REF_DELTAs against objects the client already has.
 - Legacy file modes such as `100664` are preserved as `FileKind::GitMode`, so imported trees and commits hash to their original SHA-1s.
 - Auth: HTTP Basic (any user name, token as password) or Bearer, with the same modes as the rest of the server.
 - Not yet: protocol v2, shallow and partial clones, bundle-uri.

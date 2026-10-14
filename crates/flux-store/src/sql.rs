@@ -683,6 +683,43 @@ macro_rules! sql_store {
                 Ok(ordered(ids, &found))
             }
 
+            async fn git_pack_get(&self, repo: RepoId) -> StoreResult<Option<GitPack>> {
+                let Some(r) = sqlx::query("SELECT content_id, objects, tips, created_ms FROM git_packs WHERE repo_id = $1")
+                    .bind(repo.0)
+                    .fetch_optional(&self.pool)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let tips: &[u8] = r.try_get(2)?;
+                if tips.len() % 32 != 0 {
+                    return Err(StoreError::Corrupt("git_packs.tips length".into()));
+                }
+                Ok(Some(GitPack {
+                    content: ContentId::from_bytes(arr::<32>(r.try_get::<&[u8], _>(0)?, "content id")?),
+                    objects: r.try_get::<i64, _>(1)? as u32,
+                    tips: tips.chunks(32).map(cs_id).collect::<StoreResult<_>>()?,
+                    created_ms: r.try_get(3)?,
+                }))
+            }
+
+            async fn git_pack_put(&self, repo: RepoId, pack: &GitPack) -> StoreResult<()> {
+                let tips: Vec<u8> = pack.tips.iter().flat_map(|t| *t.as_bytes()).collect();
+                sqlx::query(
+                    "INSERT INTO git_packs (repo_id, content_id, objects, tips, created_ms) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (repo_id) DO UPDATE SET content_id = excluded.content_id, objects = excluded.objects, \
+                     tips = excluded.tips, created_ms = excluded.created_ms",
+                )
+                .bind(repo.0)
+                .bind(pack.content.as_bytes().as_slice())
+                .bind(pack.objects as i64)
+                .bind(tips)
+                .bind(pack.created_ms)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+
             async fn content_by_sha1(&self, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ContentId>>> {
                 let mut found = std::collections::HashMap::new();
                 for chunk in shas.chunks(IN_CHUNK) {
