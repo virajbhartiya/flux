@@ -40,6 +40,48 @@ pub enum FileKind {
     Symlink,
     /// A git submodule pointer; content is not stored in flux.
     GitLink([u8; 20]),
+    /// A plain file recorded with a non-canonical git mode (`0o100664` in
+    /// early git history, say). Kept so imported trees hash to their
+    /// original SHA-1s; otherwise it behaves as `Regular`, or `Executable`
+    /// when any execute bit is set.
+    GitMode(u32),
+}
+
+impl FileKind {
+    /// The kind for a raw git file mode (`0o100xxx`), keeping odd modes.
+    pub fn from_git_file_mode(mode: u32) -> Self {
+        match mode {
+            0o100644 => FileKind::Regular,
+            0o100755 => FileKind::Executable,
+            m => FileKind::GitMode(m),
+        }
+    }
+
+    pub fn is_executable(self) -> bool {
+        match self {
+            FileKind::Executable => true,
+            FileKind::GitMode(m) => m & 0o111 != 0,
+            _ => false,
+        }
+    }
+
+    /// Regular or executable file content (not a symlink or gitlink).
+    pub fn is_plain(self) -> bool {
+        matches!(self, FileKind::Regular | FileKind::Executable | FileKind::GitMode(_))
+    }
+
+    /// The canonical kind this one behaves as.
+    pub fn normalized(self) -> Self {
+        match self {
+            FileKind::GitMode(_) if self.is_executable() => FileKind::Executable,
+            FileKind::GitMode(_) => FileKind::Regular,
+            k => k,
+        }
+    }
+
+    fn valid_git_mode(m: u32) -> bool {
+        m & !0o777 == 0o100000 && m != 0o100644 && m != 0o100755
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,6 +132,11 @@ impl Changeset {
                 }
                 if matches!(kind, FileKind::GitLink(_)) && copy_from.is_some() {
                     return Err(Error::InvalidObject("gitlink cannot have copy_from".into()));
+                }
+                if let FileKind::GitMode(m) = kind
+                    && !FileKind::valid_git_mode(*m)
+                {
+                    return Err(Error::InvalidObject(format!("invalid git mode {m:o} for {path}")));
                 }
             }
         }
@@ -256,6 +303,8 @@ pub(crate) fn encode_kind(e: &mut Encoder, kind: &FileKind) {
         FileKind::Executable => e.array(1).uint(1),
         FileKind::Symlink => e.array(1).uint(2),
         FileKind::GitLink(sha) => e.array(2).uint(3).bytes(sha),
+        // Tag 4 is a directory in tree entries (tree.rs).
+        FileKind::GitMode(m) => e.array(2).uint(5).uint(*m as u64),
     };
 }
 
@@ -267,6 +316,13 @@ pub(crate) fn decode_kind(d: &mut Decoder<'_>) -> Result<FileKind> {
         (1, 1) => FileKind::Executable,
         (2, 1) => FileKind::Symlink,
         (3, 2) => FileKind::GitLink(d.bytes_fixed()?),
+        (5, 2) => {
+            let m = u32::try_from(d.uint()?).map_err(|_| Error::Decode("git mode out of range".into()))?;
+            if !FileKind::valid_git_mode(m) {
+                return Err(Error::NonCanonical);
+            }
+            FileKind::GitMode(m)
+        }
         _ => return Err(Error::Decode(format!("bad file kind tag {tag}/{n}"))),
     };
     d.end();
@@ -426,5 +482,24 @@ pub(crate) mod tests {
         let mut bytes = sample().encode();
         bytes.push(0);
         assert!(Changeset::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn legacy_git_modes_roundtrip() {
+        let mut cs = sample();
+        cs.file_changes.insert(
+            RepoPath::try_from("legacy").unwrap(),
+            FileChange::Change { content_id: ContentId::empty(), size: 0, kind: FileKind::GitMode(0o100664), copy_from: None },
+        );
+        cs.validate().unwrap();
+        assert_eq!(Changeset::decode(&cs.encode()).unwrap(), cs);
+        assert_eq!(FileKind::from_git_file_mode(0o100644), FileKind::Regular);
+        assert!(FileKind::GitMode(0o100775).is_executable());
+        assert_eq!(FileKind::GitMode(0o100664).normalized(), FileKind::Regular);
+        cs.file_changes.insert(
+            RepoPath::try_from("bad").unwrap(),
+            FileChange::Change { content_id: ContentId::empty(), size: 0, kind: FileKind::GitMode(0o100644), copy_from: None },
+        );
+        assert!(cs.validate().is_err(), "canonical modes must use Regular/Executable");
     }
 }

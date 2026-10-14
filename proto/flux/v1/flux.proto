@@ -44,6 +44,9 @@ message FileChange {
   CopyFrom copy_from = 7;      // optional
   // Merges only: keep parents[0]'s value (the parents disagree here).
   bool retain = 8;
+  // Nonzero: a regular file with this non-canonical git mode (e.g. 0100664),
+  // preserved for git fidelity. `kind` then holds the canonical kind.
+  uint32 git_mode = 9;
 }
 
 message Changeset {

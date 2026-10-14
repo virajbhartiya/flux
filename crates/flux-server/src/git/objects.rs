@@ -85,6 +85,7 @@ fn mode_of(kind: &EntryKind) -> u32 {
         EntryKind::File(FileKind::Executable) => 0o100755,
         EntryKind::File(FileKind::Symlink) => 0o120000,
         EntryKind::File(FileKind::GitLink(_)) => 0o160000,
+        EntryKind::File(FileKind::GitMode(m)) => *m,
     }
 }
 
@@ -167,6 +168,8 @@ pub struct GitCaches {
     pub trees: moka::sync::Cache<TreeId, Sha>,
     pub blobs: moka::sync::Cache<ContentId, Sha>,
     pub commits: moka::sync::Cache<(RepoId, ChangesetId), Sha>,
+    /// Tree mappings not yet persisted (written in batches).
+    pending_trees: std::sync::Mutex<Vec<(TreeId, Sha)>>,
 }
 
 impl Default for GitCaches {
@@ -181,6 +184,7 @@ impl GitCaches {
             trees: moka::sync::Cache::new(4_000_000),
             blobs: moka::sync::Cache::new(4_000_000),
             commits: moka::sync::Cache::new(4_000_000),
+            pending_trees: Default::default(),
         }
     }
 }
@@ -217,7 +221,7 @@ impl Flux {
             let (sha, target) = match e.kind {
                 EntryKind::Dir => {
                     let t = e.tree_id().unwrap();
-                    (Box::pin(self.git_tree_sha(t)).await?, Target::Tree(t))
+                    (Box::pin(self.git_tree_sha_buffered(t)).await?, Target::Tree(t))
                 }
                 EntryKind::File(FileKind::GitLink(s)) => (s, Target::Gitlink),
                 EntryKind::File(_) => {
@@ -233,6 +237,29 @@ impl Flux {
 
     /// The git tree SHA-1 of a flux tree (memoized and persisted).
     pub async fn git_tree_sha(&self, id: TreeId) -> FluxResult<Sha> {
+        let sha = self.git_tree_sha_buffered(id).await?;
+        self.flush_git_trees().await?;
+        Ok(sha)
+    }
+
+    /// Persist buffered tree mappings.
+    pub async fn flush_git_trees(&self) -> FluxResult<()> {
+        let batch = std::mem::take(&mut *self.git.pending_trees.lock().unwrap());
+        if !batch.is_empty() {
+            self.meta.git_trees_put(&batch).await?;
+        }
+        Ok(())
+    }
+
+    /// The flux tree for a git tree SHA-1 generated earlier.
+    pub async fn git_tree_by_sha(&self, sha: &Sha) -> FluxResult<Option<TreeId>> {
+        self.flush_git_trees().await?;
+        Ok(self.meta.git_tree_by_sha(sha).await?)
+    }
+
+    /// Like `git_tree_sha`, but new mappings are only buffered (flushed in
+    /// batches) so generating a long history costs no write per tree.
+    async fn git_tree_sha_buffered(&self, id: TreeId) -> FluxResult<Sha> {
         if let Some(s) = self.git.trees.get(&id) {
             return Ok(s);
         }
@@ -243,8 +270,15 @@ impl Flux {
         let tree = self.blobs.get_tree(&id).await?.ok_or_else(|| FluxError::Internal(anyhow::anyhow!("tree {id} missing")))?;
         let bytes = encode_tree(&self.git_tree_entries(&tree).await?);
         let sha = hash_object(Kind::Tree, &bytes);
-        self.meta.git_trees_put(&[(id, sha)]).await?;
         self.git.trees.insert(id, sha);
+        let full = {
+            let mut p = self.git.pending_trees.lock().unwrap();
+            p.push((id, sha));
+            p.len() >= 2000
+        };
+        if full {
+            self.flush_git_trees().await?;
+        }
         Ok(sha)
     }
 
@@ -320,42 +354,68 @@ impl Flux {
             if known.contains_key(&id) || self.git.commits.get(&(repo, id)).is_some() {
                 continue;
             }
-            // Check the persisted mapping in batches as we go.
-            if let Some(Some(s)) = self.meta.git_commits_of(repo, &[id]).await?.pop() {
-                self.git.commits.insert((repo, id), s);
-                continue;
-            }
             need.push(i);
             stack.extend(parents);
         }
+        // Drop commits whose mapping is already persisted (their ancestors
+        // were collected too, which is harmless: they are skipped here).
         need.sort_unstable();
+        let ids: Vec<ChangesetId> = {
+            let graph = g.graph.read().unwrap();
+            need.iter().map(|i| graph.id(*i)).collect()
+        };
+        let mut todo = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(4000) {
+            for (id, s) in chunk.iter().zip(self.meta.git_commits_of(repo, chunk).await?) {
+                match s {
+                    Some(s) => {
+                        self.git.commits.insert((repo, *id), s);
+                        known.insert(*id, s);
+                    }
+                    None => todo.push(*id),
+                }
+            }
+        }
         let mut batch: Vec<(ChangesetId, Sha)> = Vec::new();
-        for i in need {
-            let id = g.graph.read().unwrap().id(i);
-            let l = self.load_one_arc(repo, &id).await?;
-            let tree = self.git_tree_sha(self.root_tree(repo, &id).await?).await?;
-            let mut parents = Vec::with_capacity(l.changeset.parents.len());
-            for p in &l.changeset.parents {
-                let s = match known.get(p).copied().or_else(|| self.git.commits.get(&(repo, *p))) {
-                    Some(s) => s,
-                    None => self
-                        .meta
-                        .git_commits_of(repo, &[*p])
-                        .await?
-                        .pop()
-                        .flatten()
-                        .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("parent {p} has no git commit")))?,
-                };
-                parents.push(s);
+        for chunk in todo.chunks(512) {
+            // Trees are independent of each other: compute them concurrently.
+            let trees: Vec<(Arc<crate::core::Loaded>, Sha)> = {
+                use futures::StreamExt as _;
+                let futs: Vec<_> = chunk
+                    .iter()
+                    .map(|id| async move {
+                        let l = self.load_one_arc(repo, id).await?;
+                        let tree = self.git_tree_sha_buffered(self.root_tree(repo, id).await?).await?;
+                        FluxResult::Ok((l, tree))
+                    })
+                    .collect();
+                futures::stream::iter(futs).buffered(16).collect::<Vec<_>>().await.into_iter().collect::<FluxResult<_>>()?
+            };
+            for (id, (l, tree)) in chunk.iter().zip(trees) {
+                let id = *id;
+                let mut parents = Vec::with_capacity(l.changeset.parents.len());
+                for p in &l.changeset.parents {
+                    let s = match known.get(p).copied().or_else(|| self.git.commits.get(&(repo, *p))) {
+                        Some(s) => s,
+                        None => self
+                            .meta
+                            .git_commits_of(repo, &[*p])
+                            .await?
+                            .pop()
+                            .flatten()
+                            .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("parent {p} has no git commit")))?,
+                    };
+                    parents.push(s);
+                }
+                let sha = hash_object(Kind::Commit, &encode_commit(&l.changeset, &tree, &parents));
+                known.insert(id, sha);
+                self.git.commits.insert((repo, id), sha);
+                batch.push((id, sha));
             }
-            let sha = hash_object(Kind::Commit, &encode_commit(&l.changeset, &tree, &parents));
-            known.insert(id, sha);
-            self.git.commits.insert((repo, id), sha);
-            batch.push((id, sha));
-            if batch.len() >= 1000 {
-                self.meta.git_commits_put(repo, &batch).await?;
-                batch.clear();
-            }
+            // Trees before commits: a persisted commit implies its trees are.
+            self.flush_git_trees().await?;
+            self.meta.git_commits_put(repo, &batch).await?;
+            batch.clear();
         }
         if !batch.is_empty() {
             self.meta.git_commits_put(repo, &batch).await?;

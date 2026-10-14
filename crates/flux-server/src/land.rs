@@ -209,7 +209,7 @@ impl Flux {
         let (Some(b), Some(o), FileChange::Change { content_id: t_id, kind: t_kind, .. }) = (base, ours, theirs) else {
             return Ok(None);
         };
-        let text = |k: Option<FileKind>| matches!(k, Some(FileKind::Regular | FileKind::Executable));
+        let text = |k: Option<FileKind>| k.is_some_and(FileKind::is_plain);
         if !text(b.file_kind()) || !text(o.file_kind()) || !text(Some(*t_kind)) {
             return Ok(None);
         }

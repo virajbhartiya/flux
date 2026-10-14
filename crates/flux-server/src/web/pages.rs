@@ -905,7 +905,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                     v
                 };
                 info.insert(0, format!("{} lines", plain.len()));
-                editable = entry.size <= 1 << 20 && matches!(entry.file_kind(), Some(FileKind::Regular | FileKind::Executable));
+                editable = entry.size <= 1 << 20 && entry.file_kind().is_some_and(FileKind::is_plain);
                 if entry.file_kind() == Some(FileKind::Symlink) {
                     content_block = html! { div.notice { (icon("link")) " Symbolic link to " code { (text) } } };
                 } else if is_md && !plain_md {
@@ -957,7 +957,6 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                         a.btn.small href=(url(&ctx.name, "edit", rev, Some(path))) { (icon("edit")) "Edit" }
                     }
                     a.btn.small href=(url(&ctx.name, "blame", rev, Some(path))) { (icon("blame")) "Blame" }
-                    a.btn.small href=(history_url) { (icon("history")) "History" }
                     button.btn.small.copy-btn type="button" data-copy-url=(permalink) title="Copy permalink (y)" { (icon("copy")) "Permalink" }
                 }
                 (content_block)
@@ -1227,7 +1226,7 @@ fn graph_rows(items: &[Arc<Loaded>]) -> Vec<Markup> {
             html! {
                 svg.graph width=(format!("{w}")) height=(format!("{ROW_H}")) viewBox=(format!("0 0 {w} {ROW_H}")) aria-hidden="true" {
                     @for (d, c) in &paths { path d=(d) stroke=(c) {} }
-                    circle cx=(format!("{}", x(col))) cy=(format!("{mid}")) r=(if merge { "4" } else { "4.5" }) fill=(if merge { "var(--surface)" } else { color(col) }) stroke=(color(col)) {}
+                    circle cx=(format!("{}", x(col))) cy=(format!("{mid}")) r=(if merge { "4" } else { "4.5" }) class=[merge.then_some("merge-node")] fill=(color(col)) stroke=(color(col)) {}
                 }
             }
         })

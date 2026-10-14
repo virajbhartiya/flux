@@ -43,8 +43,8 @@ pub enum Kind {
 
 impl Kind {
     pub fn from_core(k: &FileKind) -> Self {
-        match k {
-            FileKind::Regular => Kind::Regular,
+        match k.normalized() {
+            FileKind::Regular | FileKind::GitMode(_) => Kind::Regular,
             FileKind::Executable => Kind::Executable,
             FileKind::Symlink => Kind::Symlink,
             FileKind::GitLink(_) => Kind::GitLink,

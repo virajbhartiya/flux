@@ -67,6 +67,26 @@ async fn push_clone_fetch_roundtrip() {
             git(&src, &["push", "-q", &url, "main"]);
             git(&clone, &["pull", "-q", "--ff-only"]);
             assert_eq!(git(&clone, &["rev-parse", "HEAD"]), git(&src, &["rev-parse", "HEAD"]));
+            // Legacy file modes (100664, as in early git history) keep their SHA-1s.
+            let blob = git(&src, &["hash-object", "-w", "README.md"]);
+            let mktree = Command::new("git")
+                .args(["mktree"])
+                .current_dir(&src)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                use std::io::Write as _;
+                let mut stdin = mktree.stdin.as_ref().unwrap();
+                writeln!(stdin, "100664 blob {blob}\told.txt").unwrap();
+            }
+            let tree = String::from_utf8(mktree.wait_with_output().unwrap().stdout).unwrap().trim().to_string();
+            let legacy = git(&src, &["commit-tree", &tree, "-m", "legacy mode"]);
+            git(&src, &["push", "-q", &url, &format!("{legacy}:refs/heads/legacy")]);
+            git(&clone, &["fetch", "-q", "origin", "legacy"]);
+            assert_eq!(git(&clone, &["rev-parse", "FETCH_HEAD^{tree}"]), tree);
+            assert_eq!(git(&clone, &["rev-parse", "FETCH_HEAD"]), legacy);
             head
         })
     };

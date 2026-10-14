@@ -585,7 +585,7 @@ impl Resolver<'_> {
         let entries = match self.pushed.get(sha) {
             Some(o) if o.kind == Kind::Tree => parse_tree(&o.data).map_err(FluxError::InvalidArgument)?,
             _ => {
-                let t = self.flux.meta.git_tree_by_sha(sha).await?.ok_or_else(|| {
+                let t = self.flux.git_tree_by_sha(sha).await?.ok_or_else(|| {
                     FluxError::InvalidArgument(format!("tree {} is not in the push or the repository", hex(sha)))
                 })?;
                 let (bytes, _) = self.flux.git_tree_bytes(t).await?;
@@ -756,7 +756,7 @@ async fn existing_object(flux: &Flux, repo: RepoId, sha: &Sha) -> FluxResult<Opt
     if let Some(c) = flux.meta.content_by_sha1(std::slice::from_ref(sha)).await?.pop().flatten() {
         return Ok(flux.blobs.get_content_bytes(&c).await?.map(|b| (Kind::Blob, b.to_vec())));
     }
-    if let Some(t) = flux.meta.git_tree_by_sha(sha).await? {
+    if let Some(t) = flux.git_tree_by_sha(sha).await? {
         return Ok(Some((Kind::Tree, flux.git_tree_bytes(t).await?.0)));
     }
     if let Some(cs) = flux.git_lookup_commit(repo, sha).await? {
@@ -889,10 +889,9 @@ async fn import_commits(
         };
         for (rp, mode, sha) in blobs_needed {
             let kind = match mode {
-                0o100755 => FileKind::Executable,
                 0o120000 => FileKind::Symlink,
                 0o160000 => FileKind::GitLink(sha),
-                0o100644 | 0o100664 => FileKind::Regular,
+                m if m & !0o777 == 0o100000 => FileKind::from_git_file_mode(m),
                 m => return Err(FluxError::InvalidArgument(format!("unsupported git mode {m:o} at {rp}"))),
             };
             let change = match kind {

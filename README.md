@@ -6,7 +6,7 @@
 - **Changesets are deltas.** Creating one costs O(change), not O(repo). Trees, history indexes and blame are *derived data*.
 - **Everything is content-addressed** (BLAKE3, domain separated) and verified on every fetch, by every tier.
 - **Refs move only by compare-and-swap**, and **landing is a server-side rebase** with line-level three-way merges, so many people and agents can land on `main` concurrently without a merge queue lock.
-- **Git compatible from day one:** import any git repository (incremental and resumable) and verify the result against `git ls-tree`.
+- **Git compatible:** import any git repository (incremental and resumable), and `git clone`, `fetch` and `push` straight from the flux server, with commit SHA-1s preserved.
 
 It ships as one binary for the server, gRPC API and web UI (`flux-server`), one CLI (`flux`) and a git importer (`flux-import-git`).
 
@@ -49,6 +49,9 @@ open http://127.0.0.1:7878
 # Import a git repository (resumable, incremental), then check it.
 flux-import-git --repo demo import /path/to/repo.git
 flux-import-git --repo demo verify /path/to/repo.git --sample 200
+
+# Plain git works against the same server.
+git clone http://127.0.0.1:7878/demo.git
 
 # Or start from scratch.
 flux attach 127.0.0.1:7878 demo work && cd work
@@ -105,6 +108,8 @@ docker compose exec flux flux-server token --user admin --admin
 ```
 
 - **Auth** (`--auth`): `open` (single user / trusted network), `token` (anonymous reads, token writes), `private` (tokens for everything). `flux-server token --user NAME [--admin]` issues a token; only its SHA-256 is stored. `flux login` saves it for the CLI; the web UI uses an HttpOnly, SameSite cookie. `flux-server revoke --user NAME` revokes.
+- **Path ACLs:** admins set per-path rules on the settings page (`infra/secrets | ops | ops`). The rules are enforced on gRPC, the web UI and git, and the most specific rule wins. See SPEC §12.2 for the limits of v1.
+- **Git:** `/<repo>.git` speaks smart HTTP. Use your token as the password (`git clone http://x:TOKEN@host/repo.git`) or send it as a Bearer header. Pushes to protected refs must be fast-forwards.
 - **Protected refs:** non-admins can only fast-forward `main`, `master`, `trunk` and `release/*`. Rebased work reaches them through `flux land` or a review.
 - **Durability:** objects are fsynced before any metadata references them. Segment files are append-only with per-record CRCs, and a torn tail is truncated on restart. The importer resumes after any crash. A test kills the server with `SIGKILL` three times during a git.git import, then resumes, verifies and runs `fsck --full`.
 - **Integrity:** `flux-server fsck [--full]` re-hashes changesets, trees and file contents, checks graph closure and refs, and re-derives missing derived data. It is safe to run online.
@@ -126,7 +131,7 @@ docker compose exec flux flux-server token --user admin --admin
 | `flux-core` | ids, deterministic CBOR, paths, changesets, trees; golden vectors pin object identity |
 | `flux-store` | metadata stores (SQLite, Postgres; one conformance suite), blob store: segment files with delta chains and FastCDC chunking, or any object store |
 | `flux-derive` | `tree_v1` and `lastmod_v1` derivation, tree walk and diff |
-| `flux-server` | core operations, commit graph, landing, reviews, search, auth, gRPC, web UI, cache tier, fsck and backup |
+| `flux-server` | core operations, commit graph, landing, reviews, search, auth and ACLs, gRPC, web UI, git smart HTTP, cache tier, fsck and backup |
 | `flux-client` | Rust client; verifies every object it fetches |
 | `flux-cli` | the `flux` command |
 | `flux-git` | `flux-import-git` (import and verify) |

@@ -576,6 +576,14 @@ For each changeset, it computes git tree objects bottom-up, reusing parent git t
   - pushes to `refs/heads/scratch/*` are a direct ref CAS.
 - **Goal:** `git clone --filter=blob:none https://flux.example/repo` works, and `git fetch` stays O(new objects).
 
+**As built.** `flux-server` serves git smart HTTP (protocol v0/v1) at `/<repo>.git` on the main port:
+- `upload-pack` with `multi_ack_detailed`, `side-band-64k` and `ofs-delta`. Packs are streamed as they are generated; trees and blobs are deltified against the previous version of the same path.
+- `receive-pack` imports pushed commits as changesets, merges included (`Retain` entries keep parent 0's side). It then checks that the regenerated commit hashes to the pushed SHA-1, and keeps the verbatim commit in `extra["git.commit"]` when it does not. Ref updates are compare-and-swap; protected refs accept fast-forwards only, and non-admins land rebased work through flux.
+- Generated objects are memoized: `git_trees` (flux tree → SHA-1) and `git_commits` (changeset ↔ SHA-1, per repository). The first fetch of an imported history generates the whole mapping (about 4 minutes for git.git); later fetches only generate new objects.
+- Legacy file modes such as `100664` are preserved as `FileKind::GitMode`, so imported trees and commits hash to their original SHA-1s.
+- Auth: HTTP Basic (any user name, token as password) or Bearer, with the same modes as the rest of the server.
+- Not yet: protocol v2, shallow and partial clones, bundle-uri.
+
 ### 10.4 `flux-mirror` (two-way sync with GitHub/GitLab)
 - **Inbound:** a webhook or poll triggers an incremental import, then the mirror moves `mirror/<remote>/<branch>`.
 - **Outbound:** the mirror tails `EventService` for protected-ref moves and pushes `git_v1` commits to the remote. Commit SHA-1s are identical in both directions, so mirrors never diverge in history.
@@ -655,6 +663,11 @@ write = ["group:sec-eng"]
 3. Caches and fluxd tag stored objects with their domain. They serve domain objects only to principals that flux-server has confirmed have access. Confirmations are cached per `(principal, domain)` for at most 60 s.
 4. **Moving a file across a domain boundary** re-hashes it into the target namespace, and the server does this at changeset creation.
 5. **ACL changes do not rewrite history.** A newly restricted path takes effect for new changesets. Historical exposure is documented, and `flux-admin acl rehome` can re-key history as an offline operation.
+
+**As built (v1).** ACL rules live in the repository settings (`path | readers | writers`, editable by admins on the settings page) instead of `/.flux/acl.toml`. Principals are user names, `*` and `admins`. The most specific path prefix wins, and admins bypass every rule.
+- Enforcement is path-based on every surface. gRPC tree, list, read, blame, diff, search and find calls filter or refuse restricted paths. Creates and lands check write rights on each changed path. The web UI applies the same checks.
+- Git access is refused to principals restricted by any rule, because a git clone exposes every object.
+- **Limitation:** domain-keyed hashing (items 1–4 above) is not implemented, so a principal who already knows a content or tree id can fetch it by id. Treat v1 ACLs as access control on paths, not as secrecy for content whose hash has leaked.
 
 ### 12.3 Audit
 Every write, every ref move and every read of a restricted domain is emitted to an audit log (OTLP logs, with the sink configurable).

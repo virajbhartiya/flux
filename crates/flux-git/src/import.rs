@@ -49,12 +49,12 @@ pub struct ImportStats {
     pub elapsed_ms: u128,
 }
 
-/// Map a git mode to a flux file kind. Legacy modes like 100664 are treated
-/// as regular files (exact git tree bytes are a phase-3b concern).
+/// Map a git mode to a flux file kind. Legacy modes like 100664 are kept
+/// (`FileKind::GitMode`) so regenerated trees hash to the original SHA-1s.
 pub fn mode_kind(mode: u32, sha: &Sha) -> Result<Option<FileKind>> {
     Ok(match mode & 0o170000 {
         0 if mode == 0 => None,
-        0o100000 => Some(if mode & 0o111 != 0 { FileKind::Executable } else { FileKind::Regular }),
+        0o100000 if mode & 0o7000 == 0 => Some(FileKind::from_git_file_mode(mode)),
         0o120000 => Some(FileKind::Symlink),
         0o160000 => Some(FileKind::GitLink(*sha)),
         _ => bail!("unsupported git mode {mode:o}"),
@@ -99,6 +99,29 @@ fn file_changes(first: &[RawEntry], others: &[Vec<RawEntry>]) -> Result<BTreeMap
         }
     }
     Ok(out)
+}
+
+/// git's diff output canonicalizes legacy modes, so restore them: files
+/// with a legacy mode in this commit get `FileKind::GitMode`, and files
+/// whose legacy mode differs from the first parent's (including mode-only
+/// changes, which git's diff does not report) get an explicit change.
+fn apply_legacy_modes(changes: &mut BTreeMap<Vec<u8>, Value>, cur: &git::LegacyMap, prev: &git::LegacyMap) {
+    for (path, (mode, sha)) in cur {
+        match changes.get_mut(path) {
+            Some(Value::Set(Some((kind, _)))) => *kind = FileKind::GitMode(*mode),
+            Some(_) => {}
+            None if prev.get(path) != Some(&(*mode, *sha)) => {
+                changes.insert(path.clone(), Value::Set(Some((FileKind::GitMode(*mode), *sha))));
+            }
+            None => {}
+        }
+    }
+    for (path, (mode, sha)) in prev {
+        if !cur.contains_key(path) && !changes.contains_key(path) {
+            // Unchanged content, now with the canonical mode.
+            changes.insert(path.clone(), Value::Set(Some((FileKind::GitMode(*mode).normalized(), *sha))));
+        }
+    }
 }
 
 fn ts(t: (i64, i16)) -> Timestamp {
@@ -181,6 +204,9 @@ fn read_batches(
     }
     let mut diffs = DiffTree::spawn(&repo, requests)?;
     let mut cat = CatFile::new(&repo)?;
+    let mut legacy = git::LegacyModes::scan(&repo)?;
+    // Root tree per commit, for comparing legacy modes with the first parent.
+    let mut trees: HashMap<Sha, Sha> = HashMap::new();
     let mut blobs: HashMap<Sha, (ContentId, u64)> = HashMap::new();
     for chunk in todo.chunks(batch.max(1)) {
         let mut out = ReadBatch { shas: vec![], changesets: vec![], uploads: vec![] };
@@ -195,7 +221,23 @@ fn read_batches(
             for _ in 1..parents.len() {
                 others.push(diffs.next_record()?);
             }
-            let changes = file_changes(&first, &others).with_context(|| format!("commit {}", hex::encode(sha)))?;
+            let mut changes = file_changes(&first, &others).with_context(|| format!("commit {}", hex::encode(sha)))?;
+            if !legacy.is_empty() {
+                let parent_tree = match parents.first() {
+                    None => None,
+                    Some(p0) => Some(match trees.get(p0) {
+                        Some(t) => *t,
+                        None => git::parse_commit(&cat.read(p0)?.1)?.tree,
+                    }),
+                };
+                let cur = legacy.files(&mut cat, &commit.tree)?;
+                let prev = match parent_tree {
+                    Some(t) => legacy.files(&mut cat, &t)?,
+                    None => Default::default(),
+                };
+                apply_legacy_modes(&mut changes, &cur, &prev);
+            }
+            trees.insert(*sha, commit.tree);
             // Previous version of each modified path, for delta hints.
             let old: HashMap<&[u8], Sha> =
                 first.iter().filter(|e| e.old_mode & 0o170000 == 0o100000).map(|e| (e.path.as_slice(), e.old_sha)).collect();
@@ -393,7 +435,8 @@ pub async fn verify(client: &Client, git_dir: &Path, commits: &[Sha]) -> Result<
                         full.push(b'/');
                     }
                     full.extend_from_slice(e.name.as_bytes());
-                    got.insert(full, (kind, e.content_id()));
+                    // git's ls-tree reports canonical modes.
+                    got.insert(full, (kind.normalized(), e.content_id()));
                 }
             }
         }
@@ -415,4 +458,36 @@ pub async fn verify(client: &Client, git_dir: &Path, commits: &[Sha]) -> Result<
         }
     }
     Ok(mismatches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_modes_restore_kinds_and_mode_only_changes() {
+        let (a, b, c) = ([1u8; 20], [2u8; 20], [3u8; 20]);
+        let prev: git::LegacyMap = [(b"kept".to_vec(), (0o100664, a)), (b"fixed".to_vec(), (0o100664, b))].into();
+        let cur: git::LegacyMap = [(b"kept".to_vec(), (0o100664, a)), (b"new".to_vec(), (0o100664, c))].into();
+        // git's diff reports the new file with a canonical mode and nothing for
+        // `fixed` (100664 → 100644 is not a change to git's diff).
+        let mut changes: BTreeMap<Vec<u8>, Value> = [(b"new".to_vec(), Value::Set(Some((FileKind::Regular, c))))].into();
+        apply_legacy_modes(&mut changes, &cur, &prev);
+        assert_eq!(changes[b"new".as_slice()], Value::Set(Some((FileKind::GitMode(0o100664), c))));
+        assert_eq!(changes[b"fixed".as_slice()], Value::Set(Some((FileKind::Regular, b))));
+        assert!(!changes.contains_key(b"kept".as_slice()), "unchanged legacy files need no entry");
+    }
+
+    #[test]
+    fn raw_tree_entries() {
+        let mut t = b"100664 a.txt\0".to_vec();
+        t.extend([7u8; 20]);
+        t.extend(b"40000 dir\0");
+        t.extend([8u8; 20]);
+        let e = git::tree_entries(&t).unwrap();
+        assert_eq!(
+            e,
+            vec![(b"100664".as_slice(), b"a.txt".as_slice(), [7; 20]), (b"40000".as_slice(), b"dir".as_slice(), [8; 20])]
+        );
+    }
 }

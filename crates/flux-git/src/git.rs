@@ -189,6 +189,7 @@ impl DiffTree {
 /// Parsed git commit object. Unknown headers are preserved verbatim.
 #[derive(Debug, Clone)]
 pub struct Commit {
+    pub tree: Sha,
     pub parents: Vec<Sha>,
     pub author: Vec<u8>,
     pub author_time: (i64, i16),
@@ -231,6 +232,7 @@ pub fn parse_commit(data: &[u8]) -> Result<Commit> {
         Some(i) => (&data[..i], data[i + 2..].to_vec()),
         None => (data, Vec::new()),
     };
+    let mut tree = [0u8; 20];
     let mut parents = Vec::new();
     let mut author_line = None;
     let mut committer_line = None;
@@ -246,7 +248,7 @@ pub fn parse_commit(data: &[u8]) -> Result<Commit> {
         }
         in_extra = false;
         if let Some(rest) = line.strip_prefix(b"tree ") {
-            let _ = rest;
+            tree = parse_sha(std::str::from_utf8(rest)?)?;
         } else if let Some(rest) = line.strip_prefix(b"parent ") {
             parents.push(parse_sha(std::str::from_utf8(rest)?)?);
         } else if let Some(rest) = line.strip_prefix(b"author ") {
@@ -266,7 +268,136 @@ pub fn parse_commit(data: &[u8]) -> Result<Commit> {
             (Some((a, at)), Some((c, ct))) => (a, at, c, ct, None),
             _ => (Vec::new(), (0, 0), Vec::new(), (0, 0), Some((author_line, committer_line))),
         };
-    Ok(Commit { parents, author, author_time, committer, committer_time, extra_headers: extra, message, raw_identity })
+    Ok(Commit { tree, parents, author, author_time, committer, committer_time, extra_headers: extra, message, raw_identity })
+}
+
+/// Files recorded with non-canonical git modes (`100664` in early git
+/// history). git's own diff and ls-tree output canonicalizes these, so they
+/// are found by scanning raw tree objects once; afterwards only trees that
+/// contain such an entry somewhere below are ever read again.
+#[derive(Default)]
+pub struct LegacyModes {
+    /// Trees with a legacy entry at or below them.
+    tainted: std::collections::HashSet<Sha>,
+    /// Per tainted tree: legacy file entries by full path below it.
+    memo: std::collections::HashMap<Sha, std::sync::Arc<LegacyMap>>,
+}
+
+/// path → (raw mode, blob sha).
+pub type LegacyMap = std::collections::BTreeMap<Vec<u8>, (u32, Sha)>;
+
+const CANONICAL_MODES: [&[u8]; 5] = [b"100644", b"100755", b"120000", b"160000", b"40000"];
+
+/// Raw tree entries: `(mode bytes, name, sha)`.
+pub fn tree_entries(data: &[u8]) -> Result<Vec<(&[u8], &[u8], Sha)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let sp = data[i..].iter().position(|b| *b == b' ').ok_or_else(|| anyhow!("bad tree entry"))? + i;
+        let nul = data[sp..].iter().position(|b| *b == 0).ok_or_else(|| anyhow!("bad tree entry"))? + sp;
+        let sha: Sha = data.get(nul + 1..nul + 21).ok_or_else(|| anyhow!("truncated tree"))?.try_into()?;
+        out.push((&data[i..sp], &data[sp + 1..nul], sha));
+        i = nul + 21;
+    }
+    Ok(out)
+}
+
+fn is_legacy_file_mode(mode: &[u8]) -> Option<u32> {
+    if CANONICAL_MODES.contains(&mode) {
+        return None;
+    }
+    let m = u32::from_str_radix(std::str::from_utf8(mode).ok()?, 8).ok()?;
+    (m & !0o777 == 0o100000).then_some(m)
+}
+
+impl LegacyModes {
+    /// Scan every tree object in the repository.
+    pub fn scan(repo: &Path) -> Result<Self> {
+        let list = run(repo, &["cat-file", "--batch-all-objects", "--unordered", "--batch-check=%(objecttype) %(objectname)"])?;
+        let trees: Vec<Sha> = list
+            .split(|b| *b == b'\n')
+            .filter_map(|l| l.strip_prefix(b"tree "))
+            .map(|s| parse_sha(std::str::from_utf8(s)?))
+            .collect::<Result<_>>()?;
+        let mut child = git(repo).args(["cat-file", "--batch"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let stdin = child.stdin.take().unwrap();
+        let feed = trees.clone();
+        let writer = std::thread::spawn(move || -> Result<()> {
+            let mut w = BufWriter::new(stdin);
+            for t in feed {
+                writeln!(w, "{}", hex::encode(t))?;
+            }
+            w.flush()?;
+            Ok(())
+        });
+        let mut r = BufReader::with_capacity(1 << 20, child.stdout.take().unwrap());
+        // Subtree edges (child → parent tree index), kept only to propagate taint upwards.
+        let mut parents_of: std::collections::HashMap<Sha, Vec<u32>> = std::collections::HashMap::new();
+        let mut legacy: Vec<Sha> = Vec::new();
+        let mut header = String::new();
+        let mut data = Vec::new();
+        for (idx, sha) in trees.iter().enumerate() {
+            header.clear();
+            r.read_line(&mut header)?;
+            let size: usize = header.trim_end().rsplit(' ').next().unwrap_or("").parse().context("cat-file header")?;
+            data.resize(size + 1, 0);
+            r.read_exact(&mut data)?;
+            let mut has_legacy = false;
+            for (mode, _, sub) in tree_entries(&data[..size])? {
+                if mode == b"40000" || mode == b"040000" {
+                    parents_of.entry(sub).or_default().push(idx as u32);
+                } else if is_legacy_file_mode(mode).is_some() {
+                    has_legacy = true;
+                }
+            }
+            if has_legacy {
+                legacy.push(*sha);
+            }
+        }
+        writer.join().map_err(|_| anyhow!("cat-file writer panicked"))??;
+        child.wait()?;
+        let mut tainted = std::collections::HashSet::new();
+        let mut stack = legacy;
+        while let Some(t) = stack.pop() {
+            if tainted.insert(t)
+                && let Some(ps) = parents_of.get(&t)
+            {
+                stack.extend(ps.iter().map(|i| trees[*i as usize]));
+            }
+        }
+        Ok(Self { tainted, memo: Default::default() })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tainted.is_empty()
+    }
+
+    /// Legacy-mode files in `tree` (full paths).
+    pub fn files(&mut self, cat: &mut CatFile, tree: &Sha) -> Result<std::sync::Arc<LegacyMap>> {
+        if !self.tainted.contains(tree) {
+            return Ok(Default::default());
+        }
+        if let Some(m) = self.memo.get(tree) {
+            return Ok(m.clone());
+        }
+        let (_, data) = cat.read(tree)?;
+        let mut out = LegacyMap::new();
+        for (mode, name, sha) in tree_entries(&data)? {
+            if let Some(m) = is_legacy_file_mode(mode) {
+                out.insert(name.to_vec(), (m, sha));
+            } else if (mode == b"40000" || mode == b"040000") && self.tainted.contains(&sha) {
+                for (p, v) in self.files(cat, &sha)?.iter() {
+                    let mut full = name.to_vec();
+                    full.push(b'/');
+                    full.extend_from_slice(p);
+                    out.insert(full, *v);
+                }
+            }
+        }
+        let out = std::sync::Arc::new(out);
+        self.memo.insert(*tree, out.clone());
+        Ok(out)
+    }
 }
 
 /// List `(ref name, sha)` for `refs/heads/*` (or the given patterns).

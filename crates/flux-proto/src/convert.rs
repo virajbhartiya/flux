@@ -38,6 +38,7 @@ pub fn kind_to_pb(kind: &FileKind) -> (i32, Vec<u8>) {
         FileKind::Executable => (v1::FileKind::Executable as i32, vec![]),
         FileKind::Symlink => (v1::FileKind::Symlink as i32, vec![]),
         FileKind::GitLink(sha) => (v1::FileKind::Gitlink as i32, sha.to_vec()),
+        FileKind::GitMode(_) => kind_to_pb(&kind.normalized()),
     }
 }
 
@@ -78,8 +79,13 @@ pub fn changeset_to_pb(cs: &flux_core::Changeset) -> v1::Changeset {
                 FileChange::Deletion => v1::FileChange { path: path.as_bytes().to_vec(), deleted: true, ..Default::default() },
                 FileChange::Retain => v1::FileChange { path: path.as_bytes().to_vec(), retain: true, ..Default::default() },
                 FileChange::Change { content_id, size, kind, copy_from } => {
+                    let git_mode = match kind {
+                        FileKind::GitMode(m) => *m,
+                        _ => 0,
+                    };
                     let (kind, gitlink_sha1) = kind_to_pb(kind);
                     v1::FileChange {
+                        git_mode,
                         path: path.as_bytes().to_vec(),
                         deleted: false,
                         content_id: content_id.as_bytes().to_vec(),
@@ -109,7 +115,11 @@ pub fn changeset_from_pb(pb: &v1::Changeset) -> Result<flux_core::Changeset, Sta
         } else if fc.retain {
             FileChange::Retain
         } else {
-            let kind = kind_from_pb(fc.kind, &fc.gitlink_sha1)?;
+            let kind = match fc.git_mode {
+                0 => kind_from_pb(fc.kind, &fc.gitlink_sha1)?,
+                m if m & !0o777 == 0o100000 => FileKind::from_git_file_mode(m),
+                m => return Err(bad(format!("{path}: invalid git_mode {m:o}"))),
+            };
             let content_id = match kind {
                 // Gitlinks carry no content; normalize to the empty id.
                 FileKind::GitLink(_) => ContentId::empty(),
@@ -163,6 +173,10 @@ mod tests {
         fc.insert(
             RepoPath::try_from("sub").unwrap(),
             FileChange::Change { content_id: ContentId::empty(), size: 0, kind: FileKind::GitLink([3; 20]), copy_from: None },
+        );
+        fc.insert(
+            RepoPath::try_from("old").unwrap(),
+            FileChange::Change { content_id: ContentId::hash(b"o"), size: 1, kind: FileKind::GitMode(0o100664), copy_from: None },
         );
         let cs = flux_core::Changeset {
             parents: vec![ChangesetId::hash(b"p")],

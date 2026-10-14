@@ -225,10 +225,9 @@ aside.side p { margin: 0 0 8px; }
 .crumbs strong { font-weight: 600; }
 .crumbs .sep { color: var(--text-3); margin: 0 3px; }
 .crumbs-label { display: flex; align-items: center; gap: 8px; color: var(--text-2); }
-.copy-btn { border: 0; background: transparent; color: var(--text-3); cursor: pointer; padding: 3px 4px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; font: inherit; }
-.copy-btn:hover { color: var(--text); background: var(--bg-hover); }
+:where(.copy-btn:not(.btn)) { border: 0; background: transparent; color: var(--text-3); cursor: pointer; padding: 3px 4px; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; font: inherit; }
+:where(.copy-btn:not(.btn)):hover { color: var(--text); background: var(--bg-hover); }
 .copy-btn.copied, .copy-btn.copied:hover { color: var(--green); }
-.btn.copy-btn { color: var(--text); }
 
 /* ── file browser ────────────────────────────────────────────────── */
 .commit-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--bg-subtle); font-size: 13px; min-height: 44px; }
@@ -517,3 +516,6 @@ label.radio input[type=radio] { accent-color: var(--accent); }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 svg.langbar, .langs svg { filter: saturate(.7); }
+
+/* Merge commits: hollow graph nodes (SVG fill attributes can't use CSS variables). */
+circle.merge-node { fill: var(--bg); }

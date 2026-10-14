@@ -239,6 +239,7 @@ mod tests {
             TreeEntry::dir(comp("a"), sub.id(), sub.total_size(), sub.total_files()),
             TreeEntry::file(comp("sub"), FileKind::GitLink([7; 20]), ContentId::empty(), 0),
             TreeEntry::file(comp("link"), FileKind::Symlink, ContentId::hash(b"target"), 6),
+            TreeEntry::file(comp("old"), FileKind::GitMode(0o100664), ContentId::hash(b"o"), 1),
         ])
         .unwrap();
         assert_eq!(t.entries()[0].name, comp("a"));
@@ -246,7 +247,7 @@ mod tests {
         let back = Tree::decode(&bytes).unwrap();
         assert_eq!(back, t);
         assert_eq!(back.encode(), bytes);
-        assert_eq!(t.total_files(), 4);
+        assert_eq!(t.total_files(), 5);
         assert!(t.get(b"link").is_some());
         assert!(t.get(b"nope").is_none());
     }
