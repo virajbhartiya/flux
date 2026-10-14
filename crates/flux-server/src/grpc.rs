@@ -158,6 +158,8 @@ impl object_service_server::ObjectService for Services {
         }
         let depth = req.depth.min(64);
         let prefixes = req.sparse_prefixes;
+        let repo_id = flux.repo(&req.repo).await?;
+        let acl = flux.repo_config(repo_id).await?;
         Ok(Response::new(spawn_stream(move |tx| async move {
             while let Some((id, path, level)) = queue.pop_front() {
                 let tree = flux
@@ -174,7 +176,7 @@ impl object_service_server::ObjectService for Services {
                                 p.push(b'/');
                             }
                             p.extend_from_slice(e.name.as_bytes());
-                            if sparse_allows(&p, &prefixes) {
+                            if sparse_allows(&p, &prefixes) && acl.dir_visible(&principal, &p) {
                                 queue.push_back((sub, p, level + 1));
                             }
                         }
@@ -345,9 +347,20 @@ impl repo_service_server::RepoService for Services {
         };
         let tree =
             self.flux.blobs.get_tree(&dir).await.map_err(FluxError::from)?.ok_or_else(|| Status::internal("missing tree"))?;
+        let acl = self.flux.repo_config(repo).await?;
+        let base = req.path.clone();
+        if !base.is_empty() && !acl.dir_visible(&principal, &base) {
+            return Err(Status::not_found("not found"));
+        }
+        let child = |name: &[u8]| if base.is_empty() { name.to_vec() } else { [base.as_slice(), b"/", name].concat() };
         Ok(Response::new(ListDirResponse {
             tree_id: dir.as_bytes().to_vec(),
-            entries: tree.entries().iter().map(entry_info).collect(),
+            entries: tree
+                .entries()
+                .iter()
+                .filter(|e| acl.dir_visible(&principal, &child(e.name.as_bytes())))
+                .map(entry_info)
+                .collect(),
         }))
     }
 
@@ -358,6 +371,7 @@ impl repo_service_server::RepoService for Services {
         let repo = self.flux.repo(&req.repo).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let path = flux_proto::repo_path(&req.path)?;
+        self.flux.check_read_path(repo, &principal, path.as_bytes()).await?;
         let entry = self.flux.entry_at(repo, &id, &path).await?.ok_or_else(|| Status::not_found(format!("{path} not found")))?;
         let cid = entry.content_id().ok_or_else(|| Status::failed_precondition(format!("{path} is not a regular file")))?;
         let flux = self.flux.clone();
@@ -388,7 +402,9 @@ impl repo_service_server::RepoService for Services {
             None => true,
             Some(pre) => p.starts_with(pre) || (is_dir && pre.starts_with(p)),
         };
-        let entries = diff_trees(&self.flux.blobs, old_root, Some(new_root), &include).await.map_err(FluxError::from)?;
+        let acl = self.flux.repo_config(repo).await?;
+        let mut entries = diff_trees(&self.flux.blobs, old_root, Some(new_root), &include).await.map_err(FluxError::from)?;
+        entries.retain(|e| acl.allows(&principal, e.path.as_bytes(), false));
         let to_pb = |f: &flux_derive::TreeFile| {
             let (kind, _) = kind_to_pb(&f.kind);
             DiffFile { kind, content_id: f.content_id.map(|c| c.as_bytes().to_vec()).unwrap_or_default(), size: f.size }
@@ -420,11 +436,13 @@ impl repo_service_server::RepoService for Services {
     type SearchStream = RpcStream<SearchMatch>;
 
     async fn blame(&self, req: Request<BlameRequest>) -> Result<Response<BlameResponse>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
+        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let path = flux_proto::repo_path(&req.path)?;
+        self.flux.check_read_path(repo, &principal, path.as_bytes()).await?;
         let blame = self.flux.blame(repo, &id, &path).await?;
         let mut ids: Vec<ChangesetId> = blame.ranges.iter().map(|r| r.2).collect();
         ids.sort();
@@ -461,7 +479,8 @@ impl repo_service_server::RepoService for Services {
     }
 
     async fn search(&self, req: Request<SearchRequest>) -> Result<Response<Self::SearchStream>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
+        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         let id = self.flux.resolve_rev(repo, if req.rev.is_empty() { "main" } else { &req.rev }).await?;
@@ -469,23 +488,29 @@ impl repo_service_server::RepoService for Services {
         let prefix = opt_repo_path(&req.path_prefix)?;
         let limit = if req.limit == 0 { 500 } else { req.limit.min(10_000) as usize };
         let result = self.flux.search(repo, root, &req.pattern, req.regex, req.case_insensitive, prefix.as_ref(), limit).await?;
+        let acl = self.flux.repo_config(repo).await?;
         let out: Vec<Result<SearchMatch, Status>> = result
             .hits
             .into_iter()
+            .filter(|h| acl.allows(&principal, h.path.as_bytes(), false))
             .map(|h| Ok(SearchMatch { path: h.path.into_bytes(), line_number: h.line_number, line: h.line }))
             .collect();
         Ok(Response::new(Box::pin(futures::stream::iter(out))))
     }
 
     async fn find_files(&self, req: Request<FindFilesRequest>) -> Result<Response<FindFilesResponse>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
+        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         let id = self.flux.resolve_rev(repo, if req.rev.is_empty() { "main" } else { &req.rev }).await?;
         let root = self.flux.root_tree(repo, &id).await?;
         let limit = if req.limit == 0 { 100 } else { req.limit.min(100_000) as usize };
         let paths = self.flux.find_files(root, &req.query, limit).await?;
-        Ok(Response::new(FindFilesResponse { paths: paths.into_iter().map(RepoPath::into_bytes).collect() }))
+        let acl = self.flux.repo_config(repo).await?;
+        Ok(Response::new(FindFilesResponse {
+            paths: paths.into_iter().filter(|p| acl.allows(&principal, p.as_bytes(), false)).map(RepoPath::into_bytes).collect(),
+        }))
     }
 
     async fn last_modified(&self, req: Request<LastModifiedRequest>) -> Result<Response<LastModifiedResponse>, Status> {
@@ -667,6 +692,8 @@ impl write_service_server::WriteService for Services {
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         let cs = changeset_from_pb(req.changeset.as_ref().ok_or_else(|| Status::invalid_argument("missing changeset"))?)?;
+        let paths: Vec<Vec<u8>> = cs.file_changes.keys().map(|p| p.as_bytes().to_vec()).collect();
+        self.flux.check_write_paths(repo, &principal, paths).await?;
         Ok(Response::new(self.flux.create_changeset(repo, cs).await?))
     }
 
@@ -679,6 +706,8 @@ impl write_service_server::WriteService for Services {
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         let batch = req.changesets.iter().map(changeset_from_pb).collect::<Result<Vec<_>, _>>()?;
+        let paths: Vec<Vec<u8>> = batch.iter().flat_map(|c| c.file_changes.keys().map(|p| p.as_bytes().to_vec())).collect();
+        self.flux.check_write_paths(repo, &principal, paths).await?;
         Ok(Response::new(CreateChangesetsResponse { changesets: self.flux.create_changesets(repo, batch).await? }))
     }
 
@@ -751,6 +780,7 @@ impl write_service_server::WriteService for Services {
         let top = self.flux.resolve_rev(repo, &req.rev).await?;
         let target = if req.target_ref.is_empty() { "main".to_string() } else { req.target_ref };
         let reason = if req.reason.is_empty() { "flux land".to_string() } else { req.reason };
+        self.flux.check_land_paths(repo, &principal, &top, target.as_bytes()).await?;
         let r = self.flux.land(repo, top, target.as_bytes(), principal.name(), &reason).await?;
         Ok(Response::new(land_pb(&r)))
     }
@@ -862,6 +892,8 @@ impl review_service_server::ReviewService for Services {
         principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        let rv = self.flux.review(repo, req.number).await?;
+        self.flux.check_land_paths(repo, &principal, &rv.head, &rv.target).await?;
         let r = self.flux.land_review(repo, req.number, principal.name()).await?;
         Ok(Response::new(land_pb(&r)))
     }

@@ -883,10 +883,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "clap",
  "diffy",
+ "flate2",
  "flux-client",
  "flux-core",
  "flux-derive",

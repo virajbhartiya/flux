@@ -389,6 +389,10 @@ fn check_origin(headers: &HeaderMap) -> WebResult<()> {
 
 // ───────────── repo dispatch ─────────────
 
+pub fn decode_repo(s: &str) -> String {
+    url_decode(s)
+}
+
 fn split_repo(rest: &str) -> (String, Vec<String>) {
     let rest = rest.trim_matches('/');
     match rest.split_once("/-/") {
@@ -411,6 +415,20 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
         };
     };
     let q = query_map(&req.query);
+    // Path permissions (SPEC §12.2): restricted paths look like they don't exist.
+    if ctx.config.has_rules() && matches!(action.as_str(), "tree" | "blob" | "raw" | "blame" | "commits" | "edit" | "new") {
+        let (_, rest) = ctx.split_rev(args);
+        if let Some(p) = path_from(rest)? {
+            let ok = if action == "tree" || action == "new" || action == "commits" {
+                ctx.config.dir_visible(&req.principal, p.as_bytes())
+            } else {
+                ctx.config.allows(&req.principal, p.as_bytes(), false)
+            };
+            if !ok {
+                return Err(WebError::NotFound(format!("{p} does not exist")));
+            }
+        }
+    }
     match action.as_str() {
         "tree" => {
             let (rev, rest) = ctx.split_rev(args);
@@ -446,7 +464,7 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
         "search" => search(&web, &req, &ctx, &q).await,
         "files" => {
             let (rev, _) = ctx.split_rev(args);
-            files_json(&web, &ctx, &rev).await
+            files_json(&web, &req, &ctx, &rev).await
         }
         "events" => Ok(events(&web, &ctx)),
         "refs.json" => {
@@ -589,7 +607,14 @@ async fn tree(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Option<
     want.dedup();
     let loaded: HashMap<ChangesetId, Arc<Loaded>> =
         flux.load_arc(ctx.id, &want).await?.into_iter().flatten().map(|l| (l.id, l)).collect();
-    let mut entries: Vec<&TreeEntry> = t.entries().iter().collect();
+    let visible = |name: &[u8]| {
+        let full: Vec<u8> = match &path {
+            Some(p) => [p.as_bytes(), b"/", name].concat(),
+            None => name.to_vec(),
+        };
+        ctx.config.dir_visible(&req.principal, &full)
+    };
+    let mut entries: Vec<&TreeEntry> = t.entries().iter().filter(|e| visible(e.name.as_bytes())).collect();
     entries.sort_by_key(|e| (!e.is_dir(), e.name.as_bytes().to_ascii_lowercase()));
     let readme = t.entries().iter().filter(|e| !e.is_dir()).find(|e| {
         let n = String::from_utf8_lossy(e.name.as_bytes()).to_ascii_lowercase();
@@ -1547,7 +1572,8 @@ async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResul
         Some(p) => Some(flux.tree_of(ctx.id, p).await?),
         None => None,
     };
-    let files = diff_files(web, parent_tree, Some(tree)).await?;
+    let mut files = diff_files(web, parent_tree, Some(tree)).await?;
+    files.retain(|f| ctx.config.allows(&req.principal, f.path.as_bytes(), false));
     let git = flux.meta.cs_to_git(ctx.id, &[cs]).await?.pop().flatten();
     let (n, e) = person(&l.changeset.author);
     let committer = l.changeset.committer.as_ref().map(|c| person(c).0).filter(|c| *c != n);
@@ -1602,7 +1628,11 @@ async fn compare(web: &WebState, req: &Req, ctx: &RepoCtx, spec: &str) -> WebRes
     let mb = flux.merge_base(ctx.id, &b, &h).await?;
     let items = flux.log_page(ctx.id, &h, &[b], None, false, 0, 250).await?;
     let files = match mb {
-        Some(m) => diff_files(web, Some(flux.tree_of(ctx.id, &m).await?), Some(flux.tree_of(ctx.id, &h).await?)).await?,
+        Some(m) => {
+            let mut f = diff_files(web, Some(flux.tree_of(ctx.id, &m).await?), Some(flux.tree_of(ctx.id, &h).await?)).await?;
+            f.retain(|f| ctx.config.allows(&req.principal, f.path.as_bytes(), false));
+            f
+        }
         None => vec![],
     };
     let can_write = req.principal.can_write();
@@ -1768,7 +1798,7 @@ async fn search(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String, St
     let elapsed = started.elapsed();
     let mut by_file: BTreeMap<String, Vec<&crate::search::SearchHit>> = BTreeMap::new();
     if let Some(r) = &result {
-        for h in &r.hits {
+        for h in r.hits.iter().filter(|h| ctx.config.allows(&req.principal, h.path.as_bytes(), false)) {
             by_file.entry(h.path.to_string()).or_default().push(h);
         }
     }
@@ -1847,11 +1877,15 @@ fn mark_spans(line: &[u8], spans: &[(u32, u32)]) -> String {
     out
 }
 
-async fn files_json(web: &WebState, ctx: &RepoCtx, rev: &str) -> WebResult {
+async fn files_json(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResult {
     let cs = web.flux.resolve_rev(ctx.id, rev).await?;
     let root = web.flux.tree_of(ctx.id, &cs).await?;
     let list = web.flux.file_list(root).await?;
-    let paths: Vec<String> = list.iter().map(|(p, _, _)| p.to_string()).collect();
+    let paths: Vec<String> = list
+        .iter()
+        .filter(|(p, _, _)| ctx.config.allows(&req.principal, p.as_bytes(), false))
+        .map(|(p, _, _)| p.to_string())
+        .collect();
     let body = serde_json::json!({ "rev": rev, "changeset": cs.to_hex(), "paths": paths }).to_string();
     let mut r = body.into_response();
     let h = r.headers_mut();
@@ -2020,7 +2054,9 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
             Some(b) => Some(flux.tree_of(ctx.id, &b).await?),
             None => None,
         };
-        Some(diff_files(web, old, Some(flux.tree_of(ctx.id, &top).await?)).await?)
+        let mut f = diff_files(web, old, Some(flux.tree_of(ctx.id, &top).await?)).await?;
+        f.retain(|f| ctx.config.allows(&req.principal, f.path.as_bytes(), false));
+        Some(f)
     } else {
         None
     };
@@ -2219,6 +2255,8 @@ pub async fn repo_post(
         }
         ["reviews", n, "land"] => {
             let n = parse_num(n)?;
+            let rv = flux.review(ctx.id, n).await?;
+            flux.check_land_paths(ctx.id, &req.principal, &rv.head, &rv.target).await?;
             flux.land_review(ctx.id, n, &actor).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
@@ -2233,7 +2271,10 @@ pub async fn repo_post(
             flux.update_review(ctx.id, n, action, &actor, &f.body, None).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
-        ["edit"] => save_edit(&web, &ctx, &actor, f).await,
+        ["edit"] => {
+            flux.check_write_paths(ctx.id, &req.principal, vec![f.path.trim().trim_matches('/').as_bytes().to_vec()]).await?;
+            save_edit(&web, &ctx, &actor, f).await
+        }
         ["settings"] => {
             req.principal.require_admin()?;
             let mut acl = Vec::new();

@@ -185,7 +185,7 @@ impl Flux {
                 parents: vec![parent],
                 author: cs.changeset.author.clone(),
                 author_time: cs.changeset.author_time,
-                committer: Some(actor.as_bytes().to_vec()),
+                committer: Some(format!("{actor} <{actor}@flux>").into_bytes()),
                 committer_time: Some(Timestamp { unix_ms: now, tz_offset_min: 0 }),
                 message: cs.changeset.message.clone(),
                 file_changes: fc,

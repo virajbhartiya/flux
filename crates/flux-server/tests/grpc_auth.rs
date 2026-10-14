@@ -32,7 +32,7 @@ async fn tokens_and_protected_refs() {
     let (_, user) = flux.issue_token("alice", false, "t").await.unwrap();
     let (_, admin) = flux.issue_token("root", true, "t").await.unwrap();
     let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-    tokio::spawn(flux_server::serve(flux, listener, std::future::pending()));
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
     let url = format!("http://{addr}");
 
     let anon = Client::connect_with_token(&url, "r", Some("")).await.unwrap();
@@ -62,4 +62,32 @@ async fn tokens_and_protected_refs() {
     assert!(alice.update_ref("scratch/x", Expect::Absent(true), Some(side), "s").await.unwrap());
     assert!(alice.update_ref("scratch/x", Expect::Any(true), Some(a), "s").await.unwrap());
     assert!(root.update_ref("main", Expect::Any(true), Some(a), "admin reset").await.unwrap());
+
+    // Path ACLs: `secret` is admins-only.
+    let repo = flux.repo("r").await.unwrap();
+    flux.set_repo_config(
+        repo,
+        &flux_server::repo_config::RepoConfig {
+            acl: vec![flux_server::repo_config::AclRule {
+                path: "secret".into(),
+                read: vec!["admins".into()],
+                write: vec!["admins".into()],
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sid = root.upload(&[b"s3cr3t"]).await.unwrap()[0];
+    assert!(alice.create_changeset(&cs(Some(a), "secret/key", sid, 6)).await.is_err(), "alice may not write secret/");
+    let with_secret = root.create_changeset(&cs(Some(a), "secret/key", sid, 6)).await.unwrap();
+    let hex = with_secret.id.to_hex();
+    assert!(root.read_file(&hex, b"secret/key").await.is_ok());
+    assert!(alice.read_file(&hex, b"secret/key").await.is_err(), "alice can't read it");
+    let listing = alice.list_dir(&hex, b"").await.unwrap();
+    assert!(!listing.entries.iter().any(|e| e.name == b"secret"), "hidden from listings");
+    let trees = alice.get_trees(&[with_secret.root_tree], 64, &[], b"").await.unwrap();
+    assert!(trees.iter().all(|(_, p, _)| !p.starts_with(b"secret")), "checkouts skip it");
+    let found = alice.find_files(&hex, "key", 10).await.unwrap();
+    assert!(found.is_empty());
 }

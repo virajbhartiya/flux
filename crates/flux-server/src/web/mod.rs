@@ -94,9 +94,55 @@ pub fn router(flux: Arc<Flux>) -> Router {
         .route("/-/healthz", get(|| async { "ok" }))
         .route("/-/readyz", get(pages::readyz))
         .route("/-/metrics", get(pages::metrics))
-        .route("/{*rest}", get(pages::repo_get).post(pages::repo_post))
+        .route("/{*rest}", get(dispatch_get).post(dispatch_post))
         .fallback(|| async { WebError::NotFound("page not found".into()) })
         .with_state(web)
+}
+
+/// git smart-HTTP requests share the repository URL space with the web UI.
+async fn dispatch_get(State(web): State<WebState>, req: axum::extract::Request) -> Response {
+    let path = req.uri().path().trim_start_matches('/').to_string();
+    if let Some((repo, op)) = crate::git::http::route(&path) {
+        let query = req.uri().query().unwrap_or("").to_string();
+        let (parts, body) = req.into_parts();
+        return crate::git::http::handle(web.flux.clone(), &pages::decode_repo(&repo), op, &parts.headers, &query, body).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let r = Req::from_request_parts(&mut parts, &web).await;
+    let p = axum::extract::Path::<String>::from_request_parts(&mut parts, &web).await;
+    drop(body);
+    match (r, p) {
+        (Ok(r), Ok(p)) => pages::repo_get(State(web), r, p).await.into_response(),
+        (Err(e), _) => e.into_response(),
+        (_, Err(e)) => e.into_response(),
+    }
+}
+
+async fn dispatch_post(State(web): State<WebState>, req: axum::extract::Request) -> Response {
+    use axum::extract::FromRequest;
+    let path = req.uri().path().trim_start_matches('/').to_string();
+    if let Some((repo, op)) = crate::git::http::route(&path) {
+        let query = req.uri().query().unwrap_or("").to_string();
+        let (parts, body) = req.into_parts();
+        return crate::git::http::handle(web.flux.clone(), &pages::decode_repo(&repo), op, &parts.headers, &query, body).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let r = match Req::from_request_parts(&mut parts, &web).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let p = match axum::extract::Path::<String>::from_request_parts(&mut parts, &web).await {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let headers = parts.headers.clone();
+    let form = match axum::extract::Form::<pages::ReviewForm>::from_request(axum::extract::Request::from_parts(parts, body), &web)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+    pages::repo_post(State(web), r, headers, p, form).await.into_response()
 }
 
 async fn static_asset(State(web): State<WebState>, axum::extract::Path(file): axum::extract::Path<String>) -> Response {
