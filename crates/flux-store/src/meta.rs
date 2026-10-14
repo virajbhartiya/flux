@@ -220,6 +220,15 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn git_to_cs(&self, repo: RepoId, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ChangesetId>>>;
     async fn cs_to_git(&self, repo: RepoId, ids: &[ChangesetId]) -> StoreResult<Vec<Option<[u8; 20]>>>;
 
+    // git frontend mappings
+    async fn git_trees_get(&self, ids: &[flux_core::TreeId]) -> StoreResult<Vec<Option<[u8; 20]>>>;
+    async fn git_trees_put(&self, pairs: &[(flux_core::TreeId, [u8; 20])]) -> StoreResult<()>;
+    async fn git_tree_by_sha(&self, sha: &[u8; 20]) -> StoreResult<Option<flux_core::TreeId>>;
+    async fn git_commits_put(&self, repo: RepoId, pairs: &[(ChangesetId, [u8; 20])]) -> StoreResult<()>;
+    async fn git_commits_lookup(&self, repo: RepoId, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ChangesetId>>>;
+    async fn git_commits_of(&self, repo: RepoId, ids: &[ChangesetId]) -> StoreResult<Vec<Option<[u8; 20]>>>;
+    async fn content_by_sha1(&self, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ContentId>>>;
+
     // commit graph
     /// Changesets with `log_seq > after`, in log order, with their parents.
     async fn graph_tail(&self, repo: RepoId, after: LogSeq, limit: u32) -> StoreResult<Vec<GraphRow>>;

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod cache;
 pub mod core;
+pub mod git;
 pub mod graph;
 pub mod grpc;
 pub mod history;

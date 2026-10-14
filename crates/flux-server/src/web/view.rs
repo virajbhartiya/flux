@@ -9,7 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use super::{Req, Web, security_headers};
 
-pub const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="9" fill="#e2512a"/><path d="M13.5 25.5V13.2c0-3.2 2-5.2 5.2-5.2h2.3M9.5 15.5h9" stroke="#fffaf3" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="22.5" cy="23.5" r="2.4" fill="#1c1a16"/></svg>"##;
+pub const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#3466d6"/><path d="M13.5 24.5V12.8c0-2.8 1.8-4.6 4.6-4.6h2.4M10 15h8.5" stroke="#fff" stroke-width="2.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -244,8 +244,7 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                 meta name="color-scheme" content="light dark";
                 title { (title) " · flux" }
                 link rel="icon" href="/-/static/favicon.svg" type="image/svg+xml";
-                link rel="preload" href="/-/static/fonts/sans.woff2" as="font" type="font/woff2" crossorigin;
-                link rel="preload" href="/-/static/fonts/serif.woff2" as="font" type="font/woff2" crossorigin;
+                link rel="preload" href="/-/static/fonts/inter.woff2" as="font" type="font/woff2" crossorigin;
                 link rel="stylesheet" href=(web.css_path);
                 script src=(web.js_path) defer {}
             }
@@ -312,9 +311,10 @@ fn repo_head(n: &RepoNav<'_>) -> Markup {
         section.repo-head {
             div.repo-head-inner {
                 div.repo-title {
-                    h1 { @if let Some(o) = owner { span.owner { (o) " / " } } (name) }
+                    h1 { (icon("repo")) @if let Some(o) = owner { span.owner { (o) " / " } } (name) }
+                    div.spacer {}
                     details.clone {
-                        summary.btn.accent { (icon("code")) "Clone" span.caret {} }
+                        summary.btn.small { (icon("code")) "Clone" span.caret {} }
                         div.clone-menu {
                             h4 { "flux · sparse working copy" }
                             div.cmd { code { (flux_cmd) } button.copy-btn type="button" data-copy=(flux_cmd) title="Copy" { (icon("copy")) } }
@@ -324,9 +324,7 @@ fn repo_head(n: &RepoNav<'_>) -> Markup {
                         }
                     }
                 }
-                @if n.description.is_empty() {
-                    p.repo-desc.faint { "No description" @if n.is_admin { " · " a.link href=(format!("/{}/-/settings", enc(n.repo))) { "add one" } } }
-                } @else {
+                @if !n.description.is_empty() {
                     p.repo-desc { (n.description) }
                 }
                 div.repo-chips {

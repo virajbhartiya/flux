@@ -590,6 +590,115 @@ macro_rules! sql_store {
                 Ok(n as u64)
             }
 
+
+            async fn git_trees_get(&self, ids: &[flux_core::TreeId]) -> StoreResult<Vec<Option<[u8; 20]>>> {
+                let mut found = std::collections::HashMap::new();
+                for chunk in ids.chunks(IN_CHUNK) {
+                    let q = format!("SELECT tree_id, git_sha FROM git_trees WHERE tree_id IN ({})", placeholders(1, chunk.len()));
+                    let mut query = sqlx::query(&q);
+                    for id in chunk {
+                        query = query.bind(id.as_bytes().as_slice());
+                    }
+                    for r in query.fetch_all(&self.pool).await? {
+                        let t = flux_core::TreeId::from_slice(r.try_get::<&[u8], _>(0)?).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                        found.insert(t, arr::<20>(r.try_get::<&[u8], _>(1)?, "sha1")?);
+                    }
+                }
+                Ok(ordered(ids, &found))
+            }
+
+            async fn git_trees_put(&self, pairs: &[(flux_core::TreeId, [u8; 20])]) -> StoreResult<()> {
+                let mut tx = self.pool.begin().await?;
+                for chunk in pairs.chunks(INSERT_CHUNK) {
+                    let q = format!("INSERT INTO git_trees (tree_id, git_sha) VALUES {} ON CONFLICT DO NOTHING", values(1, chunk.len(), 2));
+                    let mut query = sqlx::query(&q);
+                    for (t, sha) in chunk {
+                        query = query.bind(t.as_bytes().as_slice()).bind(sha.as_slice());
+                    }
+                    query.execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+
+            async fn git_tree_by_sha(&self, sha: &[u8; 20]) -> StoreResult<Option<flux_core::TreeId>> {
+                let row = sqlx::query("SELECT tree_id FROM git_trees WHERE git_sha = $1 LIMIT 1")
+                    .bind(sha.as_slice())
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| flux_core::TreeId::from_slice(r.try_get::<&[u8], _>(0)?).map_err(|e| StoreError::Corrupt(e.to_string())))
+                    .transpose()
+            }
+
+            async fn git_commits_put(&self, repo: RepoId, pairs: &[(ChangesetId, [u8; 20])]) -> StoreResult<()> {
+                let mut tx = self.pool.begin().await?;
+                for chunk in pairs.chunks(INSERT_CHUNK) {
+                    let q = format!(
+                        "INSERT INTO git_commits (repo_id, git_sha, cs_id) VALUES {} ON CONFLICT DO NOTHING",
+                        values(1, chunk.len(), 3)
+                    );
+                    let mut query = sqlx::query(&q);
+                    for (c, sha) in chunk {
+                        query = query.bind(repo.0).bind(sha.as_slice()).bind(c.as_bytes().as_slice());
+                    }
+                    query.execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+
+            async fn git_commits_lookup(&self, repo: RepoId, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ChangesetId>>> {
+                let mut found = std::collections::HashMap::new();
+                for chunk in shas.chunks(IN_CHUNK) {
+                    let q = format!(
+                        "SELECT git_sha, cs_id FROM git_commits WHERE repo_id = $1 AND git_sha IN ({})",
+                        placeholders(2, chunk.len())
+                    );
+                    let mut query = sqlx::query(&q).bind(repo.0);
+                    for s in chunk {
+                        query = query.bind(s.as_slice());
+                    }
+                    for r in query.fetch_all(&self.pool).await? {
+                        found.insert(arr::<20>(r.try_get::<&[u8], _>(0)?, "sha1")?, cs_id(r.try_get::<&[u8], _>(1)?)?);
+                    }
+                }
+                Ok(ordered(shas, &found))
+            }
+
+            async fn git_commits_of(&self, repo: RepoId, ids: &[ChangesetId]) -> StoreResult<Vec<Option<[u8; 20]>>> {
+                let mut found = std::collections::HashMap::new();
+                for chunk in ids.chunks(IN_CHUNK) {
+                    let q = format!(
+                        "SELECT cs_id, git_sha FROM git_commits WHERE repo_id = $1 AND cs_id IN ({})",
+                        placeholders(2, chunk.len())
+                    );
+                    let mut query = sqlx::query(&q).bind(repo.0);
+                    for id in chunk {
+                        query = query.bind(id.as_bytes().as_slice());
+                    }
+                    for r in query.fetch_all(&self.pool).await? {
+                        found.insert(cs_id(r.try_get::<&[u8], _>(0)?)?, arr::<20>(r.try_get::<&[u8], _>(1)?, "sha1")?);
+                    }
+                }
+                Ok(ordered(ids, &found))
+            }
+
+            async fn content_by_sha1(&self, shas: &[[u8; 20]]) -> StoreResult<Vec<Option<ContentId>>> {
+                let mut found = std::collections::HashMap::new();
+                for chunk in shas.chunks(IN_CHUNK) {
+                    let q = format!("SELECT sha1, content_id FROM content_meta WHERE sha1 IN ({})", placeholders(1, chunk.len()));
+                    let mut query = sqlx::query(&q);
+                    for s in chunk {
+                        query = query.bind(s.as_slice());
+                    }
+                    for r in query.fetch_all(&self.pool).await? {
+                        let c = ContentId::from_slice(r.try_get::<&[u8], _>(1)?).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                        found.insert(arr::<20>(r.try_get::<&[u8], _>(0)?, "sha1")?, c);
+                    }
+                }
+                Ok(ordered(shas, &found))
+            }
+
             async fn graph_tail(&self, repo: RepoId, after: LogSeq, limit: u32) -> StoreResult<Vec<GraphRow>> {
                 let rows = sqlx::query(
                     "SELECT log_seq, cs_id, gen FROM changesets WHERE repo_id = $1 AND log_seq > $2 ORDER BY log_seq LIMIT $3",

@@ -198,15 +198,13 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
     let body = html! {
         div.container.wide {
             div.hero {
-                h1 {
-                    @match &who { Some(u) => { "Welcome back, " em { (u) } "." } None => { "Every change, " em { "instantly" } "." } }
-                }
-                p { (repos.len()) " repositor" @if repos.len() == 1 { "y" } @else { "ies" } " on this server. Press " kbd { "⌘" } kbd { "K" } " to jump anywhere." }
+                h1 { @match &who { Some(u) => { "Welcome back, " (u) } None => { "Repositories" } } }
+                p { (repos.len()) " repositor" @if repos.len() == 1 { "y" } @else { "ies" } " · press " kbd { "⌘" } kbd { "K" } " to jump anywhere" }
             }
             div.split-layout {
                 div {
                     div.page-head.row {
-                        h2 { "Repositories" }
+                        h2 { "All repositories" }
                         div.spacer {}
                         @if req.principal.is_admin() {
                             form.inline-form method="post" action="/-/repos" {
@@ -224,7 +222,7 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
                     div.repo-grid.reveal {
                         @for (name, desc, nrefs, head, latest) in &cards {
                             a.repo-card href=(view::repo_url(name)) {
-                                div.repo-card-title { (name) }
+                                div.repo-card-title { (icon("repo")) (name) }
                                 div.repo-card-desc { @if desc.is_empty() { span.faint { "No description" } } @else { (desc) } }
                                 @if let Some(l) = latest {
                                     div.repo-card-msg { (subject(&l.changeset.message)) }
@@ -1096,7 +1094,7 @@ fn commit_row_with(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool, graph: Option<
     }
 }
 
-const LANE_COLORS: [&str; 8] = ["#e2512a", "#2a5db0", "#2c7a4b", "#7146b8", "#a26500", "#1f8a9c", "#b5446e", "#5f6370"];
+const LANE_COLORS: [&str; 8] = ["#3466d6", "#52a7a0", "#a580c4", "#c4a14f", "#6aab7b", "#cc7a75", "#5c9fd6", "#8b929c"];
 const ROW_H: f64 = 60.0;
 const LANE_W: f64 = 13.0;
 /// Lanes beyond this are not drawn (busy histories stay readable).

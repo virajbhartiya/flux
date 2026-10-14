@@ -130,9 +130,7 @@ async fn static_asset(State(web): State<WebState>, axum::extract::Path(file): ax
 
 async fn font_asset(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
     let data: &'static [u8] = match file.as_str() {
-        "sans.woff2" => include_bytes!("assets/fonts/sans.woff2"),
-        "serif.woff2" => include_bytes!("assets/fonts/serif.woff2"),
-        "serif-italic.woff2" => include_bytes!("assets/fonts/serif-italic.woff2"),
+        "inter.woff2" => include_bytes!("assets/fonts/inter.woff2"),
         "mono.woff2" => include_bytes!("assets/fonts/mono.woff2"),
         _ => return WebError::NotFound("no such font".into()).into_response(),
     };
