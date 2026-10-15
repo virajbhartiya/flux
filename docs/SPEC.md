@@ -553,6 +553,12 @@ Standard gRPC codes, plus a `google.rpc.ErrorInfo` with `reason` taken from a cl
 - **Proxying.** fluxd proxies `RepoService` and `WriteService` upstream unchanged. It adds request coalescing and a short TTL cache for `ResolveRef`, but only when `allow_stale` is set.
 - **Isolation.** Each request carries the client's own token, and fluxd forwards it. A tree or content is served from the local store only if that principal has previously been authorized for its **ACL domain** (§12.2). Unrestricted-domain objects are always served locally.
 
+**As built.** `fluxd --upstream URL` runs one daemon per user and upstream, on a loopback TCP port rather than a Unix socket, so the same code works on Windows.
+- **Discovery:** it advertises itself in `<cache dir>/flux/fluxd/<hash>/fluxd.json` (mode 0600; it includes a shutdown secret). The CLI connects through a live daemon for its server automatically, at the cost of one loopback connect. `flux daemon start|stop|status|enable|disable` manages it; `enable` makes the CLI start one in the background when none is running; `FLUX_NO_DAEMON=1` bypasses it.
+- **Serving:** it is the cache tier (§9.2): verified trees and contents from a local segment store, with everything else proxied upstream with the caller's token.
+- **Prefetch:** it watches upstream events for repositories its clients have read. On each ref move it fetches the trees that aren't cached yet, descending only into new ones, plus files up to 1 MiB, within 256 MiB per move. After every (re)subscription it also catches up on the current heads. On a small repository a commit was prefetched in 13 ms, and the other working copy's `flux sync` then had no misses.
+- **Not yet built:** snapshots for seeding, eviction (the store only grows), and request coalescing.
+
 ---
 
 ## 10. Git interoperability

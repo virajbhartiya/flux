@@ -41,6 +41,9 @@ pub struct Cache {
     h2: HttpClient<HttpConnector, Body>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
+    /// Repositories clients have read through this cache, with the most
+    /// recent token used for each (for prefetching on their behalf).
+    seen: std::sync::Mutex<HashMap<String, Option<String>>>,
 }
 
 impl Cache {
@@ -61,6 +64,7 @@ impl Cache {
             h2: HttpClient::builder(TokioExecutor::new()).http2_only(true).build(conn),
             hits: Default::default(),
             misses: Default::default(),
+            seen: Default::default(),
         }))
     }
 
@@ -98,6 +102,89 @@ impl Cache {
     fn count(&self, hit: bool, n: u64) {
         let c = if hit { &self.hits } else { &self.misses };
         c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note(&self, repo: &str, token: &Option<String>) {
+        if !repo.is_empty() {
+            self.seen.lock().unwrap().insert(repo.to_string(), token.clone());
+        }
+    }
+
+    /// Repositories read through this cache and the token last used for each.
+    pub fn repos(&self) -> Vec<(String, Option<String>)> {
+        self.seen.lock().unwrap().iter().map(|(r, t)| (r.clone(), t.clone())).collect()
+    }
+
+    pub fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    /// Fetch the trees of `root` that are not cached yet, and the contents of
+    /// small files in them (up to `content_budget` bytes), so the next
+    /// checkout or sync of this revision is served locally. Only newly
+    /// fetched trees are descended into: a cached tree's subtrees were
+    /// fetched with it. Returns `(trees, contents)` fetched.
+    pub async fn prefetch(
+        &self,
+        repo: &str,
+        token: Option<&str>,
+        root: TreeId,
+        content_budget: u64,
+    ) -> anyhow::Result<(usize, usize)> {
+        let client = self.client(repo, token).map_err(|e| anyhow::anyhow!(e.message().to_string()))?;
+        let mut frontier = vec![root];
+        let (mut trees, mut wanted) = (0usize, Vec::new());
+        let mut budget = content_budget;
+        while !frontier.is_empty() {
+            let mut missing = Vec::new();
+            for t in frontier.drain(..) {
+                if !self.blobs.exists(flux_core::ObjectKind::Tree, t.as_bytes()).await? {
+                    missing.push(t);
+                }
+            }
+            for chunk in missing.chunks(512) {
+                let got = client.get_trees(chunk, 0, &[], b"").await?;
+                trees += got.len();
+                for (_, _, t) in &got {
+                    for e in t.entries() {
+                        if let Some(sub) = e.tree_id() {
+                            frontier.push(sub);
+                        } else if let Some(c) = e.content_id()
+                            && e.size <= 1 << 20
+                            && e.size <= budget
+                        {
+                            budget -= e.size;
+                            wanted.push(c);
+                        }
+                    }
+                }
+                self.blobs.put_trees(got.into_iter().map(|(_, _, t)| (Arc::new(t), None)).collect()).await?;
+            }
+        }
+        let mut need = Vec::new();
+        for c in wanted {
+            if !self.blobs.exists(flux_core::ObjectKind::Content, c.as_bytes()).await? {
+                need.push(c);
+            }
+        }
+        let mut fetched = Vec::new();
+        for chunk in need.chunks(256) {
+            client
+                .get_contents(chunk, |id, data| {
+                    fetched.push(PutObject {
+                        kind: flux_core::ObjectKind::Content,
+                        id: *id.as_bytes(),
+                        data: Bytes::from(data),
+                        base: None,
+                    });
+                    Ok(())
+                })
+                .await?;
+        }
+        let contents = fetched.len();
+        self.blobs.put_objects(fetched).await?;
+        self.blobs.sync().await?;
+        Ok((trees, contents))
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -159,6 +246,7 @@ impl ObjectService for CacheObjects {
     async fn get_trees(&self, req: tonic::Request<GetTreesRequest>) -> Result<tonic::Response<Self::GetTreesStream>, Status> {
         let token = self.0.check(&req).await?;
         let req = req.into_inner();
+        self.0.note(&req.repo, &token);
         let objs = match local_trees(&self.0.blobs, &req).await? {
             Some(objs) => {
                 self.0.count(true, objs.len() as u64);
@@ -189,6 +277,7 @@ impl ObjectService for CacheObjects {
     ) -> Result<tonic::Response<Self::GetContentsStream>, Status> {
         let token = self.0.check(&req).await?;
         let req = req.into_inner();
+        self.0.note(&req.repo, &token);
         let ids: Vec<ContentId> = req.content_ids.iter().map(|b| content_id(b)).collect::<Result<_, _>>()?;
         let mut have: HashMap<ContentId, Bytes> = HashMap::new();
         let mut missing = Vec::new();

@@ -6,7 +6,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
  && mkdir -p /out \
- && cp target/release/flux target/release/flux-server target/release/flux-import-git /out/
+ && cp target/release/flux target/release/fluxd target/release/flux-server target/release/flux-import-git /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git tini \

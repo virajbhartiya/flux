@@ -811,10 +811,14 @@ name = "flux-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytes",
+ "dirs",
  "flux-core",
  "flux-proto",
  "futures",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -830,6 +834,28 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "flux-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blake3",
+ "clap",
+ "flux-client",
+ "flux-core",
+ "flux-proto",
+ "flux-server",
+ "flux-store",
+ "getrandom 0.3.4",
+ "hex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

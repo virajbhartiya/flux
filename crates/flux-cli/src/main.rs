@@ -207,6 +207,26 @@ enum Cmd {
     },
     /// Open the web UI for the current repository, revision and path.
     Web { path: Option<String> },
+    /// Manage fluxd, the local cache daemon (commands route through it
+    /// automatically while it runs).
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Start a daemon for the server (no-op if one is running).
+    Start,
+    /// Stop the server's daemon.
+    Stop,
+    /// Show the daemon's address and cache statistics.
+    Status,
+    /// Start daemons automatically when a command needs one.
+    Enable,
+    /// Stop starting daemons automatically.
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -359,7 +379,70 @@ fn save_credentials(c: &HashMap<String, String>) -> Result<()> {
 async fn connect(server: &str, repo: &str) -> Result<Client> {
     let server = normalize_server(server);
     let token = std::env::var("FLUX_TOKEN").ok().or_else(|| load_credentials().get(&server).cloned());
+    // Route through a running fluxd for this server (objects from local
+    // disk); start one in the background if the user asked for that.
+    if std::env::var_os("FLUX_NO_DAEMON").is_none() {
+        match flux_client::daemon::live_url(&server) {
+            Some(url) => {
+                if let Ok(c) = Client::connect_with_token(&url, repo, token.as_deref()).await {
+                    return Ok(c);
+                }
+            }
+            None if flux_client::daemon::auto_start_enabled() => {
+                let _ = spawn_daemon(&server);
+            }
+            None => {}
+        }
+    }
     Client::connect_with_token(&server, repo, token.as_deref()).await
+}
+
+/// Start `fluxd` for `server` in the background (detached from the terminal).
+fn spawn_daemon(server: &str) -> Result<()> {
+    let exe = if cfg!(windows) { "fluxd.exe" } else { "fluxd" };
+    let fluxd = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(exe)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(exe));
+    let dir = flux_client::daemon::dir_for(server).context("no cache directory")?;
+    std::fs::create_dir_all(&dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("fluxd.log"))?;
+    let mut cmd = std::process::Command::new(&fluxd);
+    cmd.arg("--upstream").arg(server).stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x8;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().with_context(|| format!("starting {}", fluxd.display()))?;
+    Ok(())
+}
+
+/// A minimal HTTP/1.1 request to a loopback daemon: `(status, body)`.
+fn daemon_http(url: &str, method: &str, path: &str, headers: &[(&str, &str)]) -> Result<(u16, String)> {
+    use std::io::Read as _;
+    let addr: std::net::SocketAddr = url.strip_prefix("http://").context("bad daemon url")?.parse()?;
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: 0\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    sock.write_all(req.as_bytes())?;
+    let mut resp = String::new();
+    sock.read_to_string(&mut resp)?;
+    let status = resp.split(' ').nth(1).and_then(|c| c.parse().ok()).context("bad response from daemon")?;
+    let body = resp.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default();
+    Ok((status, body))
 }
 
 async fn client_for(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<Client> {
@@ -836,6 +919,87 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     "review" => println!("{} review #{} {}", st.dim(&e.repo), e.review, e.detail),
                     other => println!("{} {other}", st.dim(&e.repo)),
+                }
+            }
+        }
+        Cmd::Daemon { cmd } => {
+            let server = normalize_server(
+                &cli.server
+                    .clone()
+                    .or_else(|| wc.as_ref().map(|w| w.config.server.clone()))
+                    .context("which server? pass --server")?,
+            );
+            match cmd {
+                DaemonCmd::Start => {
+                    if let Some(url) = flux_client::daemon::live_url(&server) {
+                        println!("fluxd already running for {server} at {url}");
+                        return Ok(());
+                    }
+                    spawn_daemon(&server)?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Some(url) = flux_client::daemon::live_url(&server) {
+                            println!("fluxd running for {server} at {url}");
+                            break;
+                        }
+                        if std::time::Instant::now() > deadline {
+                            let log = flux_client::daemon::dir_for(&server).map(|d| d.join("fluxd.log"));
+                            bail!("fluxd did not start; see {}", log.map(|p| p.display().to_string()).unwrap_or_default());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+                DaemonCmd::Stop => {
+                    let (Some(state), Some(url)) =
+                        (flux_client::daemon::read_state(&server), flux_client::daemon::live_url(&server))
+                    else {
+                        println!("no fluxd running for {server}");
+                        return Ok(());
+                    };
+                    let (status, _) = daemon_http(&url, "POST", "/-/fluxd/shutdown", &[("x-fluxd-secret", &state.secret)])?;
+                    if status != 200 {
+                        bail!("fluxd refused to stop (HTTP {status})");
+                    }
+                    for _ in 0..200 {
+                        if flux_client::daemon::live_url(&server).is_none() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    println!("stopped fluxd for {server}");
+                }
+                DaemonCmd::Status => {
+                    let auto = if flux_client::daemon::auto_start_enabled() { "on" } else { "off" };
+                    match (flux_client::daemon::read_state(&server), flux_client::daemon::live_url(&server)) {
+                        (Some(state), Some(url)) => {
+                            let (_, metrics) = daemon_http(&url, "GET", "/-/cache/metrics", &[])?;
+                            let metric = |name: &str| {
+                                metrics.lines().find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok()).unwrap_or(0.0)
+                            };
+                            let (hits, misses) = (metric("flux_cache_hits_total"), metric("flux_cache_misses_total"));
+                            println!("fluxd {} for {server}", st.green("running"));
+                            println!("  address   {url} (pid {})", state.pid);
+                            println!("  up        {}", ago(state.started_ms).trim_end_matches(" ago"));
+                            println!(
+                                "  cache     {} objects, {:.1} MiB; {:.0}% hits ({} of {})",
+                                metric("flux_cache_objects") as u64,
+                                metric("flux_cache_bytes") / (1 << 20) as f64,
+                                100.0 * hits / (hits + misses).max(1.0),
+                                hits as u64,
+                                (hits + misses) as u64
+                            );
+                            println!("  auto-start {auto}");
+                        }
+                        _ => println!("fluxd {} for {server} (auto-start {auto})", st.dim("not running")),
+                    }
+                }
+                DaemonCmd::Enable => {
+                    flux_client::daemon::set_auto_start(true)?;
+                    println!("fluxd will start automatically when needed");
+                }
+                DaemonCmd::Disable => {
+                    flux_client::daemon::set_auto_start(false)?;
+                    println!("fluxd will no longer start automatically");
                 }
             }
         }

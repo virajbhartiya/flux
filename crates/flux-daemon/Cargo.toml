@@ -1,0 +1,34 @@
+[package]
+name = "flux-daemon"
+description = "fluxd: the per-machine flux cache daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fluxd"
+path = "src/main.rs"
+
+[dependencies]
+flux-client.workspace = true
+flux-core.workspace = true
+flux-server.workspace = true
+anyhow.workspace = true
+axum = "0.8"
+blake3.workspace = true
+clap.workspace = true
+getrandom = "0.3"
+hex.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+flux-proto.workspace = true
+flux-store.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

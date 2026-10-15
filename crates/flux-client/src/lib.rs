@@ -1,6 +1,8 @@
 //! Rust client for flux. Every object fetched is verified against its id, so
 //! callers can trust content regardless of which tier served it.
 
+pub mod daemon;
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, anyhow, bail};

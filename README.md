@@ -8,7 +8,7 @@
 - **Refs move only by compare-and-swap**, and **landing is a server-side rebase** with line-level three-way merges, so many people and agents can land on `main` concurrently without a merge queue lock.
 - **Git compatible:** import any git repository (incremental and resumable), and `git clone`, `fetch` and `push` straight from the flux server, with commit SHA-1s preserved.
 
-It ships as one binary for the server, gRPC API and web UI (`flux-server`), one CLI (`flux`) and a git importer (`flux-import-git`).
+It ships as one binary for the server, gRPC API and web UI (`flux-server`), one CLI (`flux`), a per-machine cache daemon (`fluxd`) and a git importer (`flux-import-git`).
 
 ![Repository browser](docs/img/tree.png)
 
@@ -81,6 +81,7 @@ flux find cmtc                   # fuzzy file finder
 flux cat main~3 Makefile
 flux show @ --stat
 flux watch                       # live ref moves and review activity
+flux daemon enable               # local cache daemon: objects from disk, new revisions prefetched
 flux web                         # open this file/directory in the browser
 ```
 
@@ -136,6 +137,7 @@ docker compose exec flux flux-server token --user admin --admin
 | `flux-server` | core operations, commit graph, landing, reviews, search, auth and ACLs, gRPC, web UI, git smart HTTP, cache tier, fsck and backup |
 | `flux-client` | Rust client; verifies every object it fetches |
 | `flux-cli` | the `flux` command |
+| `flux-daemon` | `fluxd`: per-machine cache with automatic routing and prefetch |
 | `flux-git` | `flux-import-git` (import and verify) |
 
 The full design, with the deviations implemented so far, is in [`docs/SPEC.md`](docs/SPEC.md).
