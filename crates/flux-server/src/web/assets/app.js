@@ -597,7 +597,42 @@
     }, 150 + attempt * 150);
   }
 
+  // ── deferred diffs: load as they near the viewport (or on click) ──
+  async function loadDiff(el) {
+    if (el.dataset.loading) return;
+    el.dataset.loading = "1";
+    const b = $("button", el); if (b) b.textContent = "Loading…";
+    try {
+      const r = await fetch(el.dataset.src, { credentials: "same-origin" });
+      if (!r.ok) throw new Error(r.status);
+      const html = await r.text();
+      const tpl = document.createElement("template");
+      tpl.innerHTML = html;
+      el.replaceWith(tpl.content);
+      applyDiffMode();
+    } catch (_) {
+      delete el.dataset.loading;
+      if (b) b.textContent = "Retry";
+    }
+  }
+  let diffObserver;
+  function watchDiffs() {
+    if (diffObserver) diffObserver.disconnect();
+    const els = $$(".lazy-diff");
+    if (!els.length) return;
+    if (!("IntersectionObserver" in window)) { els.forEach(loadDiff); return; }
+    diffObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { diffObserver.unobserve(e.target); loadDiff(e.target); }
+    }, { rootMargin: "800px 0px" });
+    els.forEach((el) => diffObserver.observe(el));
+  }
+  document.addEventListener("click", (ev) => {
+    const el = ev.target.closest && ev.target.closest(".lazy-diff");
+    if (el) loadDiff(el);
+  });
+
   function onPage() {
+    watchDiffs();
     pollHighlight(0);
     applyLineHash();
     applyDiffMode();

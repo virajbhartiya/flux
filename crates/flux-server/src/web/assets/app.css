@@ -634,3 +634,4 @@ label.choice span { display: flex; flex-direction: column; gap: 2px; }
   .stat-row { grid-template-columns: repeat(2, 1fr); }
 }
 .owner-name label, .row-form label { display: flex; flex-direction: column; }
+.lazy-diff { display: flex; justify-content: center; padding: 18px; border-top: 1px solid var(--border); background: var(--bg-subtle); }

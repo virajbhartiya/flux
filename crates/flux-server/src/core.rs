@@ -125,6 +125,7 @@ pub struct Flux {
     pub(crate) access_cache: moka::sync::Cache<RepoId, Arc<flux_store::RepoAccess>>,
     /// Recent failed sign-ins by account name and by client, for throttling.
     pub(crate) login_failures: moka::sync::Cache<String, u32>,
+    pub(crate) ahead_behind_cache: moka::sync::Cache<(RepoId, ChangesetId, ChangesetId), (usize, usize)>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
 }
 
@@ -167,6 +168,7 @@ impl Flux {
                 .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
+            ahead_behind_cache: moka::sync::Cache::new(100_000),
             login_failures: moka::sync::Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_secs(900))

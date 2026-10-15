@@ -90,7 +90,61 @@ pub fn warm(flux: &Arc<Flux>) {
             }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "caches warm");
+        // Then the files at each repository's default branch, so the first
+        // search, file view and README render read memory, not storage.
+        let started = std::time::Instant::now();
+        let mut budget: u64 = WARM_CONTENT_BYTES;
+        let mut warmed = 0usize;
+        let Ok(repos) = flux.meta.list_repos().await else { return };
+        for r in repos {
+            if budget == 0 {
+                break;
+            }
+            match warm_contents(&flux, r.id, &mut budget).await {
+                Ok(n) => warmed += n,
+                Err(e) => tracing::debug!(repo = %r.name, error = %e, "warm: contents"),
+            }
+        }
+        tracing::info!(files = warmed, elapsed_ms = started.elapsed().as_millis() as u64, "file contents warm");
     });
+}
+
+/// Bytes of default-branch file contents preloaded at startup.
+const WARM_CONTENT_BYTES: u64 = 256 << 20;
+
+async fn warm_contents(flux: &Arc<Flux>, repo: flux_store::RepoId, budget: &mut u64) -> core::FluxResult<usize> {
+    use futures::StreamExt as _;
+    let cfg = flux.repo_config(repo).await?;
+    let refs = flux.meta.list_refs(repo, b"", 10_000).await?;
+    let pick = cfg
+        .default_branch
+        .clone()
+        .into_iter()
+        .chain(["main", "master", "trunk"].map(String::from))
+        .find_map(|b| refs.iter().find(|(n, _)| n.as_slice() == b.as_bytes()).map(|(_, v)| v.target));
+    let Some(head) = pick else { return Ok(0) };
+    // Recent history (sidebars, the changes page) into the changeset cache.
+    flux.log_page(repo, &head, &[], None, false, 0, 1_000).await?;
+    let files = flux.file_list(flux.root_tree(repo, &head).await?).await?;
+    let mut want = Vec::new();
+    for (_, c, size) in files.iter() {
+        if *size > (4 << 20) || *size > *budget {
+            continue;
+        }
+        *budget -= size;
+        want.push(*c);
+    }
+    let n = want.len();
+    let blobs = flux.blobs.clone();
+    futures::stream::iter(want)
+        .map(|c| {
+            let blobs = blobs.clone();
+            async move { blobs.get_content_bytes(&c).await }
+        })
+        .buffer_unordered(64)
+        .for_each(|_| async {})
+        .await;
+    Ok(n)
 }
 
 /// Keep git objects generated for every ref head, at startup and as refs

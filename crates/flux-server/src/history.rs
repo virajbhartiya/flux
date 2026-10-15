@@ -121,9 +121,15 @@ impl Flux {
     }
 
     pub async fn ahead_behind(&self, repo: RepoId, a: &ChangesetId, b: &ChangesetId) -> FluxResult<(usize, usize)> {
+        // Changesets are immutable, so the answer for a pair never changes.
+        if let Some(r) = self.ahead_behind_cache.get(&(repo, *a, *b)) {
+            return Ok(r);
+        }
         let (g, ia) = self.graph_index(repo, a).await?;
         let (_, ib) = self.graph_index(repo, b).await?;
-        Ok(g.graph.read().unwrap().ahead_behind(ia, ib))
+        let r = g.graph.read().unwrap().ahead_behind(ia, ib);
+        self.ahead_behind_cache.insert((repo, *a, *b), r);
+        Ok(r)
     }
 
     /// One page of history: ancestors of `start` not reachable from `hide`,
@@ -333,35 +339,60 @@ impl Flux {
             return Ok(b);
         }
         const MAX_VERSIONS: usize = 2_000;
-        // Versions newest → oldest: (changeset, content).
-        let mut versions: Vec<(ChangesetId, ContentId)> = Vec::new();
-        let mut cur = Some(top.cs);
-        while let Some(c) = cur.take() {
-            let Some(entry) = self.entry_at(repo, &c, path).await? else { break };
-            let Some(cid) = entry.content_id() else { break };
-            versions.push((c, cid));
-            if versions.len() >= MAX_VERSIONS {
-                break;
-            }
-            let parents = self.load_one_arc(repo, &c).await?.changeset.parents.clone();
-            if let Some(p0) = parents.first()
-                && let Some(e) = self.last_modified(repo, p0, path).await?
-            {
-                cur = Some(e.cs);
-            }
+        let t0 = std::time::Instant::now();
+        // Versions newest → oldest: the changesets that modified the path
+        // (first-parent, from the history index), with the content each one
+        // wrote, which the changeset itself names (no tree walk needed).
+        let ids = self.path_history(repo, &top.cs, path, true, MAX_VERSIONS).await?;
+        let loaded = self.load_arc(repo, &ids).await?;
+        let mut versions: Vec<(ChangesetId, ContentId)> = Vec::with_capacity(ids.len());
+        for (c, l) in ids.iter().zip(loaded) {
+            let direct = l.as_ref().and_then(|l| match l.changeset.file_changes.get(path) {
+                Some(flux_core::FileChange::Change { content_id, kind, .. })
+                    if !matches!(kind, flux_core::FileKind::GitLink(_)) =>
+                {
+                    Some(*content_id)
+                }
+                _ => None,
+            });
+            let cid = match direct {
+                Some(c) => c,
+                // Merges that kept a side (`Retain`): read it from the tree.
+                None => match self.entry_at(repo, c, path).await?.and_then(|e| e.content_id()) {
+                    Some(c) => c,
+                    None => break,
+                },
+            };
+            versions.push((*c, cid));
         }
-        let mut texts: Vec<bytes::Bytes> = Vec::with_capacity(versions.len());
-        for (_, cid) in &versions {
-            texts.push(
-                self.blobs
-                    .get_content_bytes(cid)
-                    .await?
-                    .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("content {cid} missing")))?,
-            );
-        }
+        let t_walk = t0.elapsed();
+        let texts: Vec<bytes::Bytes> = {
+            use futures::StreamExt as _;
+            let futs: Vec<_> = versions
+                .iter()
+                .map(|(_, cid)| {
+                    let (blobs, cid) = (self.blobs.clone(), *cid);
+                    async move {
+                        blobs
+                            .get_content_bytes(&cid)
+                            .await?
+                            .ok_or_else(|| FluxError::Internal(anyhow::anyhow!("content {cid} missing")))
+                    }
+                })
+                .collect();
+            futures::stream::iter(futs).buffered(32).collect::<Vec<_>>().await.into_iter().collect::<FluxResult<_>>()?
+        };
+        let t_fetch = t0.elapsed();
         let ids: Vec<ChangesetId> = versions.iter().map(|v| v.0).collect();
         let blame =
             tokio::task::spawn_blocking(move || compute_blame(&ids, &texts)).await.map_err(|e| FluxError::Internal(e.into()))?;
+        tracing::debug!(
+            versions = versions.len(),
+            walk_ms = t_walk.as_millis() as u64,
+            fetch_ms = (t_fetch - t_walk).as_millis() as u64,
+            compute_ms = (t0.elapsed() - t_fetch).as_millis() as u64,
+            "blame computed"
+        );
         let blame = Arc::new(blame);
         self.blame_cache.insert(key, blame.clone());
         Ok(blame)

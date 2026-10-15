@@ -23,8 +23,12 @@ use crate::core::{Flux, Loaded};
 use crate::rbac::Role;
 
 const PAGE_SIZE: usize = 50;
-/// Diff lines rendered per page before files are collapsed.
-const DIFF_LINE_BUDGET: usize = 12_000;
+/// Diff lines rendered inline on commit and compare pages; later files
+/// load on demand, so huge diffs still open instantly.
+const DIFF_LINE_BUDGET: usize = 2_500;
+/// Reviews render more inline (comments attach to rendered lines).
+const REVIEW_LINE_BUDGET: usize = 12_000;
+const DEFERRED_NOTE: &str = "Diff not shown to keep this page fast.";
 const MAX_DIFF_FILE: u64 = 1 << 20;
 /// Lines shown in the file viewer before truncating.
 const MAX_VIEW_LINES: usize = 25_000;
@@ -411,6 +415,7 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
             Ok(json_response(serde_json::json!({ "refs": names }), "private, max-age=5"))
         }
         "settings" if args.first().map(String::as_str) == Some("access") => settings_access(&web, &req, &ctx).await,
+        "difffile" => diff_file_fragment(&web, &req, &ctx, args, &q).await,
         "settings" => settings(&web, &req, &ctx).await,
         "edit" => {
             let (rev, rest) = ctx.split_rev(args);
@@ -1233,7 +1238,8 @@ async fn commits(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Opti
     Ok(page(web, req, &format!("Changes · {}", ctx.name), Some(n), body))
 }
 
-struct RenderedFile {
+#[derive(Clone)]
+pub(super) struct RenderedFile {
     path: RepoPath,
     status: &'static str,
     old: Option<flux_derive::TreeFile>,
@@ -1247,8 +1253,30 @@ struct RenderedFile {
 /// Diff two trees into renderable file diffs, fetching contents in
 /// parallel and stopping detailed diffs once the line budget is spent.
 async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) -> WebResult<Vec<RenderedFile>> {
-    let all = |_: &RepoPath, _: bool| true;
-    let entries = diff_trees(&web.flux.blobs, old, new, &all).await?;
+    diff_files_with(web, old, new, None, DIFF_LINE_BUDGET).await
+}
+
+/// `only`: restrict to one path. `line_budget`: lines diffed in full.
+async fn diff_files_with(
+    web: &WebState,
+    old: Option<TreeId>,
+    new: Option<TreeId>,
+    only: Option<&RepoPath>,
+    line_budget: usize,
+) -> WebResult<Vec<RenderedFile>> {
+    let filter = |p: &RepoPath, is_dir: bool| match only {
+        None => true,
+        Some(t) => {
+            let (t, p) = (t.as_bytes(), p.as_bytes());
+            if is_dir { t.starts_with(p) && t.get(p.len()) == Some(&b'/') } else { t == p }
+        }
+    };
+    // Trees are immutable: a finished (fully highlighted) result is reusable.
+    let key = (old, new, only.cloned(), line_budget);
+    if let Some(hit) = web.diffs.get(&key) {
+        return Ok((*hit).clone());
+    }
+    let entries = diff_trees(&web.flux.blobs, old, new, &filter).await?;
     type Fetched = Option<(flux_core::ContentId, bytes::Bytes)>;
     async fn fetch(blobs: flux_store::BlobStore, id: Option<flux_core::ContentId>) -> Result<Fetched, flux_store::StoreError> {
         match id {
@@ -1268,7 +1296,7 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
     use futures::StreamExt;
     let fetched: Vec<Result<(Fetched, Fetched), flux_store::StoreError>> =
         futures::stream::iter(futs).buffered(32).collect().await;
-    let mut budget = DIFF_LINE_BUDGET;
+    let mut budget = line_budget;
     let mut out = Vec::with_capacity(entries.len());
     let mut hl_jobs: Vec<(usize, bool, flux_core::ContentId, String, String)> = Vec::new();
     for (i, e) in entries.into_iter().enumerate() {
@@ -1301,7 +1329,7 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
         } else if is_binary(&a_bytes) || is_binary(&b_bytes) {
             rf.note = Some("Binary file".into());
         } else if budget == 0 {
-            rf.note = Some("Diff not shown to keep this page fast.".into());
+            rf.note = Some(DEFERRED_NOTE.into());
             // Still count lines.
             let d = diff_text(&String::from_utf8_lossy(&a_bytes), &String::from_utf8_lossy(&b_bytes), 0);
             rf.diff = Some(FileDiff { hunks: vec![], ..d });
@@ -1340,10 +1368,22 @@ async fn diff_files(web: &WebState, old: Option<TreeId>, new: Option<TreeId>) ->
         let w = web.clone();
         tasks.push((idx, new_side, tokio::task::spawn_blocking(move || w.hl.lines(id, &path, &text))));
     }
+    let mut complete = true;
     for (idx, new_side, task) in tasks {
-        if let Ok(Ok(Some(v))) = tokio::time::timeout_at(deadline, task).await {
-            if new_side { out[idx].new_hl = Some(v) } else { out[idx].old_hl = Some(v) }
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(Some(v))) => {
+                if new_side {
+                    out[idx].new_hl = Some(v)
+                } else {
+                    out[idx].old_hl = Some(v)
+                }
+            }
+            Ok(_) => {}
+            Err(_) => complete = false,
         }
+    }
+    if complete {
+        web.diffs.insert(key, Arc::new(out.clone()));
     }
     Ok(out)
 }
@@ -1423,11 +1463,19 @@ fn thread_row(c: &Comments<'_>, path: &str, line: i64, events: &[&flux_store::Re
     }
 }
 
-fn diff_view(ctx: &RepoCtx, rev: &str, files: &[RenderedFile]) -> Markup {
-    diff_view_with(ctx, rev, files, None)
+/// `lazy`: `(base, head)` changesets; deferred files load from
+/// `-/difffile/{base}/{head}?path=…` when they come into view.
+fn diff_view(ctx: &RepoCtx, rev: &str, files: &[RenderedFile], lazy: Option<(&str, &str)>) -> Markup {
+    diff_view_with(ctx, rev, files, None, lazy)
 }
 
-fn diff_view_with(ctx: &RepoCtx, rev: &str, files: &[RenderedFile], comments: Option<&Comments<'_>>) -> Markup {
+fn diff_view_with(
+    ctx: &RepoCtx,
+    rev: &str,
+    files: &[RenderedFile],
+    comments: Option<&Comments<'_>>,
+    lazy: Option<(&str, &str)>,
+) -> Markup {
     let added: u32 = files.iter().filter_map(|f| f.diff.as_ref()).map(|d| d.added).sum();
     let deleted: u32 = files.iter().filter_map(|f| f.diff.as_ref()).map(|d| d.deleted).sum();
     html! {
@@ -1464,11 +1512,31 @@ fn diff_view_with(ctx: &RepoCtx, rev: &str, files: &[RenderedFile], comments: Op
                         a.btn.small href=(url(&ctx.name, "blob", rev, Some(&f.path))) { "View file" }
                     }
                 }
-                @if let Some(note) = &f.note {
+                @if let (Some(note), Some((a, b))) = (&f.note, lazy) {
+                    @if note == DEFERRED_NOTE {
+                        div.lazy-diff data-src=(format!("/{}/-/difffile/{a}/{b}?path={}", enc(&ctx.name), enc(&f.path.to_string()))) {
+                            button.btn.small type="button" { "Load diff" }
+                        }
+                    } @else {
+                        div.notice.small { (note) }
+                    }
+                } @else if let Some(note) = &f.note {
                     div.notice.small { (note) }
                 }
                 @if let Some(d) = &f.diff {
                     @if !d.hunks.is_empty() {
+                        (diff_table(f, d, comments))
+                    } @else if f.note.is_none() && f.status == "modified" {
+                        div.notice.small { "File mode changed; contents are identical." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn diff_table(f: &RenderedFile, d: &FileDiff, comments: Option<&Comments<'_>>) -> Markup {
+    html! {
                         @let path_s = f.path.to_string();
                         @let commentable = comments.is_some_and(|c| c.can_write);
                         table.diff.commentable[commentable] data-comment-url=[comments.map(|c| c.action.clone())] data-path=(path_s) {
@@ -1493,13 +1561,38 @@ fn diff_view_with(ctx: &RepoCtx, rev: &str, files: &[RenderedFile], comments: Op
                                 }
                             }
                         }
-                    } @else if f.note.is_none() && f.status == "modified" {
-                        div.notice.small { "File mode changed; contents are identical." }
-                    }
-                }
-            }
-        }
     }
+}
+
+/// One file's diff as an HTML fragment (deferred files on big diffs).
+async fn diff_file_fragment(web: &WebState, req: &Req, ctx: &RepoCtx, args: &[String], q: &HashMap<String, String>) -> WebResult {
+    let [a, b] = args else { return Err(WebError::BadRequest("expected difffile/{base}/{head}".into())) };
+    let path = RepoPath::new(q.get("path").cloned().unwrap_or_default()).map_err(|e| WebError::BadRequest(e.to_string()))?;
+    if !ctx.config.allows(&req.principal, path.as_bytes(), false) {
+        return Err(WebError::NotFound(format!("{path} does not exist")));
+    }
+    let flux = &web.flux;
+    let old = match a.as_str() {
+        "-" => None,
+        rev => Some(flux.tree_of(ctx.id, &flux.resolve_rev(ctx.id, rev).await?).await?),
+    };
+    let new = flux.tree_of(ctx.id, &flux.resolve_rev(ctx.id, b).await?).await?;
+    let files = diff_files_with(web, old, Some(new), Some(&path), usize::MAX).await?;
+    let markup = match files.first() {
+        Some(f) => match (&f.diff, &f.note) {
+            (Some(d), None) if !d.hunks.is_empty() => diff_table(f, d, None),
+            (_, Some(note)) => html! { div.notice.small { (note) } },
+            _ => html! { div.notice.small { "No changes." } },
+        },
+        None => html! { div.notice.small { "No changes." } },
+    };
+    let mut r = Response::new(axum::body::Body::from(markup.into_string()));
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    // Both sides are immutable changesets: cache aggressively.
+    if a.len() == 64 && b.len() == 64 {
+        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));
+    }
+    Ok(r)
 }
 
 async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResult {
@@ -1547,7 +1640,7 @@ async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResul
                     div.notice.small { "Rebased by the server from " code { (&from[..from.len().min(10)]) } }
                 }
             }
-            (diff_view(ctx, &hex, &files))
+            (diff_view(ctx, &hex, &files, Some((l.changeset.parents.first().map(|p| p.to_hex()).as_deref().unwrap_or("-"), &hex))))
         }
     };
     let n = nav(web, req, ctx, Tab::Commits, rev).await;
@@ -1593,7 +1686,7 @@ async fn compare(web: &WebState, req: &Req, ctx: &RepoCtx, spec: &str) -> WebRes
                     }
                 }
                 (commit_list(ctx, &items))
-                (diff_view(ctx, &h.to_hex(), &files))
+                (diff_view(ctx, &h.to_hex(), &files, mb.map(|m| (m.to_hex(), h.to_hex())).as_ref().map(|(a, b)| (a.as_str(), b.as_str()))))
             }
         }
     };
@@ -1993,7 +2086,7 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
             Some(b) => Some(flux.tree_of(ctx.id, &b).await?),
             None => None,
         };
-        let mut f = diff_files(web, old, Some(flux.tree_of(ctx.id, &top).await?)).await?;
+        let mut f = diff_files_with(web, old, Some(flux.tree_of(ctx.id, &top).await?), None, REVIEW_LINE_BUDGET).await?;
         f.retain(|f| ctx.config.allows(&req.principal, f.path.as_bytes(), false));
         Some(f)
     } else {
@@ -2032,7 +2125,7 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                         m
                     },
                 };
-                (diff_view_with(ctx, &r.head.to_hex(), files, Some(&comments)))
+                (diff_view_with(ctx, &r.head.to_hex(), files, Some(&comments), None))
             } @else {
                 div.review-grid {
                     div.timeline {

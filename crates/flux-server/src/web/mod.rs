@@ -47,10 +47,13 @@ pub struct Web {
     /// Newly created tokens awaiting their one-time display, by a random
     /// handle (never put a secret in a URL).
     pub new_tokens: moka::sync::Cache<String, (i64, String)>,
+    /// Rendered diffs by (old tree, new tree, path filter, line budget).
+    diffs: moka::sync::Cache<DiffKey, Arc<Vec<pages::RenderedFile>>>,
     pub started: Instant,
 }
 
 pub type WebState = Arc<Web>;
+type DiffKey = (Option<flux_core::TreeId>, Option<flux_core::TreeId>, Option<flux_core::RepoPath>, usize);
 
 impl Web {
     pub fn new(flux: Arc<Flux>) -> Arc<Self> {
@@ -65,6 +68,10 @@ impl Web {
             hl: highlight::Highlighter::default(),
             langs: moka::sync::Cache::new(10_000),
             refs: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_millis(1500)).max_capacity(10_000).build(),
+            diffs: moka::sync::Cache::builder()
+                .weigher(|_, v: &Arc<Vec<pages::RenderedFile>>| (v.len() as u32).saturating_mul(4096).max(1024))
+                .max_capacity(256 << 20)
+                .build(),
             new_tokens: moka::sync::Cache::builder()
                 .time_to_live(std::time::Duration::from_secs(300))
                 .max_capacity(10_000)
