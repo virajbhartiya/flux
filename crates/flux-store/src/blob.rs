@@ -122,7 +122,6 @@ pub struct MetaHasher {
     size: u64,
     seen: u64,
     git: sha1::Sha1,
-    sha256: sha2::Sha256,
     is_binary: bool,
 }
 
@@ -130,7 +129,7 @@ impl MetaHasher {
     pub fn new(size: u64) -> Self {
         let mut git = sha1::Sha1::new();
         git.update(format!("blob {size}\0").as_bytes());
-        Self { size, seen: 0, git, sha256: sha2::Sha256::new(), is_binary: false }
+        Self { size, seen: 0, git, is_binary: false }
     }
 
     pub fn update(&mut self, data: &[u8]) {
@@ -140,14 +139,14 @@ impl MetaHasher {
         }
         self.seen += data.len() as u64;
         self.git.update(data);
-        self.sha256.update(data);
     }
 
     pub fn finish(self) -> ContentMeta {
         ContentMeta {
             size: self.size,
             git_sha1: self.git.finalize().into(),
-            sha256: self.sha256.finalize().into(),
+            // Computed on demand (it is only served to API callers).
+            sha256: [0; 32],
             is_binary: self.is_binary,
         }
     }

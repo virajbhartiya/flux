@@ -218,7 +218,17 @@ impl object_service_server::ObjectService for Services {
         let repo = self.flux.repo(&req.repo).await?;
         self.flux.authorize(&principal, repo, Role::Read).await?;
         let ids: Vec<ContentId> = req.content_ids.iter().map(|b| content_id(b)).collect::<Result<_, _>>()?;
-        let metas = self.flux.meta.get_content_meta(&ids).await.map_err(FluxError::from)?;
+        let mut metas = self.flux.meta.get_content_meta(&ids).await.map_err(FluxError::from)?;
+        // SHA-256 is not computed on write; fill it in for callers.
+        for (id, m) in ids.iter().zip(metas.iter_mut()) {
+            if let Some(m) = m
+                && m.sha256 == [0; 32]
+                && let Some(data) = self.flux.blobs.get_content_bytes(id).await.map_err(FluxError::from)?
+            {
+                use sha2::Digest as _;
+                m.sha256 = sha2::Sha256::digest(&data).into();
+            }
+        }
         let results: Vec<Result<ContentMetaResult, Status>> = ids
             .iter()
             .zip(metas)
@@ -711,7 +721,26 @@ impl write_service_server::WriteService for Services {
         let batch = req.changesets.iter().map(changeset_from_pb).collect::<Result<Vec<_>, _>>()?;
         let paths: Vec<Vec<u8>> = batch.iter().flat_map(|c| c.file_changes.keys().map(|p| p.as_bytes().to_vec())).collect();
         self.flux.check_write_paths(repo, &principal, paths).await?;
-        Ok(Response::new(CreateChangesetsResponse { changesets: self.flux.create_changesets(repo, batch).await? }))
+        if !req.git_sha1s.is_empty() && req.git_sha1s.len() != batch.len() {
+            return Err(Status::invalid_argument("git_sha1s must be empty or match changesets"));
+        }
+        let mut infos = self.flux.create_changesets(repo, batch).await?;
+        if req.ids_only {
+            for i in &mut infos {
+                i.canonical = Default::default();
+                i.changeset = None;
+            }
+        }
+        if !req.git_sha1s.is_empty() {
+            let mut pairs = Vec::with_capacity(infos.len());
+            for (info, sha) in infos.iter().zip(&req.git_sha1s) {
+                let sha: [u8; 20] =
+                    sha.as_slice().try_into().map_err(|_| Status::invalid_argument("git_sha1s must be 20 bytes"))?;
+                pairs.push((cs_id(&info.id)?, sha));
+            }
+            self.flux.meta.git_map_put(repo, &pairs).await.map_err(FluxError::from)?;
+        }
+        Ok(Response::new(CreateChangesetsResponse { changesets: infos }))
     }
 
     async fn update_ref(&self, req: Request<UpdateRefRequest>) -> Result<Response<UpdateRefResponse>, Status> {

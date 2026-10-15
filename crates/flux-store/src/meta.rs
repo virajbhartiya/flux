@@ -69,6 +69,8 @@ pub struct ContentMeta {
     pub size: u64,
     /// Git blob hash (`sha1("blob <len>\0" + data)`).
     pub git_sha1: [u8; 20],
+    /// All zeros when not computed yet: writes skip it (it costs as much as
+    /// the content hash itself); `GetContentMeta` fills it in on demand.
     pub sha256: [u8; 32],
     pub is_binary: bool,
 }

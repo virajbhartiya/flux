@@ -295,12 +295,17 @@ async fn import_commits(
         let client = client.clone();
         tokio::spawn(async move {
             let mut created: Vec<(Sha, ChangesetId)> = Vec::new();
+            let (mut busy, mut idle) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let mut waited = Instant::now();
             let mut last_log = Instant::now();
             let mut since = 0usize;
             while let Some(b) = create_rx.recv().await {
-                let infos = client.create_changesets(&b.changesets).await.context("creating changesets")?;
+                idle += waited.elapsed();
+                let t = Instant::now();
+                let infos = client.create_changesets_from_git(&b.changesets, &b.shas).await.context("creating changesets")?;
                 let pairs: Vec<_> = infos.iter().zip(&b.shas).map(|(i, s)| (i.id, *s)).collect();
-                client.put_git_mapping(&pairs).await?;
+                busy += t.elapsed();
+                waited = Instant::now();
                 since += pairs.len();
                 created.extend(pairs.iter().map(|(c, s)| (*s, *c)));
                 if last_log.elapsed().as_secs() >= 5 {
@@ -310,12 +315,17 @@ async fn import_commits(
                     since = 0;
                 }
             }
+            tracing::debug!(busy_ms = busy.as_millis() as u64, idle_ms = idle.as_millis() as u64, "stage create");
             anyhow::Ok(created)
         })
     };
 
     let mut upload_err = None;
+    let (mut up_busy, mut up_wait_read, mut up_wait_create) =
+        (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut t = Instant::now();
     while let Some(batch) = read_rx.recv().await {
+        up_wait_read += t.elapsed();
         let batch = match batch {
             Ok(b) => b,
             Err(e) => {
@@ -326,14 +336,25 @@ async fn import_commits(
         stats.blobs_uploaded += batch.uploads.len();
         stats.blob_bytes += batch.uploads.iter().map(|u| u.1.len() as u64).sum::<u64>();
         let uploads = batch.uploads.clone();
+        let tu = Instant::now();
         if let Err(e) = client.upload_known(uploads).await {
             upload_err = Some(e);
             break;
         }
+        up_busy += tu.elapsed();
+        let tc = Instant::now();
         if create_tx.send(ReadBatch { uploads: vec![], ..batch }).await.is_err() {
             break; // creator failed
         }
+        up_wait_create += tc.elapsed();
+        t = Instant::now();
     }
+    tracing::debug!(
+        busy_ms = up_busy.as_millis() as u64,
+        waiting_for_git_ms = up_wait_read.as_millis() as u64,
+        waiting_for_create_ms = up_wait_create.as_millis() as u64,
+        "stage upload"
+    );
     drop(create_tx);
     drop(read_rx);
     let created = creator.await?;

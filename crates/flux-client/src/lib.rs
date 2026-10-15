@@ -498,12 +498,20 @@ impl Client {
     /// Create many changesets in one call (in order; later ones may use
     /// earlier ones as parents).
     pub async fn create_changesets(&self, batch: &[Changeset]) -> Result<Vec<CsInfo>> {
+        self.create_changesets_from_git(batch, &[]).await
+    }
+
+    /// Create changesets and record the git commits they came from (empty
+    /// `git_shas`: none) in one call.
+    pub async fn create_changesets_from_git(&self, batch: &[Changeset], git_shas: &[[u8; 20]]) -> Result<Vec<CsInfo>> {
         let infos = self
             .writes
             .clone()
             .create_changesets(CreateChangesetsRequest {
                 repo: self.repo.clone(),
                 changesets: batch.iter().map(flux_proto::changeset_to_pb).collect(),
+                git_sha1s: git_shas.iter().map(|s| s.to_vec()).collect(),
+                ids_only: true,
             })
             .await
             .map_err(|s| anyhow!("create changesets: {}", s.message()))?
@@ -516,11 +524,19 @@ impl Client {
             .into_iter()
             .zip(batch)
             .map(|(i, cs)| {
-                let info: CsInfo = i.try_into()?;
-                if info.id != cs.id() {
-                    bail!("server computed changeset id {} but client expected {}", info.id, cs.id());
+                // The server echoes ids only; the id still proves it stored
+                // exactly this changeset.
+                let id = ChangesetId::from_slice(&i.id)?;
+                if id != cs.id() {
+                    bail!("server computed changeset id {id} but client expected {}", cs.id());
                 }
-                Ok(info)
+                Ok(CsInfo {
+                    id,
+                    generation: i.generation,
+                    root_tree: TreeId::from_slice(&i.root_tree)?,
+                    changeset: cs.clone(),
+                    git_sha1: None,
+                })
             })
             .collect()
     }

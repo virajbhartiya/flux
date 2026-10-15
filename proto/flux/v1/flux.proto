@@ -387,6 +387,12 @@ message CreateChangesetRequest {
 message CreateChangesetsRequest {
   string repo = 1;
   repeated Changeset changesets = 2;
+  // Optional, parallel to `changesets`: the git commit each one was
+  // imported from (recorded like PutGitMapping, in the same call).
+  repeated bytes git_sha1s = 3;
+  // Return only id, generation, root_tree and log_seq per changeset (the
+  // caller already has the changesets; bulk imports).
+  bool ids_only = 4;
 }
 
 message CreateChangesetsResponse {

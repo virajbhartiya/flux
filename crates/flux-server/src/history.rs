@@ -97,13 +97,45 @@ impl Flux {
             let name = self.repo_name(repo).await;
             self.publish(Event::Changesets { repo: name, count: rows.len(), last: last.id });
             // Derive lastmod in the background so history and the web UI
-            // never wait for it.
-            let (this, tip) = (self.clone(), last.id);
-            tokio::spawn(async move {
-                if let Err(e) = this.lastmod(repo, &tip).await {
-                    tracing::warn!(error = %e, "background lastmod derivation failed");
+            // never wait for it, coalescing bursts: one deriver per repo
+            // runs once writes go quiet (or at least every 30 s), so a bulk
+            // import indexes in a few large batches instead of competing
+            // with itself after every batch.
+            let start = {
+                let mut pending = self.lastmod_pending.lock().unwrap();
+                let first = !pending.contains_key(&repo);
+                let e = pending.entry(repo).or_insert((last.id, std::time::Instant::now(), std::time::Instant::now()));
+                e.0 = last.id;
+                e.2 = std::time::Instant::now();
+                first
+            };
+            if start {
+                let this = self.clone();
+                tokio::spawn(async move { this.lastmod_scheduler(repo).await });
+            }
+        }
+    }
+
+    async fn lastmod_scheduler(self: Arc<Self>, repo: RepoId) {
+        const QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+        const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(QUIET).await;
+            let tip = {
+                let mut pending = self.lastmod_pending.lock().unwrap();
+                let Some(&(tip, first, latest)) = pending.get(&repo) else { return };
+                if latest.elapsed() < QUIET && first.elapsed() < MAX_DELAY {
+                    continue;
                 }
-            });
+                pending.remove(&repo);
+                tip
+            };
+            if let Err(e) = self.lastmod(repo, &tip).await {
+                tracing::warn!(error = %e, "background lastmod derivation failed");
+            }
+            // Writes that arrived meanwhile started a new scheduler entry;
+            // this task exits and lets that one run.
+            return;
         }
     }
 
