@@ -192,10 +192,19 @@ enum Cmd {
         cmd: RepoCmd,
     },
     /// Store a token for a server (read from --token or stdin).
+    /// Sign in with your username and password (or paste a token with
+    /// --token). Stores an API token for this server.
     Login {
         server: Option<String>,
+        /// Use this access token instead of a password.
         #[arg(long)]
         token: Option<String>,
+        /// Username or email (prompted if omitted).
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Read the password from standard input (for scripts).
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Forget the stored token for a server.
     Logout { server: Option<String> },
@@ -302,7 +311,15 @@ enum SparseCmd {
 
 #[derive(Subcommand)]
 enum RepoCmd {
-    Create { name: String },
+    /// Create `owner/name` (yours or an organization you own), or a
+    /// server-wide `name` (site admins).
+    Create {
+        name: String,
+        /// public, internal or private (owned repositories default to private).
+        #[arg(long)]
+        visibility: Option<String>,
+    },
+    /// Repositories you can read.
     List,
 }
 
@@ -847,8 +864,8 @@ async fn run(cli: Cli) -> Result<()> {
                 cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("--server required")?;
             let client = connect(&server, "").await?;
             match cmd {
-                RepoCmd::Create { name } => {
-                    client.create_repo(name).await?;
+                RepoCmd::Create { name, visibility } => {
+                    client.create_repo_with(name, visibility.as_deref().unwrap_or("")).await?;
                     println!("created {name}");
                 }
                 RepoCmd::List => {
@@ -858,7 +875,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Login { server, token } => {
+        Cmd::Login { server, token, user, password_stdin } => {
             let server = normalize_server(
                 &server
                     .clone()
@@ -869,10 +886,31 @@ async fn run(cli: Cli) -> Result<()> {
             let token = match token {
                 Some(t) => t.clone(),
                 None => {
-                    eprint!("token for {server}: ");
-                    let mut t = String::new();
-                    std::io::stdin().read_line(&mut t)?;
-                    t.trim().to_string()
+                    let login = match user {
+                        Some(u) => u.clone(),
+                        None => {
+                            eprint!("username or email for {server}: ");
+                            let mut u = String::new();
+                            std::io::stdin().read_line(&mut u)?;
+                            u.trim().to_string()
+                        }
+                    };
+                    let password = if *password_stdin {
+                        let mut p = String::new();
+                        std::io::stdin().read_line(&mut p)?;
+                        p.trim_end_matches(['\r', '\n']).to_string()
+                    } else {
+                        rpassword::prompt_password("password: ")?
+                    };
+                    let host = std::env::var("HOSTNAME")
+                        .ok()
+                        .or_else(|| std::env::var("COMPUTERNAME").ok())
+                        .unwrap_or_else(|| "this machine".into());
+                    let (token, _) = Client::connect_with_token(&server, "", Some(""))
+                        .await?
+                        .login(&login, &password, &format!("flux CLI on {host}"))
+                        .await?;
+                    token
                 }
             };
             let who = Client::connect_with_token(&server, "", Some(&token)).await?.whoami().await?;
@@ -898,7 +936,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("logged out of {server}");
         }
         Cmd::Whoami => {
-            let client = client_for(&cli, wc.as_ref()).await.or_else(|_| bail!("pass --server"))?;
+            let server = cli.server.clone().or_else(|| wc.as_ref().map(|w| w.config.server.clone())).context("pass --server")?;
+            let client = connect(&server, "").await?;
             let w = client.whoami().await?;
             println!(
                 "{} on a server in {} mode{}",

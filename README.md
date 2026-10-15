@@ -110,7 +110,10 @@ docker compose up -d
 docker compose exec flux flux-server token --user admin --admin
 ```
 
-- **Auth** (`--auth`): `open` (single user / trusted network), `token` (anonymous reads, token writes), `private` (tokens for everything). `flux-server token --user NAME [--admin]` issues a token; only its SHA-256 is stored. `flux login` saves it for the CLI; the web UI uses an HttpOnly, SameSite cookie. `flux-server revoke --user NAME` revokes.
+- **Accounts:** the first account created on a server (`/-/signup`) becomes the site admin. After that, sign-up is `--signup closed` (admins create accounts under Site admin) or `open`. Passwords are hashed with argon2id, and sign-in is throttled per account and client. Web sessions last 30 days and are revoked on sign-out. Personal access tokens (Settings → Access tokens) are scoped `read`, `write` or `all`, can expire, and are shown once. `flux login` asks for your username and password and stores a token (`--password-stdin` for scripts, `--token` to paste one).
+- **Organizations and teams:** organizations own repositories (`acme/api`), and have owners and members with a base role. Teams group members and get roles on repositories. User and organization pages live at `/{name}`.
+- **Roles:** `read` < `triage` < `write` < `maintain` < `admin` per repository. A user's role is the highest of: their ownership, org ownership, the org's base role, team and direct grants, and visibility (`public`, `internal`, `private`). Token scopes cap it. Private repositories are invisible to people without access, in the UI, the API and git. Security events (sign-ins, failed sign-ins, grants, membership and visibility changes) go to an audit log under Site admin.
+- **Server auth mode** (`--auth`):
 - **Path ACLs:** admins set per-path rules on the settings page (`infra/secrets | ops | ops`). The rules are enforced on gRPC, the web UI and git, and the most specific rule wins. See SPEC §12.2 for the limits of v1.
 - **Git:** `/<repo>.git` speaks smart HTTP. Use your token as the password (`git clone http://x:TOKEN@host/repo.git`) or send it as a Bearer header. Pushes to protected refs must be fast-forwards.
 - **Protected refs:** non-admins can only fast-forward `main`, `master`, `trunk` and `release/*`. Rebased work reaches them through `flux land` or a review.

@@ -55,9 +55,17 @@ pub async fn open(cfg: &StorageConfig) -> anyhow::Result<Arc<Flux>> {
 }
 
 pub async fn open_with(cfg: &StorageConfig, auth: auth::AuthMode) -> anyhow::Result<Arc<Flux>> {
+    open_with_options(cfg, auth, Default::default()).await
+}
+
+pub async fn open_with_options(
+    cfg: &StorageConfig,
+    auth: auth::AuthMode,
+    signup: identity::SignupPolicy,
+) -> anyhow::Result<Arc<Flux>> {
     let meta = flux_store::open_meta(&cfg.meta_url).await?;
     let blobs = flux_store::BlobStore::open(&cfg.blob_url)?;
-    Ok(Arc::new(Flux::new(meta, blobs).with_auth_mode(auth)))
+    Ok(Arc::new(Flux::new(meta, blobs).with_auth_mode(auth).with_signup(signup)))
 }
 
 /// Warm caches in the background after startup: load commit graphs and

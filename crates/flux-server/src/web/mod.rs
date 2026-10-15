@@ -12,6 +12,7 @@
 //! URLs follow GitLab's `/-/` convention so repository names may contain
 //! slashes: `/{repo}/-/tree/{rev}/{path}`.
 
+mod account;
 mod diff;
 pub mod highlight;
 mod lang;
@@ -43,6 +44,9 @@ pub struct Web {
     pub js_path: String,
     pub refs: moka::sync::Cache<flux_store::RepoId, Arc<Vec<(String, flux_core::ChangesetId)>>>,
     pub langs: moka::sync::Cache<flux_core::TreeId, Arc<Vec<(String, String, f64)>>>,
+    /// Newly created tokens awaiting their one-time display, by a random
+    /// handle (never put a secret in a URL).
+    pub new_tokens: moka::sync::Cache<String, (i64, String)>,
     pub started: Instant,
 }
 
@@ -61,6 +65,10 @@ impl Web {
             hl: highlight::Highlighter::default(),
             langs: moka::sync::Cache::new(10_000),
             refs: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_millis(1500)).max_capacity(10_000).build(),
+            new_tokens: moka::sync::Cache::builder()
+                .time_to_live(std::time::Duration::from_secs(300))
+                .max_capacity(10_000)
+                .build(),
             started: Instant::now(),
         })
     }
@@ -87,9 +95,25 @@ pub fn router(flux: Arc<Flux>) -> Router {
         .route("/", get(pages::home))
         .route("/-/static/{file}", get(static_asset))
         .route("/-/static/fonts/{file}", get(font_asset))
-        .route("/-/login", get(pages::login_form).post(pages::login))
-        .route("/-/logout", post(pages::logout))
-        .route("/-/repos", post(pages::create_repo))
+        .route("/-/login", get(account::login_form).post(account::login))
+        .route("/-/logout", post(account::logout))
+        .route("/-/signup", get(account::signup_form).post(account::signup))
+        .route("/-/settings", get(account::profile))
+        .route("/-/settings/tokens", get(account::tokens).post(account::token_create))
+        .route("/-/settings/tokens/{id}/revoke", post(account::token_revoke))
+        .route("/-/settings/orgs", get(account::my_orgs))
+        .route("/-/settings/{what}", post(account::profile_post))
+        .route("/-/orgs", post(account::org_create))
+        .route("/-/orgs/{org}/people", get(account::org_people).post(account::org_people_post))
+        .route("/-/orgs/{org}/teams", get(account::org_teams).post(account::org_team_create))
+        .route("/-/orgs/{org}/teams/{team}", get(account::org_team).post(account::org_team_post))
+        .route("/-/orgs/{org}/settings", get(account::org_settings).post(account::org_settings_post))
+        .route("/-/new", get(account::new_repo))
+        .route("/-/repos", post(account::create_repo))
+        .route("/-/admin", get(account::admin_users))
+        .route("/-/admin/users", post(account::admin_users_post))
+        .route("/-/admin/users/{name}", post(account::admin_user_post))
+        .route("/-/admin/audit", get(account::admin_audit))
         .route("/-/repos.json", get(pages::repos_json))
         .route("/-/healthz", get(|| async { "ok" }))
         .route("/-/readyz", get(pages::readyz))
@@ -136,6 +160,21 @@ async fn dispatch_post(State(web): State<WebState>, req: axum::extract::Request)
         Err(e) => return e.into_response(),
     };
     let headers = parts.headers.clone();
+    if let Some(repo) = path.strip_suffix("/-/settings/access") {
+        let f = match axum::extract::Form::<account::AccountForm>::from_request(
+            axum::extract::Request::from_parts(parts, body),
+            &web,
+        )
+        .await
+        {
+            Ok(f) => f.0,
+            Err(e) => return e.into_response(),
+        };
+        if let Err(e) = account::check_origin(&headers) {
+            return e.into_response();
+        }
+        return pages::repo_access_post(&web, &r, &pages::decode_repo(repo), &f).await.into_response();
+    }
     let form = match axum::extract::Form::<pages::ReviewForm>::from_request(axum::extract::Request::from_parts(parts, body), &web)
         .await
     {
@@ -201,7 +240,7 @@ pub struct Req {
     pub partial: bool,
 }
 
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
         (k == name).then_some(v)

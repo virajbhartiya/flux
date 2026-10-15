@@ -71,13 +71,21 @@ pub fn icon(name: &str) -> Markup {
         "lock" => "M4.5 7V5a3.5 3.5 0 0 1 7 0v2M3.5 7h9v7h-9Z",
         "edit" => "M10.5 2.5l3 3L6 13H3v-3Zm-2 2 3 3",
         "plus" => "M8 3v10M3 8h10",
-        "gear" => {
+        "gear" | "settings" => {
             "M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5ZM8 1.5v1.75M8 12.75v1.75M1.5 8h1.75M12.75 8h1.75M3.4 3.4l1.25 1.25M11.35 11.35l1.25 1.25M3.4 12.6l1.25-1.25M11.35 4.65l1.25-1.25"
         }
-        "users" => {
+        "users" | "people" | "team" => {
             "M6 7.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM1.5 13.5c0-2.5 2-4 4.5-4s4.5 1.5 4.5 4M11 7.25a2 2 0 1 0 0-4M12.5 13.5c0-1.75-.75-3-2-3.5"
         }
         "repo" => "M3 2.5h8.5a1 1 0 0 1 1 1v10H4a1 1 0 0 1-1-1Zm0 9.25a1 1 0 0 1 1-1h8.5M6 5h4",
+        "alert" => "M8 1.75 1.5 13.5h13ZM8 6v3.5M8 11.5v.25",
+        "user" => "M8 7.5a2.75 2.75 0 1 0 0-5.5 2.75 2.75 0 0 0 0 5.5ZM2.5 14c0-2.75 2.5-4.5 5.5-4.5s5.5 1.75 5.5 4.5",
+        "key" => "M10 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM7.2 8.8 1.75 14.25M3.5 12.5l1.75 1.75M5 11l1.25 1.25M11 5h.01",
+        "org" => "M2.5 14V3.5a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1V14M9.5 7h3a1 1 0 0 1 1 1v6M1.5 14h13M5 5.5h1.5M5 8h1.5M5 10.5h1.5",
+        "monitor" => "M2 3h12v8H2ZM5.5 14h5M8 11v3",
+        "shield" => "M8 1.5 2.75 3.5v4c0 3.25 2.25 5.75 5.25 7 3-1.25 5.25-3.75 5.25-7v-4Z",
+        "logout" => "M6 2.5H3.25a.75.75 0 0 0-.75.75v9.5c0 .4.35.75.75.75H6M10.5 11l3-3-3-3M13.25 8H6",
+        "chevron" => "M4 6l4 4 4-4",
         _ => "M2 2h12v12H2Z",
     };
     html! {
@@ -263,13 +271,27 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                         button.btn.ghost.icon-only.theme-toggle type="button" title="Toggle theme" aria-label="Toggle theme" { (icon("sun")) }
                         @match (&user, mode) {
                             (Some(u), _) => {
-                                form.inline action="/-/logout" method="post" {
-                                    span.user { (avatar(u, "", false)) span.hide-sm { (u) } }
-                                    button.btn.ghost.small type="submit" { "Sign out" }
+                                a.btn.ghost.icon-only href="/-/new" title="New repository" aria-label="New repository" { (icon("plus")) }
+                                details.menu {
+                                    summary.user aria-label="Account menu" { (avatar(u, "", false)) span.hide-sm { (u) } (icon("chevron")) }
+                                    div.menu-pop {
+                                        div.menu-head { "Signed in as " strong { (u) } }
+                                        a href=(repo_url(u)) { (icon("user")) "Your profile" }
+                                        a href="/-/settings/orgs" { (icon("org")) "Organizations" }
+                                        a href="/-/settings/tokens" { (icon("key")) "Access tokens" }
+                                        a href="/-/settings" { (icon("settings")) "Settings" }
+                                        @if req.principal.user.as_ref().is_some_and(|u| u.is_admin) {
+                                            a href="/-/admin" { (icon("shield")) "Site admin" }
+                                        }
+                                        form action="/-/logout" method="post" { button type="submit" { (icon("logout")) "Sign out" } }
+                                    }
                                 }
                             }
                             (None, crate::auth::AuthMode::Open) => {}
-                            (None, _) => { a.btn.small href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" } }
+                            (None, _) => {
+                                a.btn.ghost.small href="/-/signup" { "Sign up" }
+                                a.btn.small.primary href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" }
+                            }
                         }
                     }
                 }

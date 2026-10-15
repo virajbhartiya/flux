@@ -23,6 +23,7 @@ hex.workspace = true
 ignore = "0.4"
 open = "5"
 rayon = "1"
+rpassword = "7"
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

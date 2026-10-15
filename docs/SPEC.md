@@ -691,8 +691,21 @@ write = ["group:sec-eng"]
 - Git access is refused to principals restricted by any rule, because a git clone exposes every object.
 - **Limitation:** domain-keyed hashing (items 1–4 above) is not implemented, so a principal who already knows a content or tree id can fetch it by id. Treat v1 ACLs as access control on paths, not as secrecy for content whose hash has leaked.
 
+**As built (accounts and RBAC).**
+- **Principals:** principals are accounts (username, optional email, argon2id password) holding API tokens or web sessions. Both are stored as SHA-256 hashes, can expire, and API tokens carry scopes `read`/`write`/`all`. User and organization names share one namespace. OIDC and SPIFFE are not implemented.
+- **Repository roles:** read, triage, write, maintain, admin. The effective role is the maximum over:
+  - site admin, the owning user and owners of the owning organization (admin);
+  - the organization's base role, for its members;
+  - team and direct grants;
+  - visibility (public: anyone the auth mode admits; internal: any signed-in user);
+  - the repository's signed-in role (`write` for repositories created before ownership, which keeps their old behaviour).
+- **Scopes and caching:** token scopes cap the effective role. Roles are cached per (user, repository) and invalidated on any change.
+- **Enforcement:** one `authorize` call guards every gRPC method, web page and git endpoint. Callers without read access to a non-public repository get "not found". Path ACLs (above) apply on top of roles. Review actions need: comment = read, close/reopen = triage (authors: read), approve/land = write. Settings need maintain; path rules, visibility and grants need admin; protected-ref overrides need admin.
+
 ### 12.3 Audit
 Every write, every ref move and every read of a restricted domain is emitted to an audit log (OTLP logs, with the sink configurable).
+
+**As built:** security events (sign-ups, sign-ins and failed sign-ins, token creation and revocation, organization, team and membership changes, grants, visibility and settings changes, repository creation) are appended to the `audit_log` table and shown to site admins at `/-/admin/audit`. Ref moves have their own log (`ref_log`). OTLP export is not built.
 
 ---
 

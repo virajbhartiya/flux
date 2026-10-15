@@ -141,6 +141,24 @@ impl Client {
 
     // ───────────── admin ─────────────
 
+    /// Exchange a password for an API token: `(token, user)`.
+    pub async fn login(&self, login: &str, password: &str, label: &str) -> Result<(String, String)> {
+        let r = self
+            .auth
+            .clone()
+            .login(LoginRequest {
+                login: login.into(),
+                password: password.into(),
+                label: label.into(),
+                scopes: String::new(),
+                expires_days: 0,
+            })
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+        Ok((r.token, r.user))
+    }
+
     pub async fn create_repo(&self, name: &str) -> Result<()> {
         self.create_repo_with(name, "").await
     }

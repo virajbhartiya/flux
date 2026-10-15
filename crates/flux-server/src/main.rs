@@ -38,6 +38,10 @@ struct Serve {
     /// reads, writes need a token; private: everything needs a token.
     #[arg(long, env = "FLUX_AUTH", default_value = "open")]
     auth: AuthMode,
+    /// Who may create accounts: closed (site admins create them) or open.
+    /// The first account is always allowed and becomes a site admin.
+    #[arg(long, env = "FLUX_SIGNUP", default_value = "closed")]
+    signup: flux_server::identity::SignupPolicy,
     /// Disable the web UI (gRPC only).
     #[arg(long)]
     no_web: bool,
@@ -123,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         (None, Some(meta_url), Some(blob_url)) => StorageConfig { meta_url, blob_url },
         _ => StorageConfig::data_dir(&PathBuf::from(".flux-data"))?,
     };
-    let flux = flux_server::open_with(&cfg, cli.serve.auth).await?;
+    let flux = flux_server::open_with_options(&cfg, cli.serve.auth, cli.serve.signup).await?;
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => {}
         Cmd::Token { user, admin, label } => {

@@ -976,6 +976,21 @@ impl event_service_server::EventService for Services {
 
 #[tonic::async_trait]
 impl auth_service_server::AuthService for Services {
+    async fn login(&self, req: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
+        let client = req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "grpc".into());
+        let req = req.into_inner();
+        // Check the password (throttled), then mint an API token rather
+        // than keeping the session.
+        let (user, session) = self.flux.password_login(&req.login, &req.password, &client).await?;
+        let principal = self.flux.principal(Some(&session)).await?;
+        let scopes = if req.scopes.is_empty() { "all" } else { req.scopes.as_str() };
+        let label = if req.label.is_empty() { "flux CLI" } else { req.label.as_str() };
+        let expires = (req.expires_days > 0).then_some(req.expires_days as i64);
+        let token = self.flux.create_api_token(&principal, label, scopes, expires).await;
+        let _ = self.flux.logout(&session).await;
+        Ok(Response::new(LoginResponse { token: token?, user: user.name }))
+    }
+
     async fn who_am_i(&self, req: Request<WhoAmIRequest>) -> Result<Response<WhoAmIResponse>, Status> {
         let p = self.who(&req).await?;
         Ok(Response::new(WhoAmIResponse {

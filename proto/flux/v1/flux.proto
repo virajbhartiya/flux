@@ -529,9 +529,24 @@ message RepoEvent {
 
 service AuthService {
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // Exchange a username (or email) and password for a new API token.
+  rpc Login(LoginRequest) returns (LoginResponse);
 }
 
 message WhoAmIRequest {}
+
+message LoginRequest {
+  string login = 1;     // username or email
+  string password = 2;
+  string label = 3;     // e.g. "flux CLI on laptop"
+  string scopes = 4;    // read | write | all (default all)
+  uint32 expires_days = 5; // 0 = never
+}
+
+message LoginResponse {
+  string token = 1;
+  string user = 2;
+}
 
 message WhoAmIResponse {
   string user = 1;      // empty = anonymous

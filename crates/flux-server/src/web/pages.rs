@@ -18,7 +18,7 @@ use super::markdown::{self, LinkBase};
 use super::view::{
     self, RepoNav, Tab, avatar, breadcrumbs, empty_state, enc, enc_path, icon, page, person, short, subject, time, url,
 };
-use super::{COOKIE, Req, WebError, WebResult, WebState};
+use super::{Req, WebError, WebResult, WebState};
 use crate::core::{Flux, Loaded};
 use crate::rbac::Role;
 
@@ -221,10 +221,7 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
                         h2 { "All repositories" }
                         div.spacer {}
                         @if req.principal.can_write() {
-                            form.inline-form method="post" action="/-/repos" {
-                                input type="text" name="name" placeholder="new-repository" pattern="[A-Za-z0-9._/-]+" required aria-label="Repository name";
-                                button.btn.primary type="submit" { (icon("plus")) "Create" }
-                            }
+                            a.btn.primary href="/-/new" { (icon("plus")) "New repository" }
                         }
                     }
                     @if cards.is_empty() {
@@ -300,20 +297,6 @@ fn json_response(v: serde_json::Value, cache: &'static str) -> Response {
     r
 }
 
-#[derive(Deserialize)]
-pub struct NewRepoForm {
-    name: String,
-    #[serde(default)]
-    visibility: Option<String>,
-}
-
-pub async fn create_repo(State(web): State<WebState>, req: Req, headers: HeaderMap, Form(f): Form<NewRepoForm>) -> WebResult {
-    check_origin(&headers)?;
-    let visibility = f.visibility.as_deref().map(str::trim).filter(|v| !v.is_empty());
-    web.flux.create_repo_as(&req.principal, f.name.trim(), visibility).await?;
-    Ok(Redirect::to(&view::repo_url(f.name.trim())).into_response())
-}
-
 pub async fn readyz(State(web): State<WebState>) -> Response {
     match web.flux.meta.list_repos().await {
         Ok(_) => "ready".into_response(),
@@ -333,74 +316,7 @@ pub async fn metrics(State(web): State<WebState>) -> Response {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
 }
 
-#[derive(Deserialize)]
-pub struct LoginForm {
-    token: String,
-    #[serde(default)]
-    next: String,
-}
-
-pub async fn login_form(State(web): State<WebState>, req: Req) -> WebResult {
-    let next = query_map(&req.query).remove("next").unwrap_or_else(|| "/".into());
-    let body = html! {
-        div.container.narrow {
-            div.card.login {
-                h1 { "Sign in to flux" }
-                p.muted { "Paste an access token. An admin can create one with " code { "flux-server token --user NAME" } "." }
-                form method="post" action="/-/login" {
-                    input type="hidden" name="next" value=(next);
-                    label { "Token" input type="password" name="token" placeholder="flx_…" autofocus required autocomplete="current-password"; }
-                    button.btn.primary type="submit" { "Sign in" }
-                }
-            }
-        }
-    };
-    Ok(page(&web, &req, "Sign in", None, body))
-}
-
-fn safe_next(next: &str) -> &str {
-    if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\') { next } else { "/" }
-}
-
-pub async fn login(State(web): State<WebState>, headers: HeaderMap, Form(f): Form<LoginForm>) -> WebResult {
-    check_origin(&headers)?;
-    let p = web.flux.principal(Some(&f.token)).await?;
-    if p.user.is_none() {
-        return Err(WebError::Unauthorized("invalid token".into()));
-    }
-    let secure = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
-    let cookie = format!(
-        "{COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",
-        f.token.trim(),
-        if secure { "; Secure" } else { "" }
-    );
-    let mut r = Redirect::to(safe_next(&f.next)).into_response();
-    r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).map_err(|e| WebError::BadRequest(e.to_string()))?);
-    Ok(r)
-}
-
-pub async fn logout(headers: HeaderMap) -> WebResult {
-    check_origin(&headers)?;
-    let mut r = Redirect::to("/").into_response();
-    r.headers_mut()
-        .insert(header::SET_COOKIE, HeaderValue::from_static("flux_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
-    Ok(r)
-}
-
-/// CSRF defence in depth (cookies are SameSite=Lax): POSTs must come from
-/// this origin when the browser says where they came from.
-fn check_origin(headers: &HeaderMap) -> WebResult<()> {
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
-        && origin != "null"
-    {
-        let o = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
-        if o != host {
-            return Err(WebError::Forbidden("cross-origin request".into()));
-        }
-    }
-    Ok(())
-}
+use super::account::check_origin;
 
 // ───────────── repo dispatch ─────────────
 
@@ -421,6 +337,14 @@ fn split_repo(rest: &str) -> (String, Vec<String>) {
 
 pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<String>) -> WebResult {
     let (repo, segs) = split_repo(&rest);
+    // `/{name}` with no such repository: a user or organization page.
+    if segs.is_empty()
+        && !repo.contains('/')
+        && web.flux.repo(&repo).await.is_err()
+        && let Some(r) = super::account::owner_page(&web, &req, &repo).await?
+    {
+        return Ok(r);
+    }
     let ctx = repo_ctx(&web, &req, &repo).await?;
     let Some((action, args)) = segs.split_first() else {
         let rev = ctx.default_branch().map(str::to_string);
@@ -486,6 +410,7 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
             let names: Vec<&str> = ctx.refs.iter().map(|(n, _)| n.as_str()).collect();
             Ok(json_response(serde_json::json!({ "refs": names }), "private, max-age=5"))
         }
+        "settings" if args.first().map(String::as_str) == Some("access") => settings_access(&web, &req, &ctx).await,
         "settings" => settings(&web, &req, &ctx).await,
         "edit" => {
             let (rev, rest) = ctx.split_rev(args);
@@ -2342,7 +2267,8 @@ async fn settings(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
     let body = html! {
         div.container.narrow {
             div.page-head { h1 { "Settings" } p.muted { "Repository details and path permissions." } }
-            @if saved { div.card.cta { div { (icon("check")) " Saved." } } }
+            (settings_tabs(ctx, "general"))
+            @if saved { div.notice.ok { (icon("check")) " Saved." } }
             form.card.form method="post" action=(format!("/{}/-/settings", enc(&ctx.name))) {
                 label { "Description" input type="text" name="description" value=(ctx.config.description) placeholder="What lives in this repository?"; }
                 label { "Default branch"
@@ -2361,6 +2287,41 @@ async fn settings(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
     };
     let n = nav(web, req, ctx, Tab::Settings, &default).await;
     Ok(page(web, req, &format!("Settings · {}", ctx.name), Some(n), body))
+}
+
+fn settings_tabs(ctx: &RepoCtx, active: &str) -> Markup {
+    let base = format!("/{}/-/settings", enc(&ctx.name));
+    html! {
+        nav.filter-tabs.under {
+            a.active[active == "general"] href=(base) { (icon("settings")) "General" }
+            @if ctx.can(Role::Admin) { a.active[active == "access"] href=(format!("{base}/access")) { (icon("people")) "Access" } }
+        }
+    }
+}
+
+async fn settings_access(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
+    ctx.require(Role::Admin)?;
+    let content = super::account::repo_access(web, ctx.id, &ctx.name).await?;
+    let q = query_map(&req.query);
+    let body = html! {
+        div.container.narrow {
+            div.page-head { h1 { "Settings" } p.muted { "Who can see and change " (ctx.name) "." } }
+            (settings_tabs(ctx, "access"))
+            @if let Some(m) = q.get("ok") { div.notice.ok { (icon("check")) (m) } }
+            @if let Some(m) = q.get("err") { div.notice.error { (icon("alert")) (m) } }
+            (content)
+        }
+    };
+    let default = ctx.default_branch().unwrap_or("main").to_string();
+    let n = nav(web, req, ctx, Tab::Settings, &default).await;
+    Ok(page(web, req, &format!("Access · {}", ctx.name), Some(n), body))
+}
+
+/// POST `/{repo}/-/settings/access`.
+pub async fn repo_access_post(web: &WebState, req: &Req, repo: &str, f: &super::account::AccountForm) -> WebResult {
+    let ctx = repo_ctx(web, req, repo).await?;
+    ctx.require(Role::Admin)?;
+    super::account::repo_access_post(web, req, ctx.id, &ctx.name, f).await
 }
 
 /// Edit (or create) a file in the browser.
