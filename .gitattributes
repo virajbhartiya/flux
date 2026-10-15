@@ -1,0 +1,5 @@
+# Byte-exact test vectors and fixtures: never convert line endings.
+* text=auto eol=lf
+testdata/** -text
+*.png binary
+*.woff2 binary
