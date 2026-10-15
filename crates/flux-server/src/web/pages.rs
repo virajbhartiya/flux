@@ -20,6 +20,7 @@ use super::view::{
 };
 use super::{COOKIE, Req, WebError, WebResult, WebState};
 use crate::core::{Flux, Loaded};
+use crate::rbac::Role;
 
 const PAGE_SIZE: usize = 50;
 /// Diff lines rendered per page before files are collapsed.
@@ -82,9 +83,23 @@ struct RepoCtx {
     id: RepoId,
     refs: Arc<Vec<(String, ChangesetId)>>,
     config: Arc<crate::repo_config::RepoConfig>,
+    /// The viewer's role on this repository.
+    role: Role,
 }
 
 impl RepoCtx {
+    fn require(&self, need: Role) -> WebResult<()> {
+        if self.role >= need {
+            Ok(())
+        } else {
+            Err(WebError::Forbidden(format!("this needs {} access to {}", need.as_str(), self.name)))
+        }
+    }
+
+    fn can(&self, need: Role) -> bool {
+        self.role >= need
+    }
+
     fn default_branch(&self) -> Option<&str> {
         if let Some(b) = self.config.default_branch.as_deref()
             && self.is_ref(b)
@@ -119,8 +134,8 @@ impl RepoCtx {
 }
 
 async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
-    req.principal.require_read()?;
     let id = web.flux.repo(name).await?;
+    let role = web.flux.authorize(&req.principal, id, Role::Read).await?;
     let refs = match web.refs.get(&id) {
         Some(r) => r,
         None => {
@@ -132,7 +147,7 @@ async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
         }
     };
     let config = web.flux.repo_config(id).await?;
-    Ok(RepoCtx { name: name.to_string(), id, refs, config })
+    Ok(RepoCtx { name: name.to_string(), id, refs, config, role })
 }
 
 async fn open_reviews(flux: &Flux, repo: RepoId) -> usize {
@@ -169,8 +184,7 @@ fn rev_label(rev: &str) -> String {
 // ───────────── top-level pages ─────────────
 
 pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
-    req.principal.require_read()?;
-    let repos = web.flux.meta.list_repos().await?;
+    let repos = web.flux.readable_repos(&req.principal).await?;
     let mut cards = Vec::new();
     let mut feed: Vec<(String, flux_store::RefLogRow)> = Vec::new();
     for r in &repos {
@@ -206,7 +220,7 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
                     div.page-head.row {
                         h2 { "All repositories" }
                         div.spacer {}
-                        @if req.principal.is_admin() {
+                        @if req.principal.can_write() {
                             form.inline-form method="post" action="/-/repos" {
                                 input type="text" name="name" placeholder="new-repository" pattern="[A-Za-z0-9._/-]+" required aria-label="Repository name";
                                 button.btn.primary type="submit" { (icon("plus")) "Create" }
@@ -275,8 +289,7 @@ pub async fn home(State(web): State<WebState>, req: Req) -> WebResult {
 }
 
 pub async fn repos_json(State(web): State<WebState>, req: Req) -> WebResult {
-    req.principal.require_read()?;
-    let repos: Vec<String> = web.flux.meta.list_repos().await?.into_iter().map(|r| r.name).collect();
+    let repos: Vec<String> = web.flux.readable_repos(&req.principal).await?.into_iter().map(|r| r.name).collect();
     Ok(json_response(serde_json::json!({ "repos": repos }), "private, max-age=10"))
 }
 
@@ -290,12 +303,14 @@ fn json_response(v: serde_json::Value, cache: &'static str) -> Response {
 #[derive(Deserialize)]
 pub struct NewRepoForm {
     name: String,
+    #[serde(default)]
+    visibility: Option<String>,
 }
 
 pub async fn create_repo(State(web): State<WebState>, req: Req, headers: HeaderMap, Form(f): Form<NewRepoForm>) -> WebResult {
     check_origin(&headers)?;
-    req.principal.require_admin()?;
-    web.flux.create_repo(f.name.trim()).await?;
+    let visibility = f.visibility.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    web.flux.create_repo_as(&req.principal, f.name.trim(), visibility).await?;
     Ok(Redirect::to(&view::repo_url(f.name.trim())).into_response())
 }
 
@@ -512,7 +527,7 @@ async fn nav<'a>(web: &WebState, req: &Req, ctx: &'a RepoCtx, tab: Tab, rev: &'a
         changesets,
         branches: ctx.refs.len(),
         origin: req.origin.clone(),
-        is_admin: req.principal.is_admin(),
+        is_admin: ctx.can(Role::Maintain),
     }
 }
 
@@ -646,7 +661,7 @@ async fn tree(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Option<
             div.spacer {}
             span.muted.small.hide-sm { (view::count(total_files)) " files · " (view::size(t.total_size())) }
             button.btn.small type="button" data-palette-files title="Go to file (t)" { (icon("file")) "Go to file" kbd { "t" } }
-            @if req.principal.can_write() {
+            @if ctx.can(Role::Write) {
                 a.btn.small href=(url(&ctx.name, "new", rev, path.as_ref())) { (icon("plus")) "Add file" }
             }
         }
@@ -953,7 +968,7 @@ async fn blob(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoPa
                         }
                     }
                     a.btn.small href=(raw_url) { (icon("raw")) "Raw" }
-                    @if req.principal.can_write() && editable {
+                    @if ctx.can(Role::Write) && editable {
                         a.btn.small href=(url(&ctx.name, "edit", rev, Some(path))) { (icon("edit")) "Edit" }
                     }
                     a.btn.small href=(url(&ctx.name, "blame", rev, Some(path))) { (icon("blame")) "Blame" }
@@ -1634,7 +1649,7 @@ async fn compare(web: &WebState, req: &Req, ctx: &RepoCtx, spec: &str) -> WebRes
         }
         None => vec![],
     };
-    let can_write = req.principal.can_write();
+    let can_write = ctx.can(Role::Write);
     let body = html! {
         div.container {
             div.page-head {
@@ -1958,7 +1973,7 @@ async fn reviews(web: &WebState, req: &Req, ctx: &RepoCtx, state: &str) -> WebRe
             div.page-head.row {
                 h1 { "Reviews" }
                 div.spacer {}
-                @if req.principal.can_write() {
+                @if ctx.can(Role::Write) {
                     a.btn.primary href=(format!("/{}/-/reviews/new", enc(&ctx.name))) { (icon("review")) "New review" }
                 }
             }
@@ -1992,7 +2007,7 @@ async fn reviews(web: &WebState, req: &Req, ctx: &RepoCtx, state: &str) -> WebRe
 }
 
 async fn new_review(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String, String>) -> WebResult {
-    req.principal.require_write()?;
+    ctx.require(Role::Write)?;
     let head = q.get("head").cloned().unwrap_or_default();
     let target = q.get("target").cloned().unwrap_or_else(|| ctx.default_branch().unwrap_or("main").to_string());
     // Prefill the title from the head's message.
@@ -2028,7 +2043,7 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
     let d = flux.review_detail(ctx.id, number).await?;
     let r = &d.review;
     let target = String::from_utf8_lossy(&r.target).into_owned();
-    let can_write = req.principal.can_write();
+    let can_write = ctx.can(Role::Write);
     // Land readiness.
     let status: Option<(bool, usize, usize)> = match (r.state.as_str(), d.target_head) {
         ("open", Some(h)) => {
@@ -2237,12 +2252,12 @@ pub async fn repo_post(
     check_origin(&headers)?;
     let (repo, segs) = split_repo(&rest);
     let ctx = repo_ctx(&web, &req, &repo).await?;
-    req.principal.require_write()?;
     let actor = req.principal.name().to_string();
     let flux = &web.flux;
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     match segs.as_slice() {
         ["reviews"] => {
+            ctx.require(Role::Write)?;
             let head = flux.resolve_rev(ctx.id, f.head.trim()).await?;
             let target = if f.target.trim().is_empty() {
                 ctx.default_branch().unwrap_or("main").to_string()
@@ -2253,6 +2268,7 @@ pub async fn repo_post(
             Ok(Redirect::to(&format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)).into_response())
         }
         ["reviews", n, "land"] => {
+            ctx.require(Role::Write)?;
             let n = parse_num(n)?;
             let rv = flux.review(ctx.id, n).await?;
             flux.check_land_paths(ctx.id, &req.principal, &rv.head, &rv.target).await?;
@@ -2260,6 +2276,7 @@ pub async fn repo_post(
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
         ["reviews", n, "comment"] if !f.path.is_empty() => {
+            ctx.require(Role::Read)?;
             let n = parse_num(n)?;
             let line: i64 = f.line.trim().parse().map_err(|_| WebError::BadRequest("bad line".into()))?;
             flux.comment_review_at(ctx.id, n, &actor, &f.body, f.path.trim().as_bytes(), line).await?;
@@ -2267,15 +2284,18 @@ pub async fn repo_post(
         }
         ["reviews", n, action @ ("comment" | "approve" | "close" | "reopen")] => {
             let n = parse_num(n)?;
+            let author = flux.review(ctx.id, n).await?.author == actor;
+            ctx.require(crate::rbac::review_action_role(action, author))?;
             flux.update_review(ctx.id, n, action, &actor, &f.body, None).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
         ["edit"] => {
+            ctx.require(Role::Write)?;
             flux.check_write_paths(ctx.id, &req.principal, vec![f.path.trim().trim_matches('/').as_bytes().to_vec()]).await?;
             save_edit(&web, &ctx, &actor, f).await
         }
         ["settings"] => {
-            req.principal.require_admin()?;
+            ctx.require(Role::Maintain)?;
             let mut acl = Vec::new();
             for line in f.acl.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
                 let parts: Vec<&str> = line.split('|').map(str::trim).collect();
@@ -2296,7 +2316,12 @@ pub async fn repo_post(
                 default_branch: Some(f.default_branch.trim().to_string()).filter(|b| !b.is_empty()),
                 acl,
             };
+            // Path rules are access control: admins only.
+            if cfg.acl != ctx.config.acl {
+                ctx.require(Role::Admin)?;
+            }
             flux.set_repo_config(ctx.id, &cfg).await?;
+            flux.audit(&req.principal, "repo.settings", &ctx.name, "").await;
             Ok(Redirect::to(&format!("/{}/-/settings?saved=1", enc(&ctx.name))).into_response())
         }
         _ => Err(WebError::NotFound("no such action".into())),
@@ -2304,7 +2329,7 @@ pub async fn repo_post(
 }
 
 async fn settings(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
-    req.principal.require_admin()?;
+    ctx.require(Role::Maintain)?;
     let saved = query_map(&req.query).contains_key("saved");
     let acl_text: String = ctx
         .config
@@ -2347,7 +2372,7 @@ async fn edit_form(
     path: Option<&RepoPath>,
     dir: Option<&RepoPath>,
 ) -> WebResult {
-    req.principal.require_write()?;
+    ctx.require(Role::Write)?;
     let flux = &web.flux;
     let cs = flux.resolve_rev(ctx.id, rev).await?;
     let content = match path {

@@ -165,3 +165,75 @@ async fn derived_content_git() {
         assert_eq!(s.cs_to_git(repo, &[a]).await.unwrap(), vec![Some([7; 20])]);
     }
 }
+
+#[tokio::test]
+async fn accounts_orgs_teams_and_grants() {
+    for (name, s) in backends().await {
+        let alice = s
+            .create_account(&NewAccount {
+                name: "alice".into(),
+                email: Some("alice@example.com".into()),
+                display_name: "Alice".into(),
+                password_hash: Some("$argon2id$x".into()),
+                is_admin: false,
+            })
+            .await
+            .unwrap();
+        let bob = s.create_account(&NewAccount { name: "bob".into(), ..Default::default() }).await.unwrap();
+        assert!(s.create_account(&NewAccount { name: "alice".into(), ..Default::default() }).await.is_err(), "{name}: dup name");
+        let dup_email = NewAccount { name: "carol".into(), email: Some("alice@example.com".into()), ..Default::default() };
+        assert!(matches!(s.create_account(&dup_email).await, Err(StoreError::Conflict(_))), "{name}: dup email");
+        let (acct, hash) = s.get_account("alice@example.com").await.unwrap().unwrap();
+        assert_eq!((acct.user.id, acct.display_name.as_str(), hash.as_deref()), (alice.id, "Alice", Some("$argon2id$x")));
+        assert_eq!(s.user_count().await.unwrap(), 2);
+
+        // Tokens: expiry, disabled accounts, listing and revocation by id.
+        let (t1, t2) = ([1u8; 32], [2u8; 32]);
+        s.add_token_ext(alice.id, &t1, "laptop", "api", "read", None).await.unwrap();
+        s.add_token_ext(alice.id, &t2, "web", "session", "all", Some(1_000)).await.unwrap();
+        assert_eq!(s.token_auth(&t1, 5_000).await.unwrap().unwrap().scopes, "read");
+        assert!(s.token_auth(&t2, 5_000).await.unwrap().is_none(), "{name}: expired");
+        assert!(s.token_auth(&t2, 500).await.unwrap().is_some());
+        s.update_account(alice.id, &AccountUpdate { disabled: Some(true), ..Default::default() }).await.unwrap();
+        assert!(s.token_auth(&t1, 5_000).await.unwrap().is_none(), "{name}: disabled account");
+        s.update_account(alice.id, &AccountUpdate { disabled: Some(false), ..Default::default() }).await.unwrap();
+        let toks = s.list_tokens(alice.id).await.unwrap();
+        assert_eq!(toks.len(), 2);
+        let laptop = toks.iter().find(|t| t.label == "laptop").unwrap();
+        assert!(s.revoke_token(alice.id, &laptop.id).await.unwrap());
+        assert!(!s.revoke_token(bob.id, &toks[0].id).await.unwrap(), "{name}: other users' tokens are untouchable");
+
+        // Organizations share the user namespace.
+        assert!(matches!(s.create_org("bob", "", alice.id).await, Err(StoreError::Conflict(_))));
+        let acme = s.create_org("acme", "Acme Inc", alice.id).await.unwrap();
+        assert!(s.create_account(&NewAccount { name: "acme".into(), ..Default::default() }).await.is_err());
+        s.set_org_member(acme.id, bob.id, Some("member")).await.unwrap();
+        assert_eq!(s.org_members(acme.id).await.unwrap().len(), 2);
+        assert_eq!(s.orgs_of_user(bob.id).await.unwrap()[0].1, "member");
+
+        // Repositories, teams and grants.
+        let repo = s.create_repo_owned("acme/api", "org", acme.id, "private", "none").await.unwrap();
+        let access = s.repo_access(repo).await.unwrap().unwrap();
+        assert_eq!((access.owner_kind.as_str(), access.visibility.as_str()), ("org", "private"));
+        let facts = s.authz_facts(repo, bob.id).await.unwrap();
+        assert_eq!((facts.org_role.as_deref(), facts.org_base_role.as_deref()), (Some("member"), Some("read")));
+        assert!(facts.grants.is_empty());
+        let team = s.create_team(acme.id, "backend", "").await.unwrap();
+        s.set_team_member(team.id, bob.id, true).await.unwrap();
+        s.set_repo_grant(repo, "team", team.id, Some("write")).await.unwrap();
+        s.set_repo_grant(repo, "user", bob.id, Some("triage")).await.unwrap();
+        let mut g = s.authz_facts(repo, bob.id).await.unwrap().grants;
+        g.sort();
+        assert_eq!(g, vec!["triage".to_string(), "write".to_string()]);
+        assert_eq!(s.repo_grants(repo).await.unwrap().len(), 2);
+        // Leaving the org drops team membership too.
+        s.set_org_member(acme.id, bob.id, None).await.unwrap();
+        let facts = s.authz_facts(repo, bob.id).await.unwrap();
+        assert_eq!((facts.org_role, facts.grants), (None, vec!["triage".to_string()]));
+        s.delete_team(team.id).await.unwrap();
+        assert!(s.list_teams(acme.id).await.unwrap().is_empty());
+
+        s.audit_append("alice", "org.create", "acme", "").await.unwrap();
+        assert_eq!(s.audit_list(None, 10).await.unwrap()[0].action, "org.create");
+    }
+}

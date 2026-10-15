@@ -223,7 +223,7 @@ impl FromRequestParts<WebState> for Req {
         let principal = match web.flux.principal(token.as_deref()).await {
             Ok(p) => p,
             // A stale cookie shouldn't lock anyone out: treat as anonymous.
-            Err(_) => Principal { user: None, mode: web.flux.auth_mode },
+            Err(_) => Principal { user: None, mode: web.flux.auth_mode, ..Default::default() },
         };
         let host = parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
         let scheme = parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");

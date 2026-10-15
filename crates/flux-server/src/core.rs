@@ -35,6 +35,7 @@ impl From<StoreError> for FluxError {
         match e {
             StoreError::RepoNotFound(r) => FluxError::NotFound(format!("repository {r:?} not found")),
             StoreError::RepoExists(r) => FluxError::AlreadyExists(format!("repository {r:?} already exists")),
+            StoreError::Conflict(m) => FluxError::AlreadyExists(m),
             other => FluxError::Internal(other.into()),
         }
     }
@@ -116,7 +117,14 @@ pub struct Flux {
     pub(crate) repo_configs: moka::sync::Cache<RepoId, Arc<crate::repo_config::RepoConfig>>,
     pub(crate) git: Arc<crate::git::objects::GitCaches>,
     pub auth_mode: crate::auth::AuthMode,
-    pub(crate) token_cache: moka::sync::Cache<[u8; 32], flux_store::User>,
+    /// Who may create accounts (the first account is always allowed).
+    pub signup: crate::identity::SignupPolicy,
+    pub(crate) token_cache: moka::sync::Cache<[u8; 32], flux_store::TokenAuth>,
+    /// Effective roles by (user id or 0, repository); see `rbac`.
+    pub(crate) role_cache: moka::sync::Cache<(i64, RepoId), crate::rbac::Role>,
+    pub(crate) access_cache: moka::sync::Cache<RepoId, Arc<flux_store::RepoAccess>>,
+    /// Recent failed sign-ins by account name and by client, for throttling.
+    pub(crate) login_failures: moka::sync::Cache<String, u32>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
 }
 
@@ -146,15 +154,33 @@ impl Flux {
                 .max_capacity(10_000)
                 .build(),
             auth_mode: crate::auth::AuthMode::Open,
+            signup: Default::default(),
             token_cache: moka::sync::Cache::builder()
-                .max_capacity(10_000)
+                .max_capacity(100_000)
                 .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            role_cache: moka::sync::Cache::builder()
+                .max_capacity(1_000_000)
+                .time_to_live(std::time::Duration::from_secs(300))
+                .build(),
+            access_cache: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(std::time::Duration::from_secs(300))
+                .build(),
+            login_failures: moka::sync::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(std::time::Duration::from_secs(900))
                 .build(),
             file_lists: moka::sync::Cache::builder()
                 .weigher(|_, l: &crate::search::FileList| (l.len() * 80 + 64) as u32)
                 .max_capacity(256 << 20)
                 .build(),
         }
+    }
+
+    pub fn with_signup(mut self, signup: crate::identity::SignupPolicy) -> Self {
+        self.signup = signup;
+        self
     }
 
     pub fn with_auth_mode(mut self, mode: crate::auth::AuthMode) -> Self {

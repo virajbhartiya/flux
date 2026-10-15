@@ -48,10 +48,20 @@ impl AuthMode {
 }
 
 /// Who is making a request. `user = None` is anonymous.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Principal {
     pub user: Option<User>,
     pub mode: AuthMode,
+    /// Token scopes (`all` for sessions and unrestricted tokens).
+    pub scopes: String,
+    /// `api` or `session`.
+    pub kind: String,
+}
+
+impl Default for Principal {
+    fn default() -> Self {
+        Self { user: None, mode: AuthMode::Open, scopes: "all".into(), kind: "api".into() }
+    }
 }
 
 impl Principal {
@@ -90,6 +100,10 @@ impl Principal {
     }
 }
 
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
 pub fn hash_token(token: &str) -> [u8; 32] {
     sha2::Sha256::digest(token.trim().as_bytes()).into()
 }
@@ -107,19 +121,25 @@ impl Flux {
     pub async fn principal(&self, token: Option<&str>) -> FluxResult<Principal> {
         let mode = self.auth_mode;
         let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
-            return Ok(Principal { user: None, mode });
+            return Ok(Principal { user: None, mode, ..Default::default() });
         };
         let h = hash_token(token);
-        if let Some(u) = self.token_cache.get(&h) {
-            return Ok(Principal { user: Some(u), mode });
-        }
-        match self.meta.user_for_token(&h).await? {
-            Some(u) => {
-                self.token_cache.insert(h, u.clone());
-                Ok(Principal { user: Some(u), mode })
+        let auth = match self.token_cache.get(&h) {
+            Some(a) => a,
+            None => {
+                let now = now_ms();
+                let a = self
+                    .meta
+                    .token_auth(&h, now)
+                    .await?
+                    .ok_or_else(|| FluxError::Unauthenticated("invalid, expired or revoked token".into()))?;
+                // Cached for a minute; `last used` is recorded on cache misses.
+                let _ = self.meta.touch_token(&h, now).await;
+                self.token_cache.insert(h, a.clone());
+                a
             }
-            None => Err(FluxError::Unauthenticated("invalid or revoked token".into())),
-        }
+        };
+        Ok(Principal { user: Some(auth.user), mode, scopes: auth.scopes, kind: auth.kind })
     }
 
     /// Create a user (if needed) and issue a token for them.

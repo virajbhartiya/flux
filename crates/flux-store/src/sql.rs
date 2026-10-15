@@ -101,6 +101,39 @@ fn ordered<K: std::hash::Hash + Eq, V: Clone>(keys: &[K], map: &std::collections
     keys.iter().map(|k| map.get(k).cloned()).collect()
 }
 
+fn account<R: sqlx::Row>(r: &R) -> StoreResult<Account>
+where
+    usize: sqlx::ColumnIndex<R>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> bool: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    Ok(Account {
+        user: User { id: r.try_get(0)?, name: r.try_get(1)?, is_admin: r.try_get(2)? },
+        email: r.try_get(3)?,
+        display_name: r.try_get(4)?,
+        disabled: r.try_get(5)?,
+        created_at: r.try_get(6)?,
+    })
+}
+
+fn org<R: sqlx::Row>(r: &R, o: usize) -> StoreResult<Org>
+where
+    usize: sqlx::ColumnIndex<R>,
+    for<'a> i64: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    Ok(Org {
+        id: r.try_get(o)?,
+        name: r.try_get(o + 1)?,
+        display_name: r.try_get(o + 2)?,
+        description: r.try_get(o + 3)?,
+        base_role: r.try_get(o + 4)?,
+        created_at: r.try_get(o + 5)?,
+    })
+}
+
 macro_rules! sql_store {
     ($name:ident, $pool:ty) => {
         #[derive(Clone)]
@@ -860,6 +893,512 @@ macro_rules! sql_store {
 
             async fn revoke_tokens(&self, user_id: i64) -> StoreResult<u64> {
                 Ok(sqlx::query("DELETE FROM tokens WHERE user_id = $1").bind(user_id).execute(&self.pool).await?.rows_affected())
+            }
+
+            async fn create_account(&self, a: &NewAccount) -> StoreResult<User> {
+                let mut tx = self.pool.begin().await?;
+                let taken: Option<i64> = sqlx::query_scalar("SELECT org_id FROM orgs WHERE name = $1").bind(&a.name).fetch_optional(&mut *tx).await?;
+                if taken.is_some() {
+                    return Err(StoreError::Conflict(format!("the name {:?} is taken", a.name)));
+                }
+                if let Some(email) = &a.email {
+                    let used: Option<i64> =
+                        sqlx::query_scalar("SELECT user_id FROM users WHERE email = $1").bind(email).fetch_optional(&mut *tx).await?;
+                    if used.is_some() {
+                        return Err(StoreError::Conflict("an account with that email already exists".into()));
+                    }
+                }
+                let row = sqlx::query(
+                    "INSERT INTO users (name, is_admin, created_at, email, display_name, password_hash) VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (name) DO NOTHING RETURNING user_id",
+                )
+                .bind(&a.name)
+                .bind(a.is_admin)
+                .bind(now_ms())
+                .bind(&a.email)
+                .bind(&a.display_name)
+                .bind(&a.password_hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(r) = row else { return Err(StoreError::Conflict(format!("the name {:?} is taken", a.name))) };
+                tx.commit().await?;
+                Ok(User { id: r.try_get(0)?, name: a.name.clone(), is_admin: a.is_admin })
+            }
+
+            async fn get_account(&self, name_or_email: &str) -> StoreResult<Option<(Account, Option<String>)>> {
+                let row = sqlx::query(
+                    "SELECT user_id, name, is_admin, email, display_name, disabled, created_at, password_hash FROM users \
+                     WHERE name = $1 OR email = $1 ORDER BY (name = $1) DESC LIMIT 1",
+                )
+                .bind(name_or_email)
+                .fetch_optional(&self.pool)
+                .await?;
+                row.map(|r| Ok((account(&r)?, r.try_get(7)?))).transpose()
+            }
+
+            async fn get_account_by_id(&self, user_id: i64) -> StoreResult<Option<Account>> {
+                let row = sqlx::query("SELECT user_id, name, is_admin, email, display_name, disabled, created_at FROM users WHERE user_id = $1")
+                    .bind(user_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| account(&r)).transpose()
+            }
+
+            async fn update_account(&self, user_id: i64, u: &AccountUpdate) -> StoreResult<()> {
+                let mut tx = self.pool.begin().await?;
+                if let Some(d) = &u.display_name {
+                    sqlx::query("UPDATE users SET display_name = $1 WHERE user_id = $2").bind(d).bind(user_id).execute(&mut *tx).await?;
+                }
+                if let Some(e) = &u.email {
+                    if let Some(email) = e {
+                        let used: Option<i64> = sqlx::query_scalar("SELECT user_id FROM users WHERE email = $1 AND user_id <> $2")
+                            .bind(email)
+                            .bind(user_id)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        if used.is_some() {
+                            return Err(StoreError::Conflict("an account with that email already exists".into()));
+                        }
+                    }
+                    sqlx::query("UPDATE users SET email = $1 WHERE user_id = $2").bind(e).bind(user_id).execute(&mut *tx).await?;
+                }
+                if let Some(p) = &u.password_hash {
+                    sqlx::query("UPDATE users SET password_hash = $1 WHERE user_id = $2").bind(p).bind(user_id).execute(&mut *tx).await?;
+                }
+                if let Some(a) = u.is_admin {
+                    sqlx::query("UPDATE users SET is_admin = $1 WHERE user_id = $2").bind(a).bind(user_id).execute(&mut *tx).await?;
+                }
+                if let Some(d) = u.disabled {
+                    sqlx::query("UPDATE users SET disabled = $1 WHERE user_id = $2").bind(d).bind(user_id).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+
+            async fn list_accounts(&self) -> StoreResult<Vec<Account>> {
+                let rows = sqlx::query("SELECT user_id, name, is_admin, email, display_name, disabled, created_at FROM users ORDER BY name")
+                    .fetch_all(&self.pool)
+                    .await?;
+                rows.iter().map(account).collect()
+            }
+
+            async fn user_count(&self) -> StoreResult<i64> {
+                Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&self.pool).await?)
+            }
+
+            async fn add_token_ext(
+                &self,
+                user_id: i64,
+                token_hash: &[u8; 32],
+                label: &str,
+                kind: &str,
+                scopes: &str,
+                expires_at: Option<i64>,
+            ) -> StoreResult<()> {
+                sqlx::query(
+                    "INSERT INTO tokens (token_hash, user_id, label, created_at, kind, scopes, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(token_hash.as_slice())
+                .bind(user_id)
+                .bind(label)
+                .bind(now_ms())
+                .bind(kind)
+                .bind(scopes)
+                .bind(expires_at)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+
+            async fn token_auth(&self, token_hash: &[u8; 32], now: i64) -> StoreResult<Option<TokenAuth>> {
+                let row = sqlx::query(
+                    "SELECT u.user_id, u.name, u.is_admin, t.kind, t.scopes FROM tokens t JOIN users u ON u.user_id = t.user_id \
+                     WHERE t.token_hash = $1 AND (t.expires_at IS NULL OR t.expires_at > $2) AND u.disabled = $3",
+                )
+                .bind(token_hash.as_slice())
+                .bind(now)
+                .bind(false)
+                .fetch_optional(&self.pool)
+                .await?;
+                row.map(|r| {
+                    Ok(TokenAuth {
+                        user: User { id: r.try_get(0)?, name: r.try_get(1)?, is_admin: r.try_get(2)? },
+                        kind: r.try_get(3)?,
+                        scopes: r.try_get(4)?,
+                    })
+                })
+                .transpose()
+            }
+
+            async fn touch_token(&self, token_hash: &[u8; 32], now: i64) -> StoreResult<()> {
+                sqlx::query("UPDATE tokens SET last_used = $1 WHERE token_hash = $2").bind(now).bind(token_hash.as_slice()).execute(&self.pool).await?;
+                Ok(())
+            }
+
+            async fn list_tokens(&self, user_id: i64) -> StoreResult<Vec<TokenInfo>> {
+                let rows = sqlx::query(
+                    "SELECT token_hash, label, kind, scopes, created_at, expires_at, last_used FROM tokens WHERE user_id = $1 ORDER BY created_at DESC",
+                )
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|r| {
+                        let h: &[u8] = r.try_get(0)?;
+                        Ok(TokenInfo {
+                            id: hex::encode(&h[..8.min(h.len())]),
+                            label: r.try_get(1)?,
+                            kind: r.try_get(2)?,
+                            scopes: r.try_get(3)?,
+                            created_at: r.try_get(4)?,
+                            expires_at: r.try_get(5)?,
+                            last_used: r.try_get(6)?,
+                        })
+                    })
+                    .collect()
+            }
+
+            async fn revoke_token(&self, user_id: i64, id: &str) -> StoreResult<bool> {
+                let hashes: Vec<Vec<u8>> =
+                    sqlx::query_scalar("SELECT token_hash FROM tokens WHERE user_id = $1").bind(user_id).fetch_all(&self.pool).await?;
+                for h in hashes {
+                    if hex::encode(&h[..8.min(h.len())]) == id {
+                        sqlx::query("DELETE FROM tokens WHERE token_hash = $1").bind(&h).execute(&self.pool).await?;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+
+            async fn revoke_token_hash(&self, token_hash: &[u8; 32]) -> StoreResult<()> {
+                sqlx::query("DELETE FROM tokens WHERE token_hash = $1").bind(token_hash.as_slice()).execute(&self.pool).await?;
+                Ok(())
+            }
+
+            async fn create_org(&self, name: &str, display_name: &str, owner_user_id: i64) -> StoreResult<Org> {
+                let mut tx = self.pool.begin().await?;
+                let taken: Option<i64> = sqlx::query_scalar("SELECT user_id FROM users WHERE name = $1").bind(name).fetch_optional(&mut *tx).await?;
+                if taken.is_some() {
+                    return Err(StoreError::Conflict(format!("the name {name:?} is taken")));
+                }
+                let now = now_ms();
+                let row = sqlx::query(
+                    "INSERT INTO orgs (name, display_name, created_at) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING RETURNING org_id",
+                )
+                .bind(name)
+                .bind(display_name)
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(r) = row else { return Err(StoreError::Conflict(format!("the name {name:?} is taken"))) };
+                let id: i64 = r.try_get(0)?;
+                sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'owner')")
+                    .bind(id)
+                    .bind(owner_user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                Ok(Org {
+                    id,
+                    name: name.to_string(),
+                    display_name: display_name.to_string(),
+                    description: String::new(),
+                    base_role: "read".into(),
+                    created_at: now,
+                })
+            }
+
+            async fn get_org(&self, name: &str) -> StoreResult<Option<Org>> {
+                let row = sqlx::query("SELECT org_id, name, display_name, description, base_role, created_at FROM orgs WHERE name = $1")
+                    .bind(name)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| org(&r, 0)).transpose()
+            }
+
+            async fn get_org_by_id(&self, org_id: i64) -> StoreResult<Option<Org>> {
+                let row = sqlx::query("SELECT org_id, name, display_name, description, base_role, created_at FROM orgs WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| org(&r, 0)).transpose()
+            }
+
+            async fn list_orgs(&self) -> StoreResult<Vec<Org>> {
+                let rows = sqlx::query("SELECT org_id, name, display_name, description, base_role, created_at FROM orgs ORDER BY name")
+                    .fetch_all(&self.pool)
+                    .await?;
+                rows.iter().map(|r| org(r, 0)).collect()
+            }
+
+            async fn orgs_of_user(&self, user_id: i64) -> StoreResult<Vec<(Org, String)>> {
+                let rows = sqlx::query(
+                    "SELECT o.org_id, o.name, o.display_name, o.description, o.base_role, o.created_at, m.role FROM orgs o \
+                     JOIN org_members m ON m.org_id = o.org_id WHERE m.user_id = $1 ORDER BY o.name",
+                )
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.iter().map(|r| Ok((org(r, 0)?, r.try_get(6)?))).collect()
+            }
+
+            async fn update_org(&self, org_id: i64, display_name: &str, description: &str, base_role: &str) -> StoreResult<()> {
+                sqlx::query("UPDATE orgs SET display_name = $1, description = $2, base_role = $3 WHERE org_id = $4")
+                    .bind(display_name)
+                    .bind(description)
+                    .bind(base_role)
+                    .bind(org_id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            }
+
+            async fn org_members(&self, org_id: i64) -> StoreResult<Vec<(User, String)>> {
+                let rows = sqlx::query(
+                    "SELECT u.user_id, u.name, u.is_admin, m.role FROM org_members m JOIN users u ON u.user_id = m.user_id \
+                     WHERE m.org_id = $1 ORDER BY u.name",
+                )
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|r| Ok((User { id: r.try_get(0)?, name: r.try_get(1)?, is_admin: r.try_get(2)? }, r.try_get(3)?)))
+                    .collect()
+            }
+
+            async fn set_org_member(&self, org_id: i64, user_id: i64, role: Option<&str>) -> StoreResult<()> {
+                let mut tx = self.pool.begin().await?;
+                match role {
+                    Some(role) => {
+                        sqlx::query(
+                            "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3) \
+                             ON CONFLICT (org_id, user_id) DO UPDATE SET role = excluded.role",
+                        )
+                        .bind(org_id)
+                        .bind(user_id)
+                        .bind(role)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    None => {
+                        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2").bind(org_id).bind(user_id).execute(&mut *tx).await?;
+                        sqlx::query("DELETE FROM team_members WHERE user_id = $1 AND team_id IN (SELECT team_id FROM teams WHERE org_id = $2)")
+                            .bind(user_id)
+                            .bind(org_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+
+            async fn create_team(&self, org_id: i64, name: &str, description: &str) -> StoreResult<Team> {
+                let row = sqlx::query(
+                    "INSERT INTO teams (org_id, name, description, created_at) VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (org_id, name) DO NOTHING RETURNING team_id",
+                )
+                .bind(org_id)
+                .bind(name)
+                .bind(description)
+                .bind(now_ms())
+                .fetch_optional(&self.pool)
+                .await?;
+                let Some(r) = row else { return Err(StoreError::Conflict(format!("a team named {name:?} already exists"))) };
+                Ok(Team { id: r.try_get(0)?, org_id, name: name.to_string(), description: description.to_string() })
+            }
+
+            async fn delete_team(&self, team_id: i64) -> StoreResult<()> {
+                let mut tx = self.pool.begin().await?;
+                sqlx::query("DELETE FROM team_members WHERE team_id = $1").bind(team_id).execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM repo_grants WHERE kind = 'team' AND subject_id = $1").bind(team_id).execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM teams WHERE team_id = $1").bind(team_id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                Ok(())
+            }
+
+            async fn list_teams(&self, org_id: i64) -> StoreResult<Vec<Team>> {
+                let rows = sqlx::query("SELECT team_id, org_id, name, description FROM teams WHERE org_id = $1 ORDER BY name")
+                    .bind(org_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                rows.into_iter()
+                    .map(|r| Ok(Team { id: r.try_get(0)?, org_id: r.try_get(1)?, name: r.try_get(2)?, description: r.try_get(3)? }))
+                    .collect()
+            }
+
+            async fn team_members(&self, team_id: i64) -> StoreResult<Vec<User>> {
+                let rows = sqlx::query(
+                    "SELECT u.user_id, u.name, u.is_admin FROM team_members m JOIN users u ON u.user_id = m.user_id WHERE m.team_id = $1 ORDER BY u.name",
+                )
+                .bind(team_id)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter().map(|r| Ok(User { id: r.try_get(0)?, name: r.try_get(1)?, is_admin: r.try_get(2)? })).collect()
+            }
+
+            async fn set_team_member(&self, team_id: i64, user_id: i64, member: bool) -> StoreResult<()> {
+                let q = if member {
+                    "INSERT INTO team_members (team_id, user_id) VALUES ($1, $2) ON CONFLICT (team_id, user_id) DO NOTHING"
+                } else {
+                    "DELETE FROM team_members WHERE team_id = $1 AND user_id = $2"
+                };
+                sqlx::query(q).bind(team_id).bind(user_id).execute(&self.pool).await?;
+                Ok(())
+            }
+
+            async fn create_repo_owned(
+                &self,
+                name: &str,
+                owner_kind: &str,
+                owner_id: i64,
+                visibility: &str,
+                signed_in_role: &str,
+            ) -> StoreResult<RepoId> {
+                let row = sqlx::query(
+                    "INSERT INTO repos (name, config, created_at, owner_kind, owner_id, visibility, signed_in_role) \
+                     VALUES ($1, '{}', $2, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING RETURNING repo_id",
+                )
+                .bind(name)
+                .bind(now_ms())
+                .bind(owner_kind)
+                .bind(owner_id)
+                .bind(visibility)
+                .bind(signed_in_role)
+                .fetch_optional(&self.pool)
+                .await?;
+                match row {
+                    Some(r) => Ok(RepoId(r.try_get::<i64, _>(0)?)),
+                    None => Err(StoreError::RepoExists(name.to_string())),
+                }
+            }
+
+            async fn repo_access(&self, repo: RepoId) -> StoreResult<Option<RepoAccess>> {
+                let row = sqlx::query("SELECT owner_kind, owner_id, visibility, signed_in_role FROM repos WHERE repo_id = $1")
+                    .bind(repo.0)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| {
+                    Ok(RepoAccess { owner_kind: r.try_get(0)?, owner_id: r.try_get(1)?, visibility: r.try_get(2)?, signed_in_role: r.try_get(3)? })
+                })
+                .transpose()
+            }
+
+            async fn set_repo_visibility(&self, repo: RepoId, visibility: &str, signed_in_role: &str) -> StoreResult<()> {
+                sqlx::query("UPDATE repos SET visibility = $1, signed_in_role = $2 WHERE repo_id = $3")
+                    .bind(visibility)
+                    .bind(signed_in_role)
+                    .bind(repo.0)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            }
+
+            async fn set_repo_grant(&self, repo: RepoId, kind: &str, subject_id: i64, role: Option<&str>) -> StoreResult<()> {
+                match role {
+                    Some(role) => {
+                        sqlx::query(
+                            "INSERT INTO repo_grants (repo_id, kind, subject_id, role) VALUES ($1, $2, $3, $4) \
+                             ON CONFLICT (repo_id, kind, subject_id) DO UPDATE SET role = excluded.role",
+                        )
+                        .bind(repo.0)
+                        .bind(kind)
+                        .bind(subject_id)
+                        .bind(role)
+                        .execute(&self.pool)
+                        .await?;
+                    }
+                    None => {
+                        sqlx::query("DELETE FROM repo_grants WHERE repo_id = $1 AND kind = $2 AND subject_id = $3")
+                            .bind(repo.0)
+                            .bind(kind)
+                            .bind(subject_id)
+                            .execute(&self.pool)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+
+            async fn repo_grants(&self, repo: RepoId) -> StoreResult<Vec<Grant>> {
+                let rows = sqlx::query(
+                    "SELECT g.kind, g.subject_id, COALESCE(u.name, t.name, ''), g.role FROM repo_grants g \
+                     LEFT JOIN users u ON g.kind = 'user' AND u.user_id = g.subject_id \
+                     LEFT JOIN teams t ON g.kind = 'team' AND t.team_id = g.subject_id \
+                     WHERE g.repo_id = $1 ORDER BY g.kind, 3",
+                )
+                .bind(repo.0)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|r| Ok(Grant { kind: r.try_get(0)?, subject_id: r.try_get(1)?, subject_name: r.try_get(2)?, role: r.try_get(3)? }))
+                    .collect()
+            }
+
+            async fn team_repos(&self, team_id: i64) -> StoreResult<Vec<(RepoId, String)>> {
+                let rows = sqlx::query("SELECT repo_id, role FROM repo_grants WHERE kind = 'team' AND subject_id = $1 ORDER BY repo_id")
+                    .bind(team_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                rows.into_iter().map(|r| Ok((RepoId(r.try_get(0)?), r.try_get(1)?))).collect()
+            }
+
+            async fn authz_facts(&self, repo: RepoId, user_id: i64) -> StoreResult<AuthzFacts> {
+                let org = sqlx::query(
+                    "SELECT o.base_role, m.role FROM repos r JOIN orgs o ON r.owner_kind = 'org' AND o.org_id = r.owner_id \
+                     LEFT JOIN org_members m ON m.org_id = o.org_id AND m.user_id = $2 WHERE r.repo_id = $1",
+                )
+                .bind(repo.0)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                let grants: Vec<String> = sqlx::query_scalar(
+                    "SELECT role FROM repo_grants WHERE repo_id = $1 AND ((kind = 'user' AND subject_id = $2) OR \
+                     (kind = 'team' AND subject_id IN (SELECT team_id FROM team_members WHERE user_id = $2)))",
+                )
+                .bind(repo.0)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+                let (org_base_role, org_role) = match org {
+                    Some(r) => (Some(r.try_get::<String, _>(0)?), r.try_get::<Option<String>, _>(1)?),
+                    None => (None, None),
+                };
+                Ok(AuthzFacts { org_role, org_base_role, grants })
+            }
+
+            async fn audit_append(&self, actor: &str, action: &str, target: &str, detail: &str) -> StoreResult<()> {
+                sqlx::query("INSERT INTO audit_log (ts, actor, action, target, detail) VALUES ($1, $2, $3, $4, $5)")
+                    .bind(now_ms())
+                    .bind(actor)
+                    .bind(action)
+                    .bind(target)
+                    .bind(detail)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            }
+
+            async fn audit_list(&self, before: Option<i64>, limit: u32) -> StoreResult<Vec<AuditEntry>> {
+                let rows = sqlx::query(
+                    "SELECT seq, ts, actor, action, target, detail FROM audit_log WHERE seq < $1 ORDER BY seq DESC LIMIT $2",
+                )
+                .bind(before.unwrap_or(i64::MAX))
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|r| {
+                        Ok(AuditEntry {
+                            seq: r.try_get(0)?,
+                            ts: r.try_get(1)?,
+                            actor: r.try_get(2)?,
+                            action: r.try_get(3)?,
+                            target: r.try_get(4)?,
+                            detail: r.try_get(5)?,
+                        })
+                    })
+                    .collect()
             }
 
             async fn create_review(

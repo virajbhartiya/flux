@@ -142,7 +142,16 @@ impl Client {
     // ───────────── admin ─────────────
 
     pub async fn create_repo(&self, name: &str) -> Result<()> {
-        self.admin.clone().create_repo(CreateRepoRequest { name: name.into() }).await?;
+        self.create_repo_with(name, "").await
+    }
+
+    /// `visibility`: public, internal, private, or empty for the default.
+    pub async fn create_repo_with(&self, name: &str, visibility: &str) -> Result<()> {
+        self.admin
+            .clone()
+            .create_repo(CreateRepoRequest { name: name.into(), visibility: visibility.into() })
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
         Ok(())
     }
 

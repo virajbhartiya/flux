@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::Principal;
 use crate::core::{Flux, FluxError};
+use crate::rbac::Role;
 
 type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -147,10 +148,10 @@ impl object_service_server::ObjectService for Services {
 
     async fn get_trees(&self, req: Request<GetTreesRequest>) -> Result<Response<Self::GetTreesStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let flux = self.flux.clone();
-        flux.repo(&req.repo).await?;
+        let repo = flux.repo(&req.repo).await?;
+        flux.authorize(&principal, repo, Role::Read).await?;
         let mut queue: VecDeque<(TreeId, Vec<u8>, u32)> = VecDeque::new();
         for (i, raw) in req.tree_ids.iter().enumerate() {
             let path = if i == 0 { req.path_hint.clone() } else { vec![] };
@@ -193,10 +194,10 @@ impl object_service_server::ObjectService for Services {
 
     async fn get_contents(&self, req: Request<GetContentsRequest>) -> Result<Response<Self::GetContentsStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let flux = self.flux.clone();
-        flux.repo(&req.repo).await?;
+        let repo = flux.repo(&req.repo).await?;
+        flux.authorize(&principal, repo, Role::Read).await?;
         let ids: Vec<ContentId> = req.content_ids.iter().map(|b| content_id(b)).collect::<Result<_, _>>()?;
         Ok(Response::new(spawn_stream(move |tx| async move {
             for id in ids {
@@ -213,9 +214,9 @@ impl object_service_server::ObjectService for Services {
         req: Request<GetContentMetaRequest>,
     ) -> Result<Response<Self::GetContentMetaStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
-        self.flux.repo(&req.repo).await?;
+        let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let ids: Vec<ContentId> = req.content_ids.iter().map(|b| content_id(b)).collect::<Result<_, _>>()?;
         let metas = self.flux.meta.get_content_meta(&ids).await.map_err(FluxError::from)?;
         let results: Vec<Result<ContentMetaResult, Status>> = ids
@@ -254,9 +255,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn resolve_rev(&self, req: Request<ResolveRevRequest>) -> Result<Response<ChangesetInfo>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let loaded = self.flux.load_one(repo, &id).await?;
         Ok(Response::new(self.flux.info(repo, &loaded).await?))
@@ -264,9 +265,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn list_refs(&self, req: Request<ListRefsRequest>) -> Result<Response<ListRefsResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let limit = if req.limit == 0 { 1000 } else { req.limit.min(10_000) };
         let refs = self.flux.meta.list_refs(repo, &req.prefix, limit).await.map_err(FluxError::from)?;
         Ok(Response::new(ListRefsResponse {
@@ -279,10 +280,10 @@ impl repo_service_server::RepoService for Services {
 
     async fn get_changesets(&self, req: Request<GetChangesetsRequest>) -> Result<Response<Self::GetChangesetsStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let flux = self.flux.clone();
         let repo = flux.repo(&req.repo).await?;
+        flux.authorize(&principal, repo, Role::Read).await?;
         let ids: Vec<ChangesetId> = req.ids.iter().map(|b| cs_id(b)).collect::<Result<_, _>>()?;
         Ok(Response::new(spawn_stream(move |tx| async move {
             let loaded: Vec<_> = flux.load_arc(repo, &ids).await?.into_iter().flatten().collect();
@@ -297,10 +298,10 @@ impl repo_service_server::RepoService for Services {
 
     async fn log(&self, req: Request<LogRequest>) -> Result<Response<Self::LogStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let flux = self.flux.clone();
         let repo = flux.repo(&req.repo).await?;
+        flux.authorize(&principal, repo, Role::Read).await?;
         let start = flux.resolve_rev(repo, &req.rev).await?;
         let path = opt_repo_path(&req.path)?;
         let limit = if req.limit == 0 { usize::MAX } else { req.limit as usize };
@@ -332,9 +333,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn list_dir(&self, req: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let root = self.flux.root_tree(repo, &id).await?;
         let dir = match opt_repo_path(&req.path)? {
@@ -366,9 +367,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn read_file(&self, req: Request<ReadFileRequest>) -> Result<Response<Self::ReadFileStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let path = flux_proto::repo_path(&req.path)?;
         self.flux.check_read_path(repo, &principal, path.as_bytes()).await?;
@@ -383,9 +384,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn diff(&self, req: Request<DiffRequest>) -> Result<Response<Self::DiffStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let new_id = self.flux.resolve_rev(repo, &req.new_rev).await?;
         let old_id = if req.old_rev.is_empty() {
             self.flux.load_one(repo, &new_id).await?.changeset.parents.first().copied()
@@ -420,9 +421,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn git_lookup(&self, req: Request<GitLookupRequest>) -> Result<Response<GitLookupResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let shas: Vec<[u8; 20]> = req
             .git_sha1s
             .iter()
@@ -437,9 +438,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn blame(&self, req: Request<BlameRequest>) -> Result<Response<BlameResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let path = flux_proto::repo_path(&req.path)?;
         self.flux.check_read_path(repo, &principal, path.as_bytes()).await?;
@@ -463,9 +464,10 @@ impl repo_service_server::RepoService for Services {
     }
 
     async fn ancestry(&self, req: Request<AncestryRequest>) -> Result<Response<AncestryResponse>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let a = self.flux.resolve_rev(repo, &req.a).await?;
         let b = self.flux.resolve_rev(repo, &req.b).await?;
         let (a_ahead, b_ahead) = self.flux.ahead_behind(repo, &a, &b).await?;
@@ -480,9 +482,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn search(&self, req: Request<SearchRequest>) -> Result<Response<Self::SearchStream>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, if req.rev.is_empty() { "main" } else { &req.rev }).await?;
         let root = self.flux.root_tree(repo, &id).await?;
         let prefix = opt_repo_path(&req.path_prefix)?;
@@ -500,9 +502,9 @@ impl repo_service_server::RepoService for Services {
 
     async fn find_files(&self, req: Request<FindFilesRequest>) -> Result<Response<FindFilesResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_read()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, if req.rev.is_empty() { "main" } else { &req.rev }).await?;
         let root = self.flux.root_tree(repo, &id).await?;
         let limit = if req.limit == 0 { 100 } else { req.limit.min(100_000) as usize };
@@ -514,9 +516,10 @@ impl repo_service_server::RepoService for Services {
     }
 
     async fn last_modified(&self, req: Request<LastModifiedRequest>) -> Result<Response<LastModifiedResponse>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let id = self.flux.resolve_rev(repo, &req.rev).await?;
         let path = opt_repo_path(&req.path)?;
         let root = self.flux.lastmod(repo, &id).await?;
@@ -588,9 +591,9 @@ impl Services {
 impl write_service_server::WriteService for Services {
     async fn has_contents(&self, req: Request<HasContentsRequest>) -> Result<Response<HasContentsResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
-        self.flux.repo(&req.repo).await?;
+        let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let ids: Vec<ContentId> = req.content_ids.iter().map(|b| content_id(b)).collect::<Result<_, _>>()?;
         let metas = self.flux.meta.get_content_meta(&ids).await.map_err(FluxError::from)?;
         Ok(Response::new(HasContentsResponse { present: metas.iter().map(Option::is_some).collect() }))
@@ -598,7 +601,6 @@ impl write_service_server::WriteService for Services {
 
     async fn upload_contents(&self, req: Request<Streaming<UploadFrame>>) -> Result<Response<UploadResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let mut stream = req.into_inner();
         let mut repo_checked = false;
         let mut stored = Vec::new();
@@ -608,7 +610,8 @@ impl write_service_server::WriteService for Services {
         while let Some(frame) = stream.next().await {
             let frame = frame?;
             if !repo_checked {
-                self.flux.repo(&frame.repo).await?;
+                let repo = self.flux.repo(&frame.repo).await?;
+                self.flux.authorize(&principal, repo, Role::Write).await?;
                 repo_checked = true;
             }
             let cur = match current.as_mut() {
@@ -688,9 +691,9 @@ impl write_service_server::WriteService for Services {
 
     async fn create_changeset(&self, req: Request<CreateChangesetRequest>) -> Result<Response<ChangesetInfo>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let cs = changeset_from_pb(req.changeset.as_ref().ok_or_else(|| Status::invalid_argument("missing changeset"))?)?;
         let paths: Vec<Vec<u8>> = cs.file_changes.keys().map(|p| p.as_bytes().to_vec()).collect();
         self.flux.check_write_paths(repo, &principal, paths).await?;
@@ -702,9 +705,9 @@ impl write_service_server::WriteService for Services {
         req: Request<CreateChangesetsRequest>,
     ) -> Result<Response<CreateChangesetsResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let batch = req.changesets.iter().map(changeset_from_pb).collect::<Result<Vec<_>, _>>()?;
         let paths: Vec<Vec<u8>> = batch.iter().flat_map(|c| c.file_changes.keys().map(|p| p.as_bytes().to_vec())).collect();
         self.flux.check_write_paths(repo, &principal, paths).await?;
@@ -713,9 +716,9 @@ impl write_service_server::WriteService for Services {
 
     async fn update_ref(&self, req: Request<UpdateRefRequest>) -> Result<Response<UpdateRefResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        let role = self.flux.authorize(&principal, repo, Role::Write).await?;
         let expect = match req.expect {
             Some(update_ref_request::Expect::Any(_)) => RefExpect::Any,
             Some(update_ref_request::Expect::Absent(_)) => RefExpect::Absent,
@@ -725,11 +728,11 @@ impl write_service_server::WriteService for Services {
         };
         let new = if req.new_target.is_empty() { None } else { Some(cs_id(&req.new_target)?) };
         let mut expect = expect;
-        if crate::core::is_protected_ref(&req.name) && !principal.is_admin() {
+        if crate::core::is_protected_ref(&req.name) && role < Role::Admin {
             // Protected refs only move forward for non-admins (land is the
             // way to put rebased work on them).
             let Some(new) = new else {
-                return Err(Status::permission_denied("only admins can delete a protected ref"));
+                return Err(Status::permission_denied("only repository admins can delete a protected ref"));
             };
             if let Some(cur) = self.flux.meta.get_ref(repo, &req.name).await.map_err(FluxError::from)? {
                 if !self.flux.is_ancestor(repo, &cur.target, &new).await? {
@@ -756,9 +759,9 @@ impl write_service_server::WriteService for Services {
 
     async fn put_git_mapping(&self, req: Request<PutGitMappingRequest>) -> Result<Response<PutGitMappingResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let mut entries = Vec::with_capacity(req.mappings.len());
         for m in &req.mappings {
             let sha: [u8; 20] =
@@ -774,9 +777,9 @@ impl write_service_server::WriteService for Services {
     }
     async fn land(&self, req: Request<LandRequest>) -> Result<Response<LandResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let top = self.flux.resolve_rev(repo, &req.rev).await?;
         let target = if req.target_ref.is_empty() { "main".to_string() } else { req.target_ref };
         let reason = if req.reason.is_empty() { "flux land".to_string() } else { req.reason };
@@ -800,15 +803,16 @@ fn land_pb(r: &crate::land::LandResult) -> LandResponse {
 #[tonic::async_trait]
 impl admin_service_server::AdminService for Services {
     async fn create_repo(&self, req: Request<CreateRepoRequest>) -> Result<Response<v1::RepoInfo>, Status> {
-        self.who(&req).await?.require_admin()?;
-        let name = req.into_inner().name;
-        self.flux.create_repo(&name).await?;
-        Ok(Response::new(v1::RepoInfo { name }))
+        let principal = self.who(&req).await?;
+        let req = req.into_inner();
+        let visibility = if req.visibility.is_empty() { None } else { Some(req.visibility.as_str()) };
+        self.flux.create_repo_as(&principal, &req.name, visibility).await?;
+        Ok(Response::new(v1::RepoInfo { name: req.name }))
     }
 
     async fn list_repos(&self, req: Request<ListReposRequest>) -> Result<Response<ListReposResponse>, Status> {
-        self.who(&req).await?.require_read()?;
-        let repos = self.flux.meta.list_repos().await.map_err(FluxError::from)?;
+        let principal = self.who(&req).await?;
+        let repos = self.flux.readable_repos(&principal).await?;
         Ok(Response::new(ListReposResponse { repos: repos.into_iter().map(|r| v1::RepoInfo { name: r.name }).collect() }))
     }
 }
@@ -834,9 +838,9 @@ fn review_pb(r: &flux_store::Review) -> v1::Review {
 impl review_service_server::ReviewService for Services {
     async fn create_review(&self, req: Request<CreateReviewRequest>) -> Result<Response<v1::Review>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let head = self.flux.resolve_rev(repo, &req.head_rev).await?;
         let target = if req.target.is_empty() { "main".to_string() } else { req.target };
         let r = self.flux.create_review(repo, &req.title, &req.body, principal.name(), head, target.as_bytes()).await?;
@@ -844,9 +848,10 @@ impl review_service_server::ReviewService for Services {
     }
 
     async fn list_reviews(&self, req: Request<ListReviewsRequest>) -> Result<Response<ListReviewsResponse>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let state = if req.state.is_empty() { None } else { Some(req.state.as_str()) };
         let limit = if req.limit == 0 { 100 } else { req.limit.min(1000) };
         let rs = self.flux.meta.list_reviews(repo, state, limit).await.map_err(FluxError::from)?;
@@ -854,9 +859,10 @@ impl review_service_server::ReviewService for Services {
     }
 
     async fn get_review(&self, req: Request<GetReviewRequest>) -> Result<Response<ReviewDetail>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Read).await?;
         let d = self.flux.review_detail(repo, req.number).await?;
         Ok(Response::new(ReviewDetail {
             review: Some(review_pb(&d.review)),
@@ -879,9 +885,9 @@ impl review_service_server::ReviewService for Services {
 
     async fn update_review(&self, req: Request<UpdateReviewRequest>) -> Result<Response<v1::Review>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let head = if req.head_rev.is_empty() { None } else { Some(self.flux.resolve_rev(repo, &req.head_rev).await?) };
         let r = self.flux.update_review(repo, req.number, &req.action, principal.name(), &req.body, head).await?;
         Ok(Response::new(review_pb(&r)))
@@ -889,9 +895,9 @@ impl review_service_server::ReviewService for Services {
 
     async fn land_review(&self, req: Request<LandReviewRequest>) -> Result<Response<LandResponse>, Status> {
         let principal = self.who(&req).await?;
-        principal.require_write()?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
+        self.flux.authorize(&principal, repo, Role::Write).await?;
         let rv = self.flux.review(repo, req.number).await?;
         self.flux.check_land_paths(repo, &principal, &rv.head, &rv.target).await?;
         let r = self.flux.land_review(repo, req.number, principal.name()).await?;
@@ -931,17 +937,24 @@ impl event_service_server::EventService for Services {
     type WatchStream = RpcStream<RepoEvent>;
 
     async fn watch(&self, req: Request<WatchRequest>) -> Result<Response<Self::WatchStream>, Status> {
-        self.who(&req).await?.require_read()?;
+        let principal = self.who(&req).await?;
         let req = req.into_inner();
         if !req.repo.is_empty() {
-            self.flux.repo(&req.repo).await?;
+            let repo = self.flux.repo(&req.repo).await?;
+            self.flux.authorize(&principal, repo, Role::Read).await?;
         }
         let mut rx = self.flux.subscribe();
+        let flux = self.flux.clone();
         Ok(Response::new(spawn_stream(move |tx| async move {
             loop {
                 match rx.recv().await {
                     Ok(e) => {
-                        if (req.repo.is_empty() || e.repo() == req.repo) && tx.send(Ok(event_pb(&e))).await.is_err() {
+                        // Only events from repositories this caller may read.
+                        let visible = match flux.repo(e.repo()).await {
+                            Ok(id) => flux.repo_role(&principal, id).await.is_ok_and(|r| r >= Role::Read),
+                            Err(_) => false,
+                        };
+                        if visible && (req.repo.is_empty() || e.repo() == req.repo) && tx.send(Ok(event_pb(&e))).await.is_err() {
                             return Ok(());
                         }
                     }

@@ -23,6 +23,7 @@ use super::objects::{EMPTY_TREE, Kind, Sha, encode_commit, hash_object, hex, par
 use super::pack::{PackObject, PackWriter, encode, flush, pkt, pkt_str, read_pack, read_pkts, sideband};
 use crate::auth::Principal;
 use crate::core::{Flux, FluxError, FluxResult, is_protected_ref};
+use crate::rbac::Role;
 
 const ZERO: Sha = [0; 20];
 const AGENT: &str = concat!("agent=flux/", env!("CARGO_PKG_VERSION"));
@@ -93,13 +94,21 @@ pub async fn handle(flux: Arc<Flux>, repo_name: &str, op: Op, headers: &HeaderMa
     };
     let service = query.split('&').find_map(|kv| kv.strip_prefix("service=")).unwrap_or("");
     let write = op == Op::ReceivePack || (op == Op::InfoRefs && service == "git-receive-pack");
-    if !principal.can_read() || (write && !principal.can_write()) {
-        return unauthorized("authentication required");
-    }
     let repo = match flux.repo(repo_name).await {
         Ok(r) => r,
+        Err(_) if principal.user.is_none() && flux.auth_mode != crate::auth::AuthMode::Open => {
+            return unauthorized("authentication required");
+        }
         Err(_) => return err(StatusCode::NOT_FOUND, "repository not found"),
     };
+    let need = if write { Role::Write } else { Role::Read };
+    if let Err(e) = flux.authorize(&principal, repo, need).await {
+        return match e {
+            FluxError::Unauthenticated(_) => unauthorized("authentication required"),
+            FluxError::NotFound(_) => err(StatusCode::NOT_FOUND, "repository not found"),
+            other => err(StatusCode::FORBIDDEN, &other.to_string()),
+        };
+    }
     // git needs whole trees, so a principal restricted from reading any path
     // can't use plain git on this repository (flux checkouts work).
     if let Ok(cfg) = flux.repo_config(repo).await
@@ -1133,9 +1142,9 @@ async fn update_one(
     } else {
         Some(*map.get(&c.new).ok_or_else(|| FluxError::Internal(anyhow::anyhow!("commit not converted")))?)
     };
-    if is_protected_ref(&name) && !principal.is_admin() {
+    if is_protected_ref(&name) && flux.repo_role(principal, repo).await? < Role::Admin {
         match (new, &current) {
-            (None, _) => return Err(FluxError::PermissionDenied("protected ref: only admins can delete it".into())),
+            (None, _) => return Err(FluxError::PermissionDenied("protected ref: only repository admins can delete it".into())),
             (Some(n), Some(cur)) if !flux.is_ancestor(repo, &cur.target, &n).await? => {
                 return Err(FluxError::PermissionDenied("protected ref: non-fast-forward (use flux land)".into()));
             }

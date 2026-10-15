@@ -548,7 +548,11 @@ service AdminService {
 }
 
 message CreateRepoRequest {
+  // `name` (server-wide, admins only) or `owner/name` (a user's own, or an
+  // organization they own).
   string name = 1;
+  // public | internal | private (default: private for owned repositories).
+  string visibility = 2;
 }
 
 message RepoInfo {

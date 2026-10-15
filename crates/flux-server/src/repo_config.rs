@@ -150,8 +150,11 @@ mod tests {
             ],
             ..Default::default()
         };
-        let who =
-            |name: &str| Principal { user: Some(User { id: 1, name: name.into(), is_admin: false }), mode: AuthMode::Token };
+        let who = |name: &str| Principal {
+            user: Some(User { id: 1, name: name.into(), is_admin: false }),
+            mode: AuthMode::Token,
+            ..Default::default()
+        };
         assert!(cfg.allows(&who("dev"), b"infra/dns.tf", false));
         assert!(!cfg.allows(&who("dev"), b"infra/dns.tf", true));
         assert!(!cfg.allows(&who("dev"), b"infra/secrets/key", false));
