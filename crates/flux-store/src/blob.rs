@@ -547,7 +547,11 @@ impl BlobStore {
                     let linked = std::fs::hard_link(&tmp, dir.join(format!("{id}.zdict")));
                     std::fs::remove_file(&tmp)?;
                     linked?;
-                    std::fs::File::open(&dir)?.sync_all()
+                    // Make the new name durable (Windows can't open
+                    // directories; NTFS journals the metadata itself).
+                    #[cfg(unix)]
+                    std::fs::File::open(&dir)?.sync_all()?;
+                    Ok(())
                 })
                 .await
                 .map_err(|e| StoreError::Backend(e.into()))?
