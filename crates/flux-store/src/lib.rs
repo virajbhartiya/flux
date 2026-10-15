@@ -19,6 +19,13 @@ pub use sql::{PostgresStore, SqliteStore};
 
 use std::sync::Arc;
 
+/// The blob-store URL for a local directory (portable: `file:///C:/...` on
+/// Windows). The directory need not exist yet.
+pub fn file_url(dir: &std::path::Path) -> anyhow::Result<String> {
+    let abs = std::path::absolute(dir)?;
+    Ok(url::Url::from_directory_path(&abs).map_err(|_| anyhow::anyhow!("not a usable directory: {}", abs.display()))?.to_string())
+}
+
 /// Open a metadata store from a URL: `sqlite://path/to/db`, `sqlite::memory:`,
 /// or `postgres://...`. Migrations are applied on open.
 pub async fn open_meta(url: &str) -> anyhow::Result<Arc<dyn MetaStore>> {

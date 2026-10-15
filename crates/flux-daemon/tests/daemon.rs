@@ -71,13 +71,11 @@ async fn serves_objects_and_prefetches_new_revisions() {
     // A new revision upstream is prefetched without any client asking.
     let c2 = up.create_changeset(&commit(Some(c1.id), &[("b/two.txt", ids[1], 4)])).await.unwrap();
     up.update_ref("main", Expect::Any(true), Some(c2.id), "t").await.unwrap();
-    let blobs =
-        flux_store::BlobStore::open(&format!("file://{}/", ddir.join("blobs").canonicalize().unwrap().display())).unwrap();
+    let blobs = flux_store::BlobStore::open(&flux_store::file_url(&ddir.join("blobs")).unwrap()).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         // The daemon writes through its own handle; reopen to see them.
-        let blobs =
-            flux_store::BlobStore::open(&format!("file://{}/", ddir.join("blobs").canonicalize().unwrap().display())).unwrap();
+        let blobs = flux_store::BlobStore::open(&flux_store::file_url(&ddir.join("blobs")).unwrap()).unwrap();
         if blobs.exists(ObjectKind::Tree, c2.root_tree.as_bytes()).await.unwrap()
             && blobs.exists(ObjectKind::Content, ids[1].as_bytes()).await.unwrap()
         {

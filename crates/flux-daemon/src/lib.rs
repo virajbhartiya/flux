@@ -42,7 +42,7 @@ pub async fn run(opts: Options, shutdown: impl std::future::Future<Output = ()> 
     std::fs::create_dir_all(&dir)?;
     let blobs = dir.join("blobs");
     std::fs::create_dir_all(&blobs)?;
-    let blob_url = format!("file://{}/", blobs.canonicalize()?.display());
+    let blob_url = flux_store::file_url(&blobs)?;
     let cache = Cache::new(&upstream, &blob_url).await?;
 
     let listener = tokio::net::TcpListener::bind(opts.listen).await?;

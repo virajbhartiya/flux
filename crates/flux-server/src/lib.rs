@@ -40,10 +40,10 @@ impl StorageConfig {
     /// SQLite + local files under one directory: the all-in-one layout.
     pub fn data_dir(dir: &std::path::Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let dir = dir.canonicalize()?;
+        let dir = std::path::absolute(dir)?;
         Ok(Self {
             meta_url: format!("sqlite://{}", dir.join("meta.db").display()),
-            blob_url: url::Url::from_directory_path(dir.join("blobs")).map_err(|_| anyhow::anyhow!("bad data dir"))?.to_string(),
+            blob_url: flux_store::file_url(&dir.join("blobs"))?,
         })
     }
 }
