@@ -399,21 +399,17 @@ impl Client {
         let ids: Vec<ContentId> = items.iter().map(|i| i.0).collect();
         let present = self.has_contents(&ids).await?;
         let mut seen = std::collections::HashSet::new();
-        let mut batches: Vec<Vec<(ContentId, Bytes, Option<ContentId>)>> = vec![vec![]];
-        let mut batch_bytes = 0;
-        for (item, present) in items.into_iter().zip(present) {
-            if present || !seen.insert(item.0) {
-                continue;
-            }
-            batch_bytes += item.1.len();
-            batches.last_mut().unwrap().push(item);
-            if batch_bytes >= UPLOAD_BATCH_BYTES {
-                batches.push(vec![]);
-                batch_bytes = 0;
-            }
-        }
-        let results: Vec<Result<()>> = futures::stream::iter(batches.into_iter().filter(|b| !b.is_empty()))
-            .map(|b| self.upload_batch(b))
+        let items: Vec<(ContentId, Bytes, Option<ContentId>)> =
+            items.into_iter().zip(present).filter(|(item, present)| !present && seen.insert(item.0)).map(|(i, _)| i).collect();
+        let results: Vec<Result<()>> = futures::stream::iter(delta_units(items))
+            .map(|unit| async move {
+                // Batches within a unit go in order, so every delta base is
+                // stored before the objects that delta against it.
+                for b in unit {
+                    self.upload_batch(b).await?;
+                }
+                Ok(())
+            })
             .buffer_unordered(UPLOAD_STREAMS)
             .collect()
             .await;
@@ -680,5 +676,98 @@ impl Client {
 
     pub async fn whoami(&self) -> Result<WhoAmIResponse> {
         Ok(self.auth.clone().who_am_i(WhoAmIRequest {}).await.map_err(Self::status)?.into_inner())
+    }
+}
+
+/// Group uploads so delta chains stay together: items linked by in-set
+/// delta bases form one unit, and units are packed into batches of about
+/// `UPLOAD_BATCH_BYTES`. A unit larger than that is split into consecutive
+/// batches (uploaded in order); otherwise a version uploaded concurrently
+/// with its base would be stored without a delta.
+fn delta_units(items: Vec<(ContentId, Bytes, Option<ContentId>)>) -> Vec<Vec<Vec<(ContentId, Bytes, Option<ContentId>)>>> {
+    let index: std::collections::HashMap<ContentId, usize> = items.iter().enumerate().map(|(i, it)| (it.0, i)).collect();
+    // Union-find over in-set base links.
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for (i, it) in items.iter().enumerate() {
+        if let Some(j) = it.2.and_then(|b| index.get(&b).copied()) {
+            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+            parent[a] = b;
+        }
+    }
+    // Groups keep input order, which already puts bases before versions.
+    let mut groups: std::collections::BTreeMap<usize, Vec<(ContentId, Bytes, Option<ContentId>)>> = Default::default();
+    let mut first_of: std::collections::HashMap<usize, usize> = Default::default();
+    for (i, it) in items.into_iter().enumerate() {
+        let root = find(&mut parent, i);
+        let key = *first_of.entry(root).or_insert(i);
+        groups.entry(key).or_default().push(it);
+    }
+    let mut units: Vec<Vec<Vec<(ContentId, Bytes, Option<ContentId>)>>> = Vec::new();
+    let mut open: Vec<(ContentId, Bytes, Option<ContentId>)> = Vec::new();
+    let mut open_bytes = 0;
+    for (_, g) in groups {
+        let bytes: usize = g.iter().map(|i| i.1.len()).sum();
+        if bytes >= UPLOAD_BATCH_BYTES {
+            let mut unit = vec![vec![]];
+            let mut b = 0;
+            for it in g {
+                b += it.1.len();
+                unit.last_mut().unwrap().push(it);
+                if b >= UPLOAD_BATCH_BYTES {
+                    unit.push(vec![]);
+                    b = 0;
+                }
+            }
+            unit.retain(|b| !b.is_empty());
+            units.push(unit);
+            continue;
+        }
+        if open_bytes + bytes > UPLOAD_BATCH_BYTES && !open.is_empty() {
+            units.push(vec![std::mem::take(&mut open)]);
+            open_bytes = 0;
+        }
+        open_bytes += bytes;
+        open.extend(g);
+    }
+    if !open.is_empty() {
+        units.push(vec![open]);
+    }
+    units
+}
+
+#[cfg(test)]
+mod delta_unit_tests {
+    use super::*;
+
+    #[test]
+    fn chains_stay_together_and_in_order() {
+        let id = |n: u8| ContentId::hash(&[n]);
+        let big = Bytes::from(vec![0u8; UPLOAD_BATCH_BYTES / 3 + 1]);
+        let items = vec![
+            (id(1), big.clone(), None),
+            (id(2), Bytes::from_static(b"x"), None),
+            (id(3), big.clone(), Some(id(1))),
+            (id(4), big.clone(), Some(id(3))),
+            (id(5), Bytes::from_static(b"y"), Some(id(2))),
+        ];
+        let units = delta_units(items);
+        let pos = |want: ContentId| {
+            units.iter().enumerate().find_map(|(u, unit)| {
+                unit.iter().enumerate().find_map(|(b, batch)| batch.iter().position(|i| i.0 == want).map(|p| (u, b, p)))
+            })
+        };
+        let (u1, b1, p1) = pos(id(1)).unwrap();
+        let (u3, b3, p3) = pos(id(3)).unwrap();
+        let (u4, _, _) = pos(id(4)).unwrap();
+        assert_eq!((u1, u3, u4), (u1, u1, u1), "one chain, one unit");
+        assert!((b1, p1) < (b3, p3), "base first");
+        assert_eq!(pos(id(2)).unwrap().0, pos(id(5)).unwrap().0);
     }
 }

@@ -919,6 +919,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zstd 0.13.3",
 ]
 
 [[package]]

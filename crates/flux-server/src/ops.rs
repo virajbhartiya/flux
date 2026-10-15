@@ -168,3 +168,85 @@ impl Flux {
         Ok((st.objects as u64, st.bytes))
     }
 }
+
+/// Result of training one dictionary.
+#[derive(Debug)]
+pub struct DictReport {
+    pub kind: ObjectKind,
+    pub id: u16,
+    pub samples: usize,
+    /// Held-out samples compressed without and with the dictionary.
+    pub plain_bytes: usize,
+    pub dict_bytes: usize,
+}
+
+impl Flux {
+    /// Train zstd dictionaries for trees and small files from the trees at
+    /// every ref head of `repo`, and install them for new writes. Objects
+    /// already stored keep their encoding.
+    pub async fn train_dicts(&self, repo: flux_store::RepoId, max_samples: usize, size: usize) -> FluxResult<Vec<DictReport>> {
+        use flux_store::dict::{DICT_MAX_OBJECT, train};
+        // Trees from recent history (many versions of each directory), and
+        // files from the ref heads.
+        let refs = self.meta.list_refs(repo, b"", 10_000).await?;
+        let heads: Vec<ChangesetId> = refs.into_iter().map(|(_, v)| v.target).collect();
+        let recent: Vec<ChangesetId> = {
+            let g = self.repo_graph(repo).await?;
+            let mut starts = Vec::new();
+            for h in &heads {
+                starts.push(self.graph_index(repo, h).await?.1);
+            }
+            let graph = g.graph.read().unwrap();
+            graph.walk(&starts, &[], false).take(2_000).map(|i| graph.id(i)).collect()
+        };
+        // Heads first, so their files are sampled before the size cap.
+        let mut stack: Vec<TreeId> = self.root_trees(repo, &recent).await?;
+        stack.reverse();
+        stack.extend(self.root_trees(repo, &heads).await?);
+        let (mut trees, mut files) = (Vec::new(), Vec::new());
+        let (mut seen_t, mut seen_c) = (HashSet::new(), HashSet::new());
+        while let Some(t) = stack.pop() {
+            if !seen_t.insert(t) || trees.len() >= max_samples {
+                continue;
+            }
+            let Some(bytes) = self.blobs.get_tree_bytes(&t).await? else { continue };
+            if bytes.len() <= DICT_MAX_OBJECT {
+                trees.push(bytes.to_vec());
+            }
+            let tree = self.blobs.get_tree(&t).await?.expect("just read");
+            for e in tree.entries() {
+                if let Some(sub) = e.tree_id() {
+                    stack.push(sub);
+                } else if let Some(c) = e.content_id()
+                    && (e.size as usize) <= DICT_MAX_OBJECT
+                    && files.len() < max_samples
+                    && seen_c.insert(c)
+                    && let Some(b) = self.blobs.get_content_bytes(&c).await?
+                {
+                    files.push(b.to_vec());
+                }
+            }
+        }
+        let mut reports = Vec::new();
+        for (kind, mut samples) in [(ObjectKind::Tree, trees), (ObjectKind::Content, files)] {
+            if samples.len() < 64 {
+                continue;
+            }
+            // Hold out every 10th sample to measure the gain honestly.
+            let held: Vec<Vec<u8>> = samples.iter().step_by(10).cloned().collect();
+            let mut i = 0;
+            samples.retain(|_| {
+                i += 1;
+                (i - 1) % 10 != 0
+            });
+            let raw = train(&samples, size)?;
+            let plain_bytes = held.iter().map(|s| zstd::bulk::compress(s, 3).map_or(s.len(), |c| c.len()).min(s.len())).sum();
+            let mut c =
+                zstd::bulk::Compressor::with_dictionary(3, &raw).map_err(|e| crate::core::FluxError::Internal(e.into()))?;
+            let dict_bytes = held.iter().map(|s| c.compress(s).map_or(s.len(), |c| c.len()).min(s.len())).sum();
+            let id = self.blobs.install_dict(kind, raw).await?;
+            reports.push(DictReport { kind, id, samples: samples.len(), plain_bytes, dict_bytes });
+        }
+        Ok(reports)
+    }
+}

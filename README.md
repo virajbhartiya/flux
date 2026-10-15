@@ -33,7 +33,7 @@ Measured on an M-series laptop, git.git imported (85,558 changesets, 4,857 files
 | Land with server-side rebase + three-way merge | ~10 ms |
 | `git clone` of git.git from flux (full history, 420k objects) | **8.7 s** (stock `git` serving its own repo: 14.4 s) |
 | git import, git.git, full history | 56–73 s (1,170–1,530 commits/s), SQLite or Postgres; every commit keeps its SHA-1 |
-| Storage for git.git | 416 MB blobs + 190 MB metadata (git's pack: 334 MB) |
+| Storage for git.git | 312 MB blobs, history index included (git's own pack: 334 MB) |
 
 Every page shows its render time in the footer and in a `Server-Timing` header.
 
@@ -114,6 +114,7 @@ docker compose exec flux flux-server token --user admin --admin
 - **Protected refs:** non-admins can only fast-forward `main`, `master`, `trunk` and `release/*`. Rebased work reaches them through `flux land` or a review.
 - **Durability:** objects are fsynced before any metadata references them. Segment files are append-only with per-record CRCs, and a torn tail is truncated on restart. The importer resumes after any crash. A test kills the server with `SIGKILL` three times during a git.git import, then resumes, verifies and runs `fsck --full`.
 - **Integrity:** `flux-server fsck [--full]` re-hashes changesets, trees and file contents, checks graph closure and refs, and re-derives missing derived data. It is safe to run online.
+- **Storage tuning:** `flux-server storage-stats` breaks stored bytes down by kind and codec. `flux-server train-dict REPO` trains zstd dictionaries for small trees and files; new writes use them.
 - **Backups:** `flux-server backup DIR` takes a consistent online snapshot of the all-in-one layout (metadata first, then append-only blobs). Restore with `flux-server --data-dir DIR`. For Postgres use `pg_dump` or PITR; for S3, bucket versioning.
 - **Caching tier:** `flux-server cache --upstream http://primary:7878 --dir /var/cache/flux` is a regional cache (SPEC §9.2). It serves verified trees and contents from local disk and proxies everything else, web UI included. Clients point at it exactly as they would at the server.
 - **Observability:** Prometheus metrics at `/-/metrics` (request counts and latency histograms per surface, blob stats), `/-/healthz`, `/-/readyz` and `Server-Timing` on every response. The server shuts down gracefully on SIGTERM.

@@ -38,6 +38,7 @@ sha1.workspace = true
 flate2 = "1"
 base64 = "0.22"
 bytes.workspace = true
+zstd.workspace = true
 clap.workspace = true
 futures.workspace = true
 moka.workspace = true

@@ -6,6 +6,7 @@
 //!   `object_store` backend (local fs, S3-compatible, in-memory).
 
 mod blob;
+pub mod dict;
 mod meta;
 pub mod segment;
 mod sql;

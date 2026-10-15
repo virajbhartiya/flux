@@ -236,6 +236,11 @@ fn open_sealed(dir: &Path, seq: u32) -> std::io::Result<Option<Sealed>> {
 }
 
 impl SegmentStore {
+    /// The directory holding the segment files.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::open_with(dir, DEFAULT_SEAL_BYTES)
     }
@@ -449,6 +454,16 @@ impl SegmentStore {
         }
         copied.objects = self.stats().objects;
         Ok(copied)
+    }
+
+    /// Every stored object id (for maintenance tools).
+    pub fn ids(&self) -> Vec<[u8; 32]> {
+        let st = self.state.read().unwrap();
+        let mut out: Vec<[u8; 32]> = st.active.keys().copied().collect();
+        for s in &st.sealed {
+            out.extend((0..s.count()).map(|i| <[u8; 32]>::try_from(s.entry_id(i)).unwrap()));
+        }
+        out
     }
 
     pub fn stats(&self) -> SegmentStats {

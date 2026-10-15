@@ -310,6 +310,10 @@ Values over 90 KB spill to the blob store.
 - Dictionaries are themselves content-addressed and immutable. `dict_id` maps to a dictionary `ContentId` in the repo config.
 - Typical savings on source code are 30–50% over plain zstd.
 
+**As built.** `flux-server train-dict REPO` samples trees from recent history and small files (≤ 64 KiB) at the ref heads, trains one dictionary per kind, reports the gain on held-out samples and installs them. Objects written afterwards that are small and not stored as deltas use codec 2. Each dictionary is an immutable, numbered, checksummed file next to the blobs (`dicts/{id}.zdict`, or `{prefix}/dicts/{id}` in an object store), so no metadata store is involved, and servers sharing a bucket pick up new dictionaries within a minute. Decoded objects are still verified against their ids. Measured on git.git: trees 83% and small files 11% smaller than plain zstd on held-out samples; 7% less blob storage overall for a full import (deltas already cover most objects). Per-extension dictionaries are not implemented.
+
+**Delta chains.** Trees and derived index nodes chain up to depth 50 (git's default), file contents up to 10. On git.git this cut blob storage from 528 MB to 312 MB with no measurable change in cold page latency. `flux-server storage-stats` shows stored and raw bytes by kind and codec.
+
 ---
 
 ## 6. Derived data framework

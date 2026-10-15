@@ -77,6 +77,19 @@ enum Cmd {
     Backup { dir: PathBuf },
     /// Create a repository.
     CreateRepo { name: String },
+    /// Show how stored objects are encoded (all-in-one layout only).
+    StorageStats,
+    /// Train zstd dictionaries for small trees and files from a repository
+    /// and use them for new writes (existing objects are unchanged).
+    TrainDict {
+        repo: String,
+        /// Samples per kind.
+        #[arg(long, default_value_t = 20_000)]
+        samples: usize,
+        /// Dictionary size in bytes.
+        #[arg(long, default_value_t = flux_store::dict::DICT_SIZE)]
+        size: usize,
+    },
     /// Run a regional cache tier in front of an upstream flux server: serves
     /// trees and contents from local disk, proxies everything else.
     Cache {
@@ -150,6 +163,49 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("{} problem(s) found", r.problems.len());
             }
             println!("ok");
+            return Ok(());
+        }
+        Cmd::StorageStats => {
+            let stats = flux.blobs.codec_stats().await?;
+            let mib = |b: u64| b as f64 / (1 << 20) as f64;
+            println!("{:<10} {:<10} {:>10} {:>12} {:>12} {:>7}", "kind", "codec", "objects", "stored MiB", "raw MiB", "ratio");
+            let (mut n, mut st, mut raw) = (0, 0, 0);
+            for ((kind, codec), (objects, stored, decoded)) in &stats {
+                println!(
+                    "{kind:<10} {codec:<10} {objects:>10} {:>12.1} {:>12.1} {:>6.1}x",
+                    mib(*stored),
+                    mib(*decoded),
+                    *decoded as f64 / (*stored).max(1) as f64
+                );
+                (n, st, raw) = (n + objects, st + stored, raw + decoded);
+            }
+            println!(
+                "{:<10} {:<10} {n:>10} {:>12.1} {:>12.1} {:>6.1}x",
+                "total",
+                "",
+                mib(st),
+                mib(raw),
+                raw as f64 / st.max(1) as f64
+            );
+            return Ok(());
+        }
+        Cmd::TrainDict { repo, samples, size } => {
+            let id = flux.repo(&repo).await?;
+            let reports = flux.train_dicts(id, samples, size).await?;
+            if reports.is_empty() {
+                println!("not enough small objects in {repo} to train a dictionary");
+            }
+            for r in reports {
+                println!(
+                    "{:?} dictionary #{} from {} samples: held-out objects {:.1} KiB -> {:.1} KiB ({:.0}% smaller than plain zstd)",
+                    r.kind,
+                    r.id,
+                    r.samples,
+                    r.plain_bytes as f64 / 1024.0,
+                    r.dict_bytes as f64 / 1024.0,
+                    100.0 * (1.0 - r.dict_bytes as f64 / r.plain_bytes.max(1) as f64)
+                );
+            }
             return Ok(());
         }
         Cmd::Backup { dir } => {

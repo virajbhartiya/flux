@@ -5,6 +5,7 @@
 //!
 //! Codecs:
 //! * `0` raw, `1` zstd;
+//! * `2` zstd with a trained dictionary (`dict_id` names it; see [`crate::dict`]);
 //! * `3` zstd delta: payload = `base_id [32] | zstd frame` compressed with the
 //!   base object's decoded bytes as a raw-content dictionary. `dict_id` holds
 //!   the chain depth; chains are capped (see [`max_depth`]) so a cold read
@@ -30,6 +31,7 @@ use object_store::{ObjectStore, PutPayload};
 use rayon::prelude::*;
 use sha1::Digest as _;
 
+use crate::dict::{DICT_MAX_OBJECT, Dict, DictSet};
 use crate::meta::{ContentMeta, StoreError, StoreResult};
 use crate::segment::SegmentStore;
 
@@ -52,11 +54,14 @@ const CHUNK_MAX: u32 = 4 << 20;
 const CACHE_OBJECT_MAX: usize = 4 << 20;
 const ZSTD_DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
-/// Longest delta chain per kind. Trees change by a few entries per version
-/// and are read through a parsed-tree cache, so they get longer chains.
+/// Longest delta chain per kind. Trees and derived index nodes are mostly
+/// 32-byte ids, which compress poorly on their own, change by a few entries
+/// per version and are read through caches, so they get git's default depth
+/// (a whole copy every 51 versions instead of every 17 halved their
+/// storage on git.git). File contents keep shorter chains for cold reads.
 fn max_depth(kind: ObjectKind) -> u16 {
     match kind {
-        ObjectKind::Tree => 16,
+        ObjectKind::Tree | ObjectKind::Derived => 50,
         _ => 10,
     }
 }
@@ -66,6 +71,7 @@ fn max_depth(kind: ObjectKind) -> u16 {
 pub enum ObjectCodec {
     Raw = 0,
     Zstd = 1,
+    Dict = 2,
     Delta = 3,
     Manifest = 4,
 }
@@ -75,6 +81,7 @@ impl ObjectCodec {
         Ok(match b {
             0 => Self::Raw,
             1 => Self::Zstd,
+            2 => Self::Dict,
             3 => Self::Delta,
             4 => Self::Manifest,
             c => return Err(StoreError::Corrupt(format!("unknown codec {c}"))),
@@ -150,7 +157,8 @@ impl MetaHasher {
 struct Header {
     codec: ObjectCodec,
     kind: u8,
-    /// Delta chain depth (0 for whole objects).
+    /// Delta chain depth (0 for whole objects); the dictionary id for
+    /// codec 2.
     depth: u16,
     len: u64,
 }
@@ -191,6 +199,10 @@ struct Inner {
     trees: moka::future::Cache<TreeId, Arc<Tree>>,
     /// Decoded, verified objects.
     decoded: moka::sync::Cache<[u8; 32], Bytes>,
+    /// Trained dictionaries, loaded lazily (and reloaded when an object names
+    /// one this process has not seen, e.g. trained by another server).
+    dicts: std::sync::RwLock<DictSet>,
+    dicts_loaded: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Clone)]
@@ -263,6 +275,8 @@ impl BlobStore {
                     .weigher(|_, b: &Bytes| b.len().max(64) as u32)
                     .max_capacity(512 << 20)
                     .build(),
+                dicts: Default::default(),
+                dicts_loaded: Default::default(),
             }),
         }
     }
@@ -387,6 +401,168 @@ impl BlobStore {
         }
     }
 
+    /// Stored bytes by `(kind, codec)`: `(objects, encoded bytes, decoded
+    /// bytes)`. Reads every object header; segment stores only.
+    pub async fn codec_stats(&self) -> StoreResult<std::collections::BTreeMap<(String, String), (u64, u64, u64)>> {
+        let Backend::Segments(s) = &self.inner.backend else {
+            return Err(StoreError::Backend(anyhow::anyhow!("storage stats are only available for file:// stores")));
+        };
+        let s = s.clone();
+        tokio::task::spawn_blocking(move || -> StoreResult<_> {
+            let mut out: std::collections::BTreeMap<(String, String), (u64, u64, u64)> = Default::default();
+            for id in s.ids() {
+                let Some((kind, raw)) = s.get(&id).map_err(|e| StoreError::Backend(e.into()))? else { continue };
+                let h = Header::parse(&raw)?;
+                let kind = ["content", "chunk", "tree", "changeset", "derived"].get(kind as usize).copied().unwrap_or("?");
+                let codec = match h.codec {
+                    ObjectCodec::Raw => "raw",
+                    ObjectCodec::Zstd => "zstd",
+                    ObjectCodec::Dict => "zstd+dict",
+                    ObjectCodec::Delta => "delta",
+                    ObjectCodec::Manifest => "chunked",
+                };
+                let e = out.entry((kind.to_string(), codec.to_string())).or_default();
+                e.0 += 1;
+                e.1 += raw.len() as u64;
+                e.2 += h.len;
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| StoreError::Backend(e.into()))?
+    }
+
+    // ───────────── trained dictionaries ─────────────
+
+    fn dict_key(namespace: &str, id: u16) -> ObjPath {
+        if namespace.is_empty() { ObjPath::from(format!("dicts/{id}")) } else { ObjPath::from(format!("{namespace}/dicts/{id}")) }
+    }
+
+    /// Read every dictionary file from the backend.
+    async fn read_dict_files(&self) -> StoreResult<Vec<Vec<u8>>> {
+        match &self.inner.backend {
+            Backend::Segments(s) => {
+                let dir = s.dir().join("dicts");
+                tokio::task::spawn_blocking(move || -> std::io::Result<Vec<Vec<u8>>> {
+                    let mut out = Vec::new();
+                    let entries = match std::fs::read_dir(&dir) {
+                        Ok(e) => e,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+                        Err(e) => return Err(e),
+                    };
+                    for e in entries {
+                        let path = e?.path();
+                        if path.extension().is_some_and(|x| x == "zdict") {
+                            out.push(std::fs::read(path)?);
+                        }
+                    }
+                    Ok(out)
+                })
+                .await
+                .map_err(|e| StoreError::Backend(e.into()))?
+                .map_err(|e| StoreError::Backend(e.into()))
+            }
+            Backend::Object { store, namespace } => {
+                let prefix =
+                    if namespace.is_empty() { ObjPath::from("dicts") } else { ObjPath::from(format!("{namespace}/dicts")) };
+                let metas: Vec<object_store::ObjectMeta> = store
+                    .list(Some(&prefix))
+                    .map(|m| m.map_err(StoreError::from))
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<StoreResult<_>>()?;
+                let mut out = Vec::new();
+                for m in metas {
+                    out.push(store.get(&m.location).await?.bytes().await?.to_vec());
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// (Re)load dictionaries from the backend.
+    pub async fn load_dicts(&self) -> StoreResult<()> {
+        let mut loaded = self.inner.dicts_loaded.lock().await;
+        let files = self.read_dict_files().await?;
+        let mut set = self.inner.dicts.read().unwrap().clone();
+        for f in files {
+            let d = Dict::decode_file(&f, ZSTD_LEVEL)?;
+            if !set.by_id.contains_key(&d.id) {
+                set.insert(d);
+            }
+        }
+        *self.inner.dicts.write().unwrap() = set;
+        *loaded = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// The newest dictionary per kind (loading dictionaries on first use and
+    /// rechecking every minute for ones trained elsewhere).
+    async fn active_dicts(&self) -> HashMap<ObjectKind, Arc<Dict>> {
+        let stale = self.inner.dicts_loaded.lock().await.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(60));
+        if stale && let Err(e) = self.load_dicts().await {
+            tracing::warn!(error = %e, "loading compression dictionaries failed");
+        }
+        let set = self.inner.dicts.read().unwrap();
+        [ObjectKind::Content, ObjectKind::Tree, ObjectKind::Changeset, ObjectKind::Derived]
+            .into_iter()
+            .filter_map(|k| set.active(k).map(|d| (k, d.clone())))
+            .collect()
+    }
+
+    async fn dict(&self, id: u16) -> StoreResult<Arc<Dict>> {
+        if let Some(d) = self.inner.dicts.read().unwrap().get(id) {
+            return Ok(d.clone());
+        }
+        self.load_dicts().await?;
+        self.inner.dicts.read().unwrap().get(id).cloned().ok_or_else(|| StoreError::Corrupt(format!("dictionary {id} missing")))
+    }
+
+    /// Dictionaries known to this store: `(id, kind, bytes)`.
+    pub async fn list_dicts(&self) -> StoreResult<Vec<(u16, ObjectKind, usize)>> {
+        self.load_dicts().await?;
+        let mut out: Vec<_> = self.inner.dicts.read().unwrap().by_id.values().map(|d| (d.id, d.kind, d.raw.len())).collect();
+        out.sort_by_key(|d| d.0);
+        Ok(out)
+    }
+
+    /// Persist a newly trained dictionary and make it the active one for its
+    /// kind. Dictionary files are never overwritten.
+    pub async fn install_dict(&self, kind: ObjectKind, raw: Vec<u8>) -> StoreResult<u16> {
+        self.load_dicts().await?;
+        let id = self.inner.dicts.read().unwrap().next_id();
+        let dict = Dict::new(id, kind, raw, ZSTD_LEVEL);
+        let file = dict.encode_file();
+        match &self.inner.backend {
+            Backend::Segments(s) => {
+                let dir = s.dir().join("dicts");
+                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    use std::io::Write as _;
+                    std::fs::create_dir_all(&dir)?;
+                    let tmp = dir.join(format!("{id}.zdict.tmp"));
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(&file)?;
+                    f.sync_all()?;
+                    // A hard link creates the name atomically and fails if it exists.
+                    let linked = std::fs::hard_link(&tmp, dir.join(format!("{id}.zdict")));
+                    std::fs::remove_file(&tmp)?;
+                    linked?;
+                    std::fs::File::open(&dir)?.sync_all()
+                })
+                .await
+                .map_err(|e| StoreError::Backend(e.into()))?
+                .map_err(|e| StoreError::Backend(e.into()))?;
+            }
+            Backend::Object { store, namespace } => {
+                let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+                store.put_opts(&Self::dict_key(namespace, id), PutPayload::from(Bytes::from(file)), opts).await?;
+            }
+        }
+        self.inner.dicts.write().unwrap().insert(dict);
+        Ok(id)
+    }
+
     /// Make all writes so far durable. MUST be called before metadata that
     /// references new objects is committed (SPEC §5.2 ordering invariant).
     pub async fn sync(&self) -> StoreResult<()> {
@@ -435,6 +611,15 @@ impl BlobStore {
                 ObjectCodec::Zstd => {
                     let out = block_in_place_if_large(len, || zstd::bulk::decompress(&payload, len))
                         .map_err(|e| StoreError::Corrupt(format!("zstd: {e}")))?;
+                    Bytes::from(out)
+                }
+                ObjectCodec::Dict => {
+                    let dict = self.dict(h.depth).await?;
+                    let out = block_in_place_if_large(len, || {
+                        zstd::bulk::Decompressor::with_prepared_dictionary(&dict.dec)
+                            .and_then(|mut d| d.decompress(&payload, len))
+                    })
+                    .map_err(|e| StoreError::Corrupt(format!("zstd dict {}: {e}", h.depth)))?;
                     Bytes::from(out)
                 }
                 ObjectCodec::Delta => {
@@ -488,7 +673,7 @@ impl BlobStore {
         };
         let h = Header::parse(&peek)?;
         let depth = match h.codec {
-            ObjectCodec::Raw | ObjectCodec::Zstd => 0,
+            ObjectCodec::Raw | ObjectCodec::Zstd | ObjectCodec::Dict => 0,
             ObjectCodec::Delta => h.depth,
             ObjectCodec::Manifest => return Ok(None),
         };
@@ -574,10 +759,12 @@ impl BlobStore {
         let ext_depth: Vec<Option<u16>> =
             bases.iter().map(|b| b.as_ref().filter(|(id, _, _)| !index.contains_key(id)).map(|(_, d, _)| *d)).collect();
         let work: Vec<(PutObject, Option<([u8; 32], u16, Bytes)>)> = todo.into_iter().zip(bases).collect();
+        let dicts = self.active_dicts().await;
         let encoded: Vec<StoreResult<(ObjectKind, [u8; 32], Vec<u8>, bool)>> = tokio::task::spawn_blocking(move || {
             work.into_par_iter()
                 .map(|(it, base)| {
-                    let (bytes, depth) = encode(it.kind, &it.data, base.as_ref().map(|(id, d, b)| (id, *d, b.as_ref())))?;
+                    let dict = dicts.get(&it.kind).map(|d| d.as_ref());
+                    let (bytes, depth) = encode(it.kind, &it.data, base.as_ref().map(|(id, d, b)| (id, *d, b.as_ref())), dict)?;
                     Ok((it.kind, it.id, bytes, depth > 0))
                 })
                 .collect()
@@ -800,7 +987,12 @@ fn block_in_place_if_large<R>(len: usize, f: impl FnOnce() -> R) -> R {
 
 /// Encode one object against an optional delta base `(id, depth, bytes)`.
 /// Returns the encoded bytes and the resulting chain depth.
-fn encode(kind: ObjectKind, data: &[u8], base: Option<(&[u8; 32], u16, &[u8])>) -> StoreResult<(Vec<u8>, u16)> {
+fn encode(
+    kind: ObjectKind,
+    data: &[u8],
+    base: Option<(&[u8; 32], u16, &[u8])>,
+    dict: Option<&Dict>,
+) -> StoreResult<(Vec<u8>, u16)> {
     let err = |e: std::io::Error| StoreError::Backend(e.into());
     let mut out = Vec::with_capacity(HEADER_LEN + data.len() / 2);
     if data.len() < MIN_COMPRESS {
@@ -827,7 +1019,15 @@ fn encode(kind: ObjectKind, data: &[u8], base: Option<(&[u8; 32], u16, &[u8])>) 
         write_delta(&mut out, bid, *depth, d);
         return Ok((out, *depth));
     }
-    let full = zstd::bulk::compress(data, ZSTD_LEVEL).map_err(err)?;
+    // Small objects: the kind's trained dictionary (when there is one).
+    let (full, full_codec, dict_id) = match dict.filter(|_| data.len() <= DICT_MAX_OBJECT) {
+        Some(d) => (
+            zstd::bulk::Compressor::with_prepared_dictionary(&d.enc).and_then(|mut c| c.compress(data)).map_err(err)?,
+            ObjectCodec::Dict,
+            d.id,
+        ),
+        None => (zstd::bulk::compress(data, ZSTD_LEVEL).map_err(err)?, ObjectCodec::Zstd, 0),
+    };
     match delta {
         // Deltas must clearly beat standalone compression.
         Some((bid, depth, d)) if d.len() + 32 < full.len() / 2 => {
@@ -835,7 +1035,7 @@ fn encode(kind: ObjectKind, data: &[u8], base: Option<(&[u8; 32], u16, &[u8])>) 
             Ok((out, depth))
         }
         _ if full.len() < data.len() => {
-            Header::write(&mut out, ObjectCodec::Zstd, kind, data.len() as u64);
+            Header::write_depth(&mut out, full_codec, kind, data.len() as u64, dict_id);
             out.extend_from_slice(&full);
             Ok((out, 0))
         }
@@ -1073,6 +1273,47 @@ mod tests {
                 _ => panic!(),
             };
             assert_eq!(a, b);
+        }
+    }
+
+    /// Small files that share vocabulary, like source files in one repo.
+    fn sample_file(i: usize) -> Vec<u8> {
+        format!(
+            "// Copyright flux authors\nuse std::collections::HashMap;\n\npub fn handler_{i}(req: &Request) -> Result<Response, Error> {{\n    let id = req.param(\"id\")?;\n    tracing::info!(id, \"handling request {i}\");\n    Ok(Response::json(&lookup(id)?))\n}}\n"
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn trained_dictionary_compresses_small_objects() {
+        for (dir, s) in stores() {
+            let samples: Vec<Vec<u8>> = (0..400).map(sample_file).collect();
+            let raw = crate::dict::train(&samples, 16 << 10).unwrap();
+            let before = encode(ObjectKind::Content, &sample_file(9999), None, None).unwrap().0.len();
+            let id = s.install_dict(ObjectKind::Content, raw).await.unwrap();
+            assert_eq!(id, 1);
+            assert_eq!(s.list_dicts().await.unwrap(), vec![(1, ObjectKind::Content, s.dict(1).await.unwrap().raw.len())]);
+            let data = sample_file(9999);
+            let (cid, _) = s.put_content(&data).await.unwrap();
+            let stored = s.backend_get(ObjectKind::Content, cid.as_bytes()).await.unwrap().unwrap();
+            let h = Header::parse(&stored).unwrap();
+            assert_eq!((h.codec, h.depth), (ObjectCodec::Dict, 1));
+            assert!(stored.len() * 2 < before, "dictionary should at least halve a small file: {} vs {before}", stored.len());
+            assert_eq!(s.get_content(&cid).await.unwrap().unwrap(), data);
+            // A fresh process loads the dictionary on demand.
+            if let Ok(url) = url::Url::from_directory_path(dir.path())
+                && matches!(s.inner.backend, Backend::Segments(_))
+            {
+                s.sync().await.unwrap();
+                drop(s);
+                let reopened = BlobStore::open(url.as_str()).unwrap();
+                assert_eq!(reopened.get_content(&cid).await.unwrap().unwrap(), data);
+                // Ids are never reused.
+                assert_eq!(
+                    reopened.install_dict(ObjectKind::Tree, crate::dict::train(&samples, 8 << 10).unwrap()).await.unwrap(),
+                    2
+                );
+            }
         }
     }
 }
