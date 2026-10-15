@@ -561,6 +561,15 @@ Standard gRPC codes, plus a `google.rpc.ErrorInfo` with `reason` taken from a cl
 
 ---
 
+### 9.4 Virtual filesystem (as built)
+`flux mount DIR [--rev REV]` mounts a revision read-only on Linux, through FUSE (the `fuser` crate in pure-Rust mode, so `fusermount3` is the only system requirement).
+- **Lazy loading:** directories are flux trees, loaded with their immediate subdirectories in one request; files are fetched on first read.
+- **Caching:** an in-process cache holds 512 MiB of file contents, and the kernel page cache is kept across opens (`FOPEN_KEEP_CACHE`), since everything under a mount is immutable.
+- **Fidelity:** the executable bit, symlinks and submodule directories are preserved.
+- **Daemon:** the mount goes through `fluxd` like any other command.
+- **Tested:** CI checks the mount against a checkout byte for byte (`ci/fuse-test.sh`).
+- **Not yet:** a writable overlay, and macOS (no FUSE in the base system).
+
 ## 10. Git interoperability
 
 ### 10.1 Import (`flux-import-git`)

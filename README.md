@@ -82,6 +82,7 @@ flux cat main~3 Makefile
 flux show @ --stat
 flux watch                       # live ref moves and review activity
 flux daemon enable               # local cache daemon: objects from disk, new revisions prefetched
+flux mount /mnt/repo --rev main  # Linux: read-only FUSE view, files load on first read
 flux web                         # open this file/directory in the browser
 ```
 

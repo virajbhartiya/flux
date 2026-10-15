@@ -38,6 +38,18 @@ jobs:
         env:
           FLUX_TEST_POSTGRES_URL: postgres://postgres:flux@localhost:5432/flux_test
 
+  fuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - run: cargo build --release -p flux-cli -p flux-server
+      - run: ci/fuse-test.sh
+        env:
+          BIN: target/release
+
   docker:
     runs-on: ubuntu-latest
     steps:

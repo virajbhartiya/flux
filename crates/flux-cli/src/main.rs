@@ -1,5 +1,7 @@
 //! `flux`: the command-line client (SPEC §13.1).
 
+#[cfg(target_os = "linux")]
+mod vfs;
 mod wc;
 
 use std::collections::{BTreeMap, HashMap};
@@ -207,6 +209,14 @@ enum Cmd {
     },
     /// Open the web UI for the current repository, revision and path.
     Web { path: Option<String> },
+    /// Mount a revision read-only (Linux, FUSE): directories and files load
+    /// on first access. Runs until Ctrl-C.
+    Mount {
+        dir: PathBuf,
+        /// Revision to mount (default: the working copy's parent, or main).
+        #[arg(short, long)]
+        rev: Option<String>,
+    },
     /// Manage fluxd, the local cache daemon (commands route through it
     /// automatically while it runs).
     Daemon {
@@ -920,6 +930,25 @@ async fn run(cli: Cli) -> Result<()> {
                     "review" => println!("{} review #{} {}", st.dim(&e.repo), e.review, e.detail),
                     other => println!("{} {other}", st.dim(&e.repo)),
                 }
+            }
+        }
+        Cmd::Mount { dir, rev } => {
+            let client = client_for(&cli, wc.as_ref()).await?;
+            let rev = match rev {
+                Some(r) => expand_rev(r, wc.as_ref())?,
+                None => wc.as_ref().and_then(|w| w.state.parent).map(|p| p.to_hex()).unwrap_or_else(|| "main".into()),
+            };
+            let info = client.resolve(&rev).await?;
+            #[cfg(target_os = "linux")]
+            {
+                let mtime = UNIX_EPOCH + std::time::Duration::from_millis(info.changeset.author_time.unix_ms.max(0) as u64);
+                eprintln!("{} {} at {} (Ctrl-C to unmount)", st.dim("mounted"), info.id.short(), dir.display());
+                vfs::mount(client, info.root_tree, mtime, dir).await?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (info, dir);
+                bail!("flux mount needs Linux (FUSE); use a sparse working copy (flux attach --sparse) here");
             }
         }
         Cmd::Daemon { cmd } => {
