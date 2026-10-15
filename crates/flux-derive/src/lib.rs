@@ -5,7 +5,10 @@ pub mod lastmod;
 pub mod tree;
 
 pub use lastmod::{LmEntry, LmNode, LmWriter, Side, derive_lastmod, lastmod_dir, load_lm, lookup_lastmod};
-pub use tree::{TreeDiffEntry, TreeFile, TreeWriter, derive_tree, derive_tree_buffered, diff_trees, lookup_path, walk_tree};
+pub use tree::{
+    TreeDiffEntry, TreeFile, TreeOverlay, TreeSource, TreeWriter, derive_tree, derive_tree_buffered, diff_trees, diff_trees_in,
+    lookup_path, lookup_path_in, walk_tree,
+};
 
 use flux_store::DerivedTypeId;
 

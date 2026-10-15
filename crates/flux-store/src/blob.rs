@@ -726,15 +726,32 @@ impl BlobStore {
             planned[i]
         }
         let usable = |it: &PutObject| it.data.len() <= MAX_DELTA_BYTES && it.data.len() >= MIN_COMPRESS;
-        // External bases first: their stored depth seeds the plan.
+        // External bases first: their stored depth seeds the plan. They are
+        // fetched concurrently (each may decode a delta chain).
+        let external: Vec<(usize, [u8; 32])> = todo
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| match it.base.filter(|b| *b != it.id) {
+                Some(b) if !index.contains_key(&b) && usable(it) => Some((i, b)),
+                _ => None,
+            })
+            .collect();
+        let futs: Vec<_> = external
+            .iter()
+            .map(|(i, b)| {
+                let (kind, b) = (todo[*i].kind, *b);
+                async move { self.delta_base(kind, &b).await }
+            })
+            .collect();
+        let fetched: Vec<StoreResult<Option<(u16, Bytes)>>> = futures::stream::iter(futs).buffered(32).collect().await;
+        for ((i, b), base) in external.iter().zip(fetched) {
+            let base = base?.filter(|(_, bytes)| !bytes.starts_with(&ZSTD_DICT_MAGIC));
+            planned[*i] = Some(base.as_ref().map(|(d, _)| d + 1).unwrap_or(0));
+            bases[*i] = base.map(|(d, bytes)| (*b, d, bytes));
+        }
         for (i, it) in todo.iter().enumerate() {
             match it.base.filter(|b| *b != it.id) {
-                Some(b) if !index.contains_key(&b) => {
-                    let base = if usable(it) { self.delta_base(it.kind, &b).await? } else { None };
-                    let base = base.filter(|(_, bytes)| !bytes.starts_with(&ZSTD_DICT_MAGIC));
-                    planned[i] = Some(base.as_ref().map(|(d, _)| d + 1).unwrap_or(0));
-                    bases[i] = base.map(|(d, bytes)| (b, d, bytes));
-                }
+                Some(b) if !index.contains_key(&b) && planned[i].is_none() => planned[i] = Some(0),
                 None => planned[i] = Some(0),
                 _ => {}
             }
@@ -757,6 +774,14 @@ impl BlobStore {
         let base_ids: Vec<Option<[u8; 32]>> = bases.iter().map(|b| b.as_ref().map(|(id, _, _)| *id)).collect();
         let ext_depth: Vec<Option<u16>> =
             bases.iter().map(|b| b.as_ref().filter(|(id, _, _)| !index.contains_key(id)).map(|(_, d, _)| *d)).collect();
+        // New versions usually become the next version's delta base: keep
+        // them decoded (once written) so that needs no chain walk.
+        let keep: Vec<([u8; 32], Bytes)> = todo
+            .iter()
+            .filter(|it| it.kind == ObjectKind::Content && (MIN_COMPRESS..=CACHE_OBJECT_MAX).contains(&it.data.len()))
+            .map(|it| (it.id, it.data.clone()))
+            .collect();
+        let planned_at = std::time::Instant::now();
         let work: Vec<(PutObject, Option<([u8; 32], u16, Bytes)>)> = todo.into_iter().zip(bases).collect();
         let dicts = self.active_dicts().await;
         let encoded: Vec<StoreResult<(ObjectKind, [u8; 32], Vec<u8>, bool)>> = tokio::task::spawn_blocking(move || {
@@ -805,7 +830,13 @@ impl BlobStore {
                 encoded[i].2[6..8].copy_from_slice(&d.to_be_bytes());
             }
         }
-        self.backend_put(encoded.into_iter().map(|(k, id, b, _)| (k, id, b)).collect()).await
+        let encode_us = planned_at.elapsed().as_micros() as u64;
+        self.backend_put(encoded.into_iter().map(|(k, id, b, _)| (k, id, b)).collect()).await?;
+        tracing::debug!(n = keep.len(), encode_us, total_us = planned_at.elapsed().as_micros() as u64, "put_objects");
+        for (id, data) in keep {
+            self.inner.decoded.insert(id, data);
+        }
+        Ok(())
     }
 
     /// Write a single object with no delta hint.
@@ -984,6 +1015,20 @@ fn block_in_place_if_large<R>(len: usize, f: impl FnOnce() -> R) -> R {
     if len > (1 << 20) && multi { tokio::task::block_in_place(f) } else { f() }
 }
 
+/// zstd-compress `data` with `base` as a single-use raw-content prefix:
+/// indexed in place rather than copied into a dictionary first. Frames
+/// decode with `base` as a raw-content dictionary.
+fn delta_compress(base: &[u8], data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use zstd::zstd_safe::{CCtx, CParameter};
+    let code = |c: usize| std::io::Error::other(zstd::zstd_safe::get_error_name(c));
+    let mut cctx = CCtx::create();
+    cctx.set_parameter(CParameter::CompressionLevel(ZSTD_DELTA_LEVEL)).map_err(code)?;
+    cctx.ref_prefix(base).map_err(code)?;
+    let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()));
+    cctx.compress2(&mut out, data).map_err(code)?;
+    Ok(out)
+}
+
 /// Encode one object against an optional delta base `(id, depth, bytes)`.
 /// Returns the encoded bytes and the resulting chain depth.
 fn encode(
@@ -1000,10 +1045,7 @@ fn encode(
         return Ok((out, 0));
     }
     let delta = match base {
-        Some((bid, depth, bytes)) => {
-            let mut c = zstd::bulk::Compressor::with_dictionary(ZSTD_DELTA_LEVEL, bytes).map_err(err)?;
-            Some((bid, depth + 1, c.compress(data).map_err(err)?))
-        }
+        Some((bid, depth, bytes)) => Some((bid, depth + 1, delta_compress(bytes, data).map_err(err)?)),
         None => None,
     };
     let write_delta = |out: &mut Vec<u8>, bid: &[u8; 32], depth: u16, d: &[u8]| {
@@ -1011,9 +1053,10 @@ fn encode(
         out.extend_from_slice(bid);
         out.extend_from_slice(d);
     };
-    // A tiny delta is always good enough; skip the full compression.
+    // A small delta is good enough: standalone compression rarely gets
+    // below a quarter, so this already beats it by the 2x required below.
     if let Some((bid, depth, d)) = &delta
-        && d.len() + 32 <= data.len() / 16
+        && d.len() + 32 <= data.len() / 8
     {
         write_delta(&mut out, bid, *depth, d);
         return Ok((out, *depth));

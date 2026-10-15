@@ -42,6 +42,35 @@ async fn load(blobs: &BlobStore, id: TreeId) -> DeriveResult<Arc<Tree>> {
     blobs.get_tree(&id).await?.ok_or(DeriveError::MissingTree(id))
 }
 
+/// Trees buffered in a [`TreeWriter`] (see [`TreeWriter::snapshot`]).
+pub type TreeOverlay = Arc<std::collections::HashMap<TreeId, Arc<Tree>>>;
+
+/// Where traversals read trees from: the blob store, optionally overlaid
+/// with trees that are derived but not yet written, so validation can run
+/// while they flush.
+#[derive(Clone)]
+pub struct TreeSource {
+    blobs: BlobStore,
+    overlay: Option<TreeOverlay>,
+}
+
+impl TreeSource {
+    pub fn new(blobs: &BlobStore) -> Self {
+        Self { blobs: blobs.clone(), overlay: None }
+    }
+
+    pub fn with_overlay(blobs: &BlobStore, overlay: TreeOverlay) -> Self {
+        Self { blobs: blobs.clone(), overlay: Some(overlay) }
+    }
+
+    pub async fn get(&self, id: TreeId) -> DeriveResult<Arc<Tree>> {
+        if let Some(t) = self.overlay.as_ref().and_then(|o| o.get(&id)) {
+            return Ok(t.clone());
+        }
+        load(&self.blobs, id).await
+    }
+}
+
 /// Buffers newly derived trees in memory so a batch of derivations can be
 /// written to the blob store concurrently. Callers MUST [`TreeWriter::flush`]
 /// before persisting anything that references the trees (SPEC §5.2 ordering).
@@ -71,6 +100,12 @@ impl<'a> TreeWriter<'a> {
         let id = TreeId::hash(&bytes);
         self.pending.lock().unwrap().entry(id).or_insert_with(|| (Arc::new(tree), bytes, base.filter(|b| *b != id)));
         id
+    }
+
+    /// The buffered trees, for reading them before [`TreeWriter::flush`]
+    /// completes.
+    pub fn snapshot(&self) -> TreeOverlay {
+        Arc::new(self.pending.lock().unwrap().iter().map(|(id, (t, _, _))| (*id, t.clone())).collect())
     }
 
     /// Write all pending trees in one batch and clear the buffer. Callers
@@ -267,10 +302,15 @@ pub async fn walk_tree(
 
 /// Look up the entry at `path` under `root`.
 pub async fn lookup_path(blobs: &BlobStore, root: TreeId, path: &RepoPath) -> DeriveResult<Option<TreeEntry>> {
+    lookup_path_in(&TreeSource::new(blobs), root, path).await
+}
+
+/// [`lookup_path`] reading from `src`.
+pub async fn lookup_path_in(src: &TreeSource, root: TreeId, path: &RepoPath) -> DeriveResult<Option<TreeEntry>> {
     let mut current = root;
     let comps: Vec<&[u8]> = path.components().collect();
     for (i, comp) in comps.iter().enumerate() {
-        let tree = load(blobs, current).await?;
+        let tree = src.get(current).await?;
         let Some(e) = tree.get(comp) else {
             return Ok(None);
         };
@@ -303,6 +343,16 @@ pub async fn diff_trees(
     new: Option<TreeId>,
     include: &(dyn Fn(&RepoPath, bool) -> bool + Sync),
 ) -> DeriveResult<Vec<TreeDiffEntry>> {
+    diff_trees_in(&TreeSource::new(blobs), old, new, include).await
+}
+
+/// [`diff_trees`] reading from `src`.
+pub async fn diff_trees_in(
+    src: &TreeSource,
+    old: Option<TreeId>,
+    new: Option<TreeId>,
+    include: &(dyn Fn(&RepoPath, bool) -> bool + Sync),
+) -> DeriveResult<Vec<TreeDiffEntry>> {
     let mut out = Vec::new();
     let mut stack: Vec<(Option<RepoPath>, Option<TreeId>, Option<TreeId>)> = vec![(None, old, new)];
     let empty = Arc::new(Tree::empty());
@@ -313,13 +363,13 @@ pub async fn diff_trees(
         let (ta, tb) = futures::future::try_join(
             async {
                 match a {
-                    Some(id) => load(blobs, id).await,
+                    Some(id) => src.get(id).await,
                     None => Ok(empty.clone()),
                 }
             },
             async {
                 match b {
-                    Some(id) => load(blobs, id).await,
+                    Some(id) => src.get(id).await,
                     None => Ok(empty.clone()),
                 }
             },

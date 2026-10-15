@@ -330,6 +330,12 @@ service WriteService {
   // Batch create: changesets are applied in order and may use earlier batch
   // members as parents. One transaction per batch (importers, agents).
   rpc CreateChangesets(CreateChangesetsRequest) returns (CreateChangesetsResponse);
+  // Pipelined batch create for bulk imports: one response per request, in
+  // order. The server validates and derives batch k+1 while batch k
+  // commits, so later batches may name changesets of earlier, still
+  // in-flight ones as parents. The first failure ends the stream; batches
+  // answered before it are durable. Every request names the same repo.
+  rpc CreateChangesetsStream(stream CreateChangesetsRequest) returns (stream CreateChangesetsResponse);
   rpc UpdateRef(UpdateRefRequest) returns (UpdateRefResponse);
   rpc PutGitMapping(PutGitMappingRequest) returns (PutGitMappingResponse);
   // Land a stack (all ancestors of `rev` not yet in `target_ref`) on the

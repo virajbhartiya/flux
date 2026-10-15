@@ -91,3 +91,46 @@ async fn tokens_and_protected_refs() {
     let found = alice.find_files(&hex, "key", 10).await.unwrap();
     assert!(found.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pipelined_create_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = flux_server::StorageConfig::data_dir(dir.path()).unwrap();
+    let flux = flux_server::open(&cfg).await.unwrap();
+    flux.create_repo("r").await.unwrap();
+    let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
+    let c = Client::connect(&format!("http://{addr}"), "r").await.unwrap();
+    let ids = c.upload(&[b"one", b"two", b"three", b"four"]).await.unwrap();
+
+    // Each batch builds on the previous one, sent before it commits.
+    let a = cs(None, "a", ids[0], 3);
+    let b = cs(Some(a.id()), "b", ids[1], 3);
+    let c3 = cs(Some(b.id()), "c", ids[2], 5);
+    let d = cs(Some(c3.id()), "d", ids[3], 4);
+    let (tx, mut rx) = c.create_stream().await.unwrap();
+    tx.send(std::slice::from_ref(&a), &[[1; 20]]).await.unwrap();
+    tx.send(&[b.clone(), c3.clone()], &[]).await.unwrap();
+    tx.send(std::slice::from_ref(&d), &[]).await.unwrap();
+    drop(tx);
+    let mut got = Vec::new();
+    while let Some(batch) = rx.next().await.unwrap() {
+        got.push(batch);
+    }
+    assert_eq!(got, vec![vec![a.id()], vec![b.id(), c3.id()], vec![d.id()]]);
+    let repo = flux.repo("r").await.unwrap();
+    assert_eq!(flux.meta.get_gens(repo, &[d.id()]).await.unwrap(), vec![Some(4)]);
+    assert_eq!(flux.meta.git_to_cs(repo, &[[1; 20]]).await.unwrap(), vec![Some(a.id())], "git mapping recorded");
+    assert!(flux.root_trees(repo, &[d.id()]).await.is_ok());
+
+    // A bad batch ends the stream; earlier batches are still answered.
+    let e = cs(Some(d.id()), "e", ids[0], 3);
+    let orphan = cs(Some(flux_core::ChangesetId::hash(b"nope")), "f", ids[0], 3);
+    let (tx, mut rx) = c.create_stream().await.unwrap();
+    tx.send(std::slice::from_ref(&e), &[]).await.unwrap();
+    let _ = tx.send(std::slice::from_ref(&orphan), &[]).await;
+    drop(tx);
+    assert_eq!(rx.next().await.unwrap(), Some(vec![e.id()]));
+    let err = rx.next().await.unwrap_err().to_string();
+    assert!(err.contains("not found"), "{err}");
+}

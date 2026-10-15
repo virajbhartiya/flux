@@ -19,7 +19,7 @@ fn unique(name: &str) -> String {
 }
 
 fn cs(n: u8, parents: Vec<ChangesetId>, gen_num: u64) -> NewChangeset {
-    NewChangeset { id: ChangesetId::hash(&[n]), parents, gen_num, body: vec![n; 3] }
+    NewChangeset { id: ChangesetId::hash(&[n]), parents, gen_num, body: vec![n; 3], derived: vec![], git_sha1: None }
 }
 
 #[tokio::test]

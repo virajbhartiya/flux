@@ -42,7 +42,7 @@ pub use flux_proto::v1::ChangesetInfo;
 /// Bytes per upload stream before starting a new one.
 const UPLOAD_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Concurrent upload streams.
-const UPLOAD_STREAMS: usize = 4;
+const UPLOAD_STREAMS: usize = 8;
 /// Max ids per batch request.
 const ID_BATCH: usize = 2_000;
 
@@ -541,6 +541,22 @@ impl Client {
             .collect()
     }
 
+    /// Open a pipelined create stream: batches are sent without waiting
+    /// for earlier ones to commit, and may use changesets of earlier
+    /// batches as parents. Results arrive in order on the receiver.
+    pub async fn create_stream(&self) -> Result<(CreateSender, CreateReceiver)> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<CreateChangesetsRequest>(2);
+        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
+        let responses = self
+            .writes
+            .clone()
+            .create_changesets_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .map_err(|s| anyhow!("create changesets: {}", s.message()))?
+            .into_inner();
+        Ok((CreateSender { repo: self.repo.clone(), tx, expect: etx }, CreateReceiver { responses, expect: erx }))
+    }
+
     /// Compare-and-swap a ref. Returns `Ok(true)` if updated.
     pub async fn update_ref(
         &self,
@@ -785,6 +801,58 @@ fn delta_units(items: Vec<(ContentId, Bytes, Option<ContentId>)>) -> Vec<Vec<Vec
         units.push(vec![open]);
     }
     units
+}
+
+/// The sending half of [`Client::create_stream`].
+pub struct CreateSender {
+    repo: String,
+    tx: tokio::sync::mpsc::Sender<CreateChangesetsRequest>,
+    expect: tokio::sync::mpsc::UnboundedSender<Vec<ChangesetId>>,
+}
+
+impl CreateSender {
+    /// Queue a batch (with the git commit of each changeset, or none).
+    pub async fn send(&self, batch: &[Changeset], git_shas: &[[u8; 20]]) -> Result<()> {
+        let _ = self.expect.send(batch.iter().map(Changeset::id).collect());
+        self.tx
+            .send(CreateChangesetsRequest {
+                repo: self.repo.clone(),
+                changesets: batch.iter().map(flux_proto::changeset_to_pb).collect(),
+                git_sha1s: git_shas.iter().map(|s| s.to_vec()).collect(),
+                ids_only: true,
+            })
+            .await
+            .map_err(|_| anyhow!("create stream closed"))
+    }
+}
+
+/// The receiving half of [`Client::create_stream`].
+pub struct CreateReceiver {
+    responses: tonic::Streaming<CreateChangesetsResponse>,
+    expect: tokio::sync::mpsc::UnboundedReceiver<Vec<ChangesetId>>,
+}
+
+impl CreateReceiver {
+    /// The ids of the next committed batch, checked against what was sent;
+    /// `None` once the sender is dropped and every batch is answered.
+    pub async fn next(&mut self) -> Result<Option<Vec<ChangesetId>>> {
+        let Some(r) = self.responses.message().await.map_err(|s| anyhow!("create changesets: {}", s.message()))? else {
+            return match self.expect.try_recv() {
+                Ok(_) => Err(anyhow!("create stream ended early")),
+                Err(_) => Ok(None),
+            };
+        };
+        let want = self.expect.recv().await.ok_or_else(|| anyhow!("unexpected create response"))?;
+        if r.changesets.len() != want.len() {
+            bail!("server returned {} results for {} changesets", r.changesets.len(), want.len());
+        }
+        for (info, id) in r.changesets.iter().zip(&want) {
+            if ChangesetId::from_slice(&info.id)? != *id {
+                bail!("server computed changeset id {} but client expected {id}", ChangesetId::from_slice(&info.id)?);
+            }
+        }
+        Ok(Some(want))
+    }
 }
 
 #[cfg(test)]

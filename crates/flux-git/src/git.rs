@@ -72,6 +72,83 @@ impl CatFile {
     }
 }
 
+impl CatFile {
+    /// Read many objects with requests pipelined ahead of the responses
+    /// (no round trip per object). Returns (type, data) in order.
+    pub fn read_many(&mut self, shas: &[Sha]) -> Result<Vec<(String, Vec<u8>)>> {
+        let Self { stdin, stdout, .. } = self;
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> Result<()> {
+                for sha in shas {
+                    writeln!(stdin, "{}", hex::encode(sha))?;
+                }
+                stdin.flush()?;
+                Ok(())
+            });
+            let mut out = Vec::with_capacity(shas.len());
+            let mut header = String::new();
+            for sha in shas {
+                header.clear();
+                stdout.read_line(&mut header)?;
+                let mut parts = header.trim_end().split(' ');
+                let (_, ty, size) = (parts.next(), parts.next(), parts.next());
+                let (Some(ty), Some(size)) = (ty, size) else {
+                    if ty == Some("missing") {
+                        bail!("git object {} missing", hex::encode(sha));
+                    }
+                    bail!("unexpected cat-file header {header:?}");
+                };
+                let mut data = vec![0u8; size.parse()?];
+                stdout.read_exact(&mut data)?;
+                let mut nl = [0u8; 1];
+                stdout.read_exact(&mut nl)?;
+                out.push((ty.to_string(), data));
+            }
+            writer.join().map_err(|_| anyhow!("cat-file writer panicked"))??;
+            Ok(out)
+        })
+    }
+}
+
+/// Several `cat-file --batch` processes reading in parallel (git inflates
+/// and resolves deltas single-threaded per process).
+pub struct CatPool {
+    cats: Vec<CatFile>,
+}
+
+impl CatPool {
+    pub fn new(repo: &Path, n: usize) -> Result<Self> {
+        Ok(Self { cats: (0..n.max(1)).map(|_| CatFile::new(repo)).collect::<Result<_>>()? })
+    }
+
+    /// Read `shas`, applying `f` to each (type, data) on the worker
+    /// threads. Results are in input order.
+    pub fn read_map<T: Send>(&mut self, shas: &[Sha], f: impl Fn(&Sha, String, Vec<u8>) -> Result<T> + Sync) -> Result<Vec<T>> {
+        if shas.is_empty() {
+            return Ok(vec![]);
+        }
+        let per = shas.len().div_ceil(self.cats.len());
+        let f = &f;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = self
+                .cats
+                .iter_mut()
+                .zip(shas.chunks(per))
+                .map(|(cat, part)| {
+                    scope.spawn(move || -> Result<Vec<T>> {
+                        cat.read_many(part)?.into_iter().zip(part).map(|((ty, data), sha)| f(sha, ty, data)).collect()
+                    })
+                })
+                .collect();
+            let mut out = Vec::with_capacity(shas.len());
+            for w in workers {
+                out.extend(w.join().map_err(|_| anyhow!("cat-file worker panicked"))??);
+            }
+            Ok(out)
+        })
+    }
+}
+
 impl Drop for CatFile {
     fn drop(&mut self) {
         let _ = self.child.kill();

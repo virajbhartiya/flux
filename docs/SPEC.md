@@ -854,7 +854,7 @@ flux/
 - `CreateChangeset` p99 < 100 ms (Postgres, 100 changes).
 
 **Implementation notes (2026-10-14).** What is built, and where it differs from the spec above:
-- **Git import** uses git's own plumbing (one long-running `cat-file --batch` and one streaming `diff-tree --stdin`) instead of `gix`, in a three-stage pipeline (git reader thread → uploader → creator). It sends delta hints (the previous version of each path). git.git imports at about 1,170 changesets/s on SQLite or Postgres.
+- **Git import** uses git's own plumbing (streaming `diff-tree --stdin`, plus `cat-file --batch` with pipelined requests: one process for commits, four reading blobs in parallel) instead of `gix`, in a three-stage pipeline (git reader thread → uploader → creator). It sends delta hints (the previous version of each path). Creation is pipelined over `CreateChangesetsStream`: the server validates and derives batch k+1 while batch k commits, and each batch's changesets, root trees and git mappings share one transaction. git.git imports at about 1,550–2,090 changesets/s on SQLite.
 - **`CreateChangesets` batch RPC (added).** Changesets are applied in order and may name earlier batch members as parents. A batch gets one content check, one tree flush, parallel merge checks and one metadata transaction.
 - **`FileChange::Retain` (added, encoding tag `[2]`).** Valid only in merges. It lists a path where the parents disagree and the resolution is `parents[0]`'s value, which satisfies the merge-completeness rule (§3.3, enforced) without repeating content ids. git.git merges list thousands of such paths, so this keeps metadata about 4x smaller. Changeset bodies are also zstd-compressed at rest.
 - **Blob storage (§5.2).**

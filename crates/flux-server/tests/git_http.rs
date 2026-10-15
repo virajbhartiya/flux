@@ -10,6 +10,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // Git for Windows' system config turns on autocrlf; compare bytes.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.autocrlf")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_AUTHOR_NAME", "Ada")
         .env("GIT_AUTHOR_EMAIL", "ada@x.org")
         .env("GIT_COMMITTER_NAME", "Ada")

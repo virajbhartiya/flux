@@ -8,7 +8,7 @@ use flux_core::{ChangesetId, ChunkId, ContentId, EntryKind, RepoPath, TreeId};
 use flux_derive::{diff_trees, lookup_path};
 use flux_proto::v1::{self, *};
 use flux_proto::{FRAME_BYTES, changeset_from_pb, content_id, cs_id, kind_to_pb, opt_repo_path, tree_id};
-use flux_store::{CasOutcome, ContentLayout, RefExpect};
+use flux_store::{CasOutcome, ContentLayout, RefExpect, RepoId};
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,6 +35,17 @@ where
         }
     });
     Box::pin(ReceiverStream::new(rx))
+}
+
+/// Drop what `ids_only` callers already have.
+fn trim_infos(mut infos: Vec<ChangesetInfo>, ids_only: bool) -> Vec<ChangesetInfo> {
+    if ids_only {
+        for i in &mut infos {
+            i.canonical = Default::default();
+            i.changeset = None;
+        }
+    }
+    infos
 }
 
 fn entry_info(e: &flux_core::TreeEntry) -> TreeEntryInfo {
@@ -595,6 +606,24 @@ impl Services {
         }
         Ok(stored.iter().map(|(id, m)| meta_result(id, m)).collect())
     }
+
+    /// Decode a create request and check path rules for it.
+    async fn create_batch(
+        &self,
+        repo: RepoId,
+        principal: &Principal,
+        req: &CreateChangesetsRequest,
+    ) -> Result<(Vec<flux_core::Changeset>, Vec<[u8; 20]>), Status> {
+        let batch = req.changesets.iter().map(changeset_from_pb).collect::<Result<Vec<_>, _>>()?;
+        let paths: Vec<Vec<u8>> = batch.iter().flat_map(|c| c.file_changes.keys().map(|p| p.as_bytes().to_vec())).collect();
+        self.flux.check_write_paths(repo, principal, paths).await?;
+        let shas = req
+            .git_sha1s
+            .iter()
+            .map(|s| s.as_slice().try_into().map_err(|_| Status::invalid_argument("git_sha1s must be 20 bytes")))
+            .collect::<Result<Vec<[u8; 20]>, _>>()?;
+        Ok((batch, shas))
+    }
 }
 
 #[tonic::async_trait]
@@ -718,29 +747,84 @@ impl write_service_server::WriteService for Services {
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
         self.flux.authorize(&principal, repo, Role::Write).await?;
-        let batch = req.changesets.iter().map(changeset_from_pb).collect::<Result<Vec<_>, _>>()?;
-        let paths: Vec<Vec<u8>> = batch.iter().flat_map(|c| c.file_changes.keys().map(|p| p.as_bytes().to_vec())).collect();
-        self.flux.check_write_paths(repo, &principal, paths).await?;
-        if !req.git_sha1s.is_empty() && req.git_sha1s.len() != batch.len() {
-            return Err(Status::invalid_argument("git_sha1s must be empty or match changesets"));
-        }
-        let mut infos = self.flux.create_changesets(repo, batch).await?;
-        if req.ids_only {
-            for i in &mut infos {
-                i.canonical = Default::default();
-                i.changeset = None;
+        let (batch, shas) = self.create_batch(repo, &principal, &req).await?;
+        let infos = self.flux.create_changesets_mapped(repo, batch, &shas).await?;
+        Ok(Response::new(CreateChangesetsResponse { changesets: trim_infos(infos, req.ids_only) }))
+    }
+
+    type CreateChangesetsStreamStream = RpcStream<CreateChangesetsResponse>;
+
+    async fn create_changesets_stream(
+        &self,
+        req: Request<Streaming<CreateChangesetsRequest>>,
+    ) -> Result<Response<Self::CreateChangesetsStreamStream>, Status> {
+        let principal = self.who(&req).await?;
+        let mut input = req.into_inner();
+        let this = self.clone();
+        Ok(Response::new(spawn_stream(move |tx| async move {
+            // This task prepares batches in order; a committer task commits
+            // them in the same order, one batch behind.
+            let (ctx, mut crx) = mpsc::channel::<(RepoId, crate::core::PreparedBatch, bool)>(1);
+            let in_flight = Arc::new(std::sync::Mutex::new(crate::core::InFlight::new()));
+            let committer = {
+                let (flux, tx, in_flight) = (this.flux.clone(), tx.clone(), in_flight.clone());
+                tokio::spawn(async move {
+                    while let Some((repo, prepared, ids_only)) = crx.recv().await {
+                        let ids: Vec<ChangesetId> = prepared.prepared().map(|p| p.0).collect();
+                        match flux.commit_changesets(repo, prepared).await {
+                            Ok(infos) => {
+                                {
+                                    let mut f = in_flight.lock().unwrap();
+                                    for id in &ids {
+                                        f.remove(id);
+                                    }
+                                }
+                                let r = CreateChangesetsResponse { changesets: trim_infos(infos, ids_only) };
+                                if tx.send(Ok(r)).await.is_err() {
+                                    return false;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e.into())).await;
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+            };
+            let mut repo_of: Option<(String, RepoId)> = None;
+            let result: Result<(), Status> = async {
+                while let Some(req) = input.message().await? {
+                    let repo = match &repo_of {
+                        Some((name, id)) if *name == req.repo => *id,
+                        Some(_) => return Err(Status::invalid_argument("every request in a stream must name the same repo")),
+                        None => {
+                            let id = this.flux.repo(&req.repo).await?;
+                            this.flux.authorize(&principal, id, Role::Write).await?;
+                            repo_of = Some((req.repo.clone(), id));
+                            id
+                        }
+                    };
+                    let (batch, shas) = this.create_batch(repo, &principal, &req).await?;
+                    let snapshot = in_flight.lock().unwrap().clone();
+                    let prepared = this.flux.prepare_changesets(repo, batch, &shas, &snapshot).await?;
+                    in_flight.lock().unwrap().extend(prepared.prepared().map(|(id, g, t)| (id, (g, t))));
+                    if ctx.send((repo, prepared, req.ids_only)).await.is_err() {
+                        break; // the committer failed and reported it
+                    }
+                }
+                Ok(())
             }
-        }
-        if !req.git_sha1s.is_empty() {
-            let mut pairs = Vec::with_capacity(infos.len());
-            for (info, sha) in infos.iter().zip(&req.git_sha1s) {
-                let sha: [u8; 20] =
-                    sha.as_slice().try_into().map_err(|_| Status::invalid_argument("git_sha1s must be 20 bytes"))?;
-                pairs.push((cs_id(&info.id)?, sha));
+            .await;
+            drop(ctx);
+            // Commit (and answer) everything prepared before any error.
+            let committed = committer.await.map_err(|e| Status::internal(e.to_string()))?;
+            match result {
+                Err(e) if committed => Err(e),
+                _ => Ok(()),
             }
-            self.flux.meta.git_map_put(repo, &pairs).await.map_err(FluxError::from)?;
-        }
-        Ok(Response::new(CreateChangesetsResponse { changesets: infos }))
+        })))
     }
 
     async fn update_ref(&self, req: Request<UpdateRefRequest>) -> Result<Response<UpdateRefResponse>, Status> {

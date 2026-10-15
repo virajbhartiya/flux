@@ -18,13 +18,16 @@ pub struct RepoInfo {
 pub type LogSeq = i64;
 
 /// A changeset ready to be persisted. `gen` is computed by the caller from
-/// the parents' generations; `body` is the canonical encoding.
+/// the parents' generations; `body` is the canonical encoding. `derived`
+/// values and the `git_sha1` mapping are written in the same transaction.
 #[derive(Debug, Clone)]
 pub struct NewChangeset {
     pub id: ChangesetId,
     pub parents: Vec<ChangesetId>,
     pub gen_num: u64,
     pub body: Vec<u8>,
+    pub derived: Vec<(DerivedTypeId, Vec<u8>)>,
+    pub git_sha1: Option<[u8; 20]>,
 }
 
 #[derive(Debug, Clone)]

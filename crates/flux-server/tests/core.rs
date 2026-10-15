@@ -78,7 +78,17 @@ async fn root_tree_is_rederived_if_mapping_lost() {
     // Simulate a crash between insert and derive: insert a changeset directly.
     let c2 = cs(vec![id1], &[("b", Some((b, 1)))]);
     flux.meta
-        .put_changesets(repo, &[flux_store::NewChangeset { id: c2.id(), parents: vec![id1], gen_num: 2, body: c2.encode() }])
+        .put_changesets(
+            repo,
+            &[flux_store::NewChangeset {
+                id: c2.id(),
+                parents: vec![id1],
+                gen_num: 2,
+                body: c2.encode(),
+                derived: vec![],
+                git_sha1: None,
+            }],
+        )
         .await
         .unwrap();
     let tree = flux.root_tree(repo, &c2.id()).await.unwrap();

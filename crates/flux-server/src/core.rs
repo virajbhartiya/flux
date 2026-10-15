@@ -4,13 +4,35 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use flux_core::{Changeset, ChangesetId, ContentId, FileChange, FileKind, RepoPath, TreeEntry, TreeId};
-use flux_derive::{DeriveError, TREE_V1, TreeWriter, derive_tree, derive_tree_buffered, diff_trees, lookup_path};
+use flux_derive::{
+    DeriveError, TREE_V1, TreeSource, TreeWriter, derive_tree, derive_tree_buffered, diff_trees_in, lookup_path, lookup_path_in,
+};
 use flux_proto::v1;
 use flux_store::{
     BlobStore, CasOutcome, ContentMeta, MetaStore, NewChangeset, RefExpect, RefLogEntry, RefValue, RepoId, StoreError,
 };
 use thiserror::Error;
 use tonic::Status;
+
+/// Changesets prepared earlier in a create stream, possibly not committed
+/// yet: id → (generation, root tree).
+pub type InFlight = std::collections::HashMap<ChangesetId, (u64, TreeId)>;
+
+/// A validated batch whose trees are written; see [`Flux::prepare_changesets`].
+pub struct PreparedBatch {
+    batch: Vec<Changeset>,
+    rows: Vec<NewChangeset>,
+    trees: Vec<TreeId>,
+    t0: std::time::Instant,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl PreparedBatch {
+    /// (id, generation, root tree) of each changeset, in order.
+    pub fn prepared(&self) -> impl Iterator<Item = (ChangesetId, u64, TreeId)> + '_ {
+        self.rows.iter().zip(&self.trees).map(|(r, t)| (r.id, r.gen_num, *t))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum FluxError {
@@ -260,9 +282,13 @@ impl Flux {
 
     /// Batch form with optional delta hints (previous version of each path).
     pub async fn put_contents(&self, items: Vec<(bytes::Bytes, Option<ContentId>)>) -> FluxResult<Vec<(ContentId, ContentMeta)>> {
+        let (t, n) = (std::time::Instant::now(), items.len());
         let out = self.blobs.put_contents(items).await?;
+        let stored = t.elapsed().as_micros();
         self.blobs.sync().await?;
+        let synced = t.elapsed().as_micros();
         self.meta.put_content_meta(&out).await?;
+        tracing::debug!(n, stored, synced, total = t.elapsed().as_micros() as u64, "put_contents");
         Ok(out)
     }
 
@@ -355,15 +381,45 @@ impl Flux {
     /// members of the batch as parents. The whole batch shares one content
     /// check, one concurrent tree flush and one metadata transaction.
     pub async fn create_changesets(self: &Arc<Self>, repo: RepoId, batch: Vec<Changeset>) -> FluxResult<Vec<v1::ChangesetInfo>> {
+        self.create_changesets_mapped(repo, batch, &[]).await
+    }
+
+    /// [`Flux::create_changesets`] that also records the git commit each
+    /// changeset came from (`git_shas` empty, or one per changeset).
+    pub async fn create_changesets_mapped(
+        self: &Arc<Self>,
+        repo: RepoId,
+        batch: Vec<Changeset>,
+        git_shas: &[[u8; 20]],
+    ) -> FluxResult<Vec<v1::ChangesetInfo>> {
+        let prepared = self.prepare_changesets(repo, batch, git_shas, &InFlight::new()).await?;
+        self.commit_changesets(repo, prepared).await
+    }
+
+    /// Validate a batch, derive and write its trees, and run the merge
+    /// checks: everything but the metadata commit. `in_flight` holds
+    /// changesets prepared by earlier batches of the same stream that may
+    /// not be committed yet; they may be used as parents, and
+    /// [`Flux::commit_changesets`] must then be called in stream order.
+    pub async fn prepare_changesets(
+        self: &Arc<Self>,
+        repo: RepoId,
+        batch: Vec<Changeset>,
+        git_shas: &[[u8; 20]],
+        in_flight: &InFlight,
+    ) -> FluxResult<PreparedBatch> {
         if batch.is_empty() {
-            return Ok(vec![]);
+            return Ok(PreparedBatch { batch, rows: vec![], trees: vec![], t0: std::time::Instant::now(), phases: vec![] });
         }
         if batch.len() > 10_000 {
             return Err(FluxError::InvalidArgument("at most 10000 changesets per batch".into()));
         }
+        if !git_shas.is_empty() && git_shas.len() != batch.len() {
+            return Err(FluxError::InvalidArgument("git_sha1s must be empty or match changesets".into()));
+        }
         let t0 = std::time::Instant::now();
-        let mut phases: Vec<(&str, u128)> = Vec::new();
-        let mark = |name: &'static str, phases: &mut Vec<(&str, u128)>| phases.push((name, t0.elapsed().as_micros()));
+        let mut phases: Vec<(&'static str, u128)> = Vec::new();
+        let mark = |name: &'static str, phases: &mut Vec<(&'static str, u128)>| phases.push((name, t0.elapsed().as_micros()));
         let ids: Vec<ChangesetId> = batch.iter().map(Changeset::id).collect();
         let mut in_batch: std::collections::HashMap<ChangesetId, usize> = std::collections::HashMap::new();
         for (i, (cs, id)) in batch.iter().zip(&ids).enumerate() {
@@ -376,15 +432,19 @@ impl Flux {
             in_batch.insert(*id, i);
         }
 
-        // External parents must exist.
-        let external: Vec<ChangesetId> = batch
-            .iter()
-            .flat_map(|c| c.parents.iter().copied())
-            .filter(|p| !in_batch.contains_key(p))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        // External parents must exist (or be in flight in this stream).
         let mut gens: std::collections::HashMap<ChangesetId, u64> = std::collections::HashMap::new();
+        let mut trees: std::collections::HashMap<ChangesetId, TreeId> = std::collections::HashMap::new();
+        let mut external: Vec<ChangesetId> = Vec::new();
+        for p in batch.iter().flat_map(|c| c.parents.iter()).filter(|p| !in_batch.contains_key(p)) {
+            if let Some((g, t)) = in_flight.get(p) {
+                gens.insert(*p, *g);
+                trees.insert(*p, *t);
+            } else if !gens.contains_key(p) {
+                gens.insert(*p, 0);
+                external.push(*p);
+            }
+        }
         for (p, g) in external.iter().zip(self.meta.get_gens(repo, &external).await?) {
             match g {
                 Some(g) => {
@@ -425,11 +485,9 @@ impl Flux {
         // Derive trees (buffered), then flush them before any row refers to them.
         mark("contents", &mut phases);
         let writer = TreeWriter::new(&self.blobs);
-        let mut trees: std::collections::HashMap<ChangesetId, TreeId> = std::collections::HashMap::new();
         let mut rows = Vec::with_capacity(batch.len());
         let mut out_trees = Vec::with_capacity(batch.len());
-        let mut bodies = Vec::with_capacity(batch.len());
-        for (cs, id) in batch.iter().zip(&ids) {
+        for (i, (cs, id)) in batch.iter().zip(&ids).enumerate() {
             let base = match cs.parents.first() {
                 None => None,
                 Some(p) => Some(match trees.get(p) {
@@ -441,44 +499,62 @@ impl Flux {
             trees.insert(*id, tree);
             let gen_num = 1 + cs.parents.iter().map(|p| gens.get(p).copied().unwrap_or(0)).max().unwrap_or(0);
             gens.insert(*id, gen_num);
-            let body = cs.encode();
-            rows.push(NewChangeset { id: *id, parents: cs.parents.clone(), gen_num, body: body.clone() });
+            rows.push(NewChangeset {
+                id: *id,
+                parents: cs.parents.clone(),
+                gen_num,
+                body: cs.encode(),
+                derived: vec![(TREE_V1, tree.as_bytes().to_vec())],
+                git_sha1: git_shas.get(i).copied(),
+            });
             out_trees.push(tree);
-            bodies.push(body);
         }
         mark("derive", &mut phases);
-        writer.flush().await?;
-        mark("flush", &mut phases);
-        // Checks that need parent trees run after the flush so in-batch
-        // parents are readable. Rejected batches leave only unreferenced
-        // (content-addressed) trees behind.
-        {
-            // Merge checks are CPU-heavy tree diffs: run them on all cores.
-            let trees = Arc::new(trees.clone());
-            let mut tasks = tokio::task::JoinSet::new();
-            for (cs, id) in batch.iter().zip(&ids) {
-                let needs = cs.parents.len() > 1
-                    || cs.file_changes.values().any(|c| matches!(c, FileChange::Change { copy_from: Some(_), .. }));
-                if !needs {
-                    continue;
-                }
-                let (this, cs, id, trees) = (self.clone(), cs.clone(), *id, trees.clone());
-                tasks.spawn(async move { this.check_against_parents(repo, &id, &cs, &trees).await });
+        // Merge checks are CPU-heavy tree diffs: run them on all cores while
+        // the new trees flush, reading the not-yet-written ones from memory.
+        // Rejected batches leave only unreferenced (content-addressed) trees.
+        let src = TreeSource::with_overlay(&self.blobs, writer.snapshot());
+        let trees = Arc::new(trees);
+        let mut tasks = tokio::task::JoinSet::new();
+        for (cs, id) in batch.iter().zip(&ids) {
+            let needs = cs.parents.len() > 1
+                || cs.file_changes.values().any(|c| matches!(c, FileChange::Change { copy_from: Some(_), .. }));
+            if !needs {
+                continue;
             }
+            let (this, cs, id, trees, src) = (self.clone(), cs.clone(), *id, trees.clone(), src.clone());
+            tasks.spawn(async move { this.check_against_parents(repo, &id, &cs, &trees, &src).await });
+        }
+        let checks = async {
             while let Some(r) = tasks.join_next().await {
                 r.map_err(|e| FluxError::Internal(e.into()))??;
             }
+            FluxResult::Ok(())
+        };
+        let (flushed, checked) = tokio::join!(writer.flush(), checks);
+        flushed?;
+        checked?;
+        mark("flush+check", &mut phases);
+        Ok(PreparedBatch { batch, rows, trees: out_trees, t0, phases })
+    }
+
+    /// Persist a prepared batch: one metadata transaction for the
+    /// changesets, their root trees and git mappings.
+    pub async fn commit_changesets(self: &Arc<Self>, repo: RepoId, p: PreparedBatch) -> FluxResult<Vec<v1::ChangesetInfo>> {
+        let PreparedBatch { batch, rows, trees: out_trees, t0, mut phases } = p;
+        if batch.is_empty() {
+            return Ok(vec![]);
         }
-        mark("check", &mut phases);
+        let mark = |name: &'static str, phases: &mut Vec<(&'static str, u128)>| phases.push((name, t0.elapsed().as_micros()));
+        mark("queued", &mut phases);
         self.blobs.sync().await?;
         mark("sync", &mut phases);
-
         let seqs = self.meta.put_changesets(repo, &rows).await?;
         mark("insert", &mut phases);
-        let derived: Vec<(ChangesetId, Vec<u8>)> = ids.iter().zip(&out_trees).map(|(i, t)| (*i, t.as_bytes().to_vec())).collect();
-        self.meta.put_derived(repo, TREE_V1, &derived).await?;
-        mark("derived", &mut phases);
         tracing::debug!(n = batch.len(), ?phases, "create_changesets");
+        for (row, tree) in rows.iter().zip(&out_trees) {
+            self.derived_cache.insert((repo, TREE_V1, row.id), *tree.as_bytes());
+        }
         self.after_create(repo, &rows, &seqs).await;
 
         Ok(batch
@@ -508,6 +584,7 @@ impl Flux {
         id: &ChangesetId,
         cs: &Changeset,
         batch_trees: &std::collections::HashMap<ChangesetId, TreeId>,
+        src_trees: &TreeSource,
     ) -> FluxResult<()> {
         let needs_copy_check = cs.file_changes.values().any(|c| matches!(c, FileChange::Change { copy_from: Some(_), .. }));
         if cs.parents.len() < 2 && !needs_copy_check {
@@ -521,16 +598,16 @@ impl Flux {
             });
         }
         for (path, change) in &cs.file_changes {
-            if let FileChange::Change { copy_from: Some((src, idx)), .. } = change {
-                let found = lookup_path(&self.blobs, parent_trees[*idx as usize], src).await?;
+            if let FileChange::Change { copy_from: Some((from, idx)), .. } = change {
+                let found = lookup_path_in(src_trees, parent_trees[*idx as usize], from).await?;
                 if found.is_none_or(|e| e.is_dir()) {
-                    return Err(FluxError::InvalidArgument(format!("{path}: copy_from {src} does not exist in parent #{idx}")));
+                    return Err(FluxError::InvalidArgument(format!("{path}: copy_from {from} does not exist in parent #{idx}")));
                 }
             }
         }
         let all = |_: &RepoPath, _: bool| true;
         for pt in &parent_trees[1..] {
-            for d in diff_trees(&self.blobs, Some(parent_trees[0]), Some(*pt), &all).await? {
+            for d in diff_trees_in(src_trees, Some(parent_trees[0]), Some(*pt), &all).await? {
                 let covered = cs.file_changes.contains_key(&d.path) || {
                     let mut anc = d.path.parent();
                     let mut hit = false;

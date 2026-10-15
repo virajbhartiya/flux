@@ -139,11 +139,21 @@ macro_rules! sql_store {
         #[derive(Clone)]
         pub struct $name {
             pool: $pool,
+            /// Queues write transactions in-process (SQLite has one writer;
+            /// waiting here is FIFO, unlike its sleeping busy handler).
+            writer: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
         }
 
         impl $name {
             pub fn pool(&self) -> &$pool {
                 &self.pool
+            }
+
+            async fn write_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+                match &self.writer {
+                    Some(w) => Some(w.lock().await),
+                    None => None,
+                }
             }
         }
 
@@ -190,6 +200,7 @@ macro_rules! sql_store {
             }
 
             async fn put_changesets(&self, repo: RepoId, batch: &[NewChangeset]) -> StoreResult<Vec<LogSeq>> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 Self::lock_log(&mut tx, repo).await?;
                 // Existing ids keep their original log position.
@@ -254,6 +265,34 @@ macro_rules! sql_store {
                     let mut query = sqlx::query(&q);
                     for (p, c, i) in chunk {
                         query = query.bind(repo.0).bind(p.as_bytes().as_slice()).bind(c.as_bytes().as_slice()).bind(*i);
+                    }
+                    query.execute(&mut *tx).await?;
+                }
+                // Derived values and git mappings for every row (existing
+                // ones too: a retried batch may have lost them).
+                let derived: Vec<(&ChangesetId, DerivedTypeId, &[u8])> =
+                    batch.iter().flat_map(|cs| cs.derived.iter().map(move |(t, v)| (&cs.id, *t, v.as_slice()))).collect();
+                for chunk in derived.chunks(INSERT_CHUNK) {
+                    let q = format!(
+                        "INSERT INTO derived (repo_id, type_id, cs_id, value_ref) VALUES {} ON CONFLICT DO NOTHING",
+                        values(1, chunk.len(), 4)
+                    );
+                    let mut query = sqlx::query(&q);
+                    for (id, ty, v) in chunk {
+                        query = query.bind(repo.0).bind(*ty).bind(id.as_bytes().as_slice()).bind(*v);
+                    }
+                    query.execute(&mut *tx).await?;
+                }
+                let git: Vec<(&ChangesetId, &[u8; 20])> =
+                    batch.iter().filter_map(|cs| cs.git_sha1.as_ref().map(|s| (&cs.id, s))).collect();
+                for chunk in git.chunks(INSERT_CHUNK) {
+                    let q = format!(
+                        "INSERT INTO git_map (repo_id, cs_id, git_sha1) VALUES {} ON CONFLICT DO NOTHING",
+                        values(1, chunk.len(), 3)
+                    );
+                    let mut query = sqlx::query(&q);
+                    for (id, sha) in chunk {
+                        query = query.bind(repo.0).bind(id.as_bytes().as_slice()).bind(sha.as_slice());
                     }
                     query.execute(&mut *tx).await?;
                 }
@@ -374,6 +413,7 @@ macro_rules! sql_store {
                 new: Option<ChangesetId>,
                 log: RefLogEntry,
             ) -> StoreResult<CasOutcome> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 // Take the write lock up front with a no-op write so the read
                 // below cannot be invalidated by a concurrent writer.
@@ -479,6 +519,7 @@ macro_rules! sql_store {
             }
 
             async fn put_derived(&self, repo: RepoId, ty: DerivedTypeId, entries: &[(ChangesetId, Vec<u8>)]) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 for chunk in entries.chunks(INSERT_CHUNK) {
                     let q = format!(
@@ -536,6 +577,7 @@ macro_rules! sql_store {
                 if metas.is_empty() {
                     return Ok(());
                 }
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 for chunk in metas.chunks(INSERT_CHUNK) {
                     let q = format!(
@@ -558,6 +600,7 @@ macro_rules! sql_store {
             }
 
             async fn git_map_put(&self, repo: RepoId, entries: &[(ChangesetId, [u8; 20])]) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 for chunk in entries.chunks(INSERT_CHUNK) {
                     let q = format!(
@@ -641,6 +684,7 @@ macro_rules! sql_store {
             }
 
             async fn git_trees_put(&self, pairs: &[(flux_core::TreeId, [u8; 20])]) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 for chunk in pairs.chunks(INSERT_CHUNK) {
                     let q = format!("INSERT INTO git_trees (tree_id, git_sha) VALUES {} ON CONFLICT DO NOTHING", values(1, chunk.len(), 2));
@@ -664,6 +708,7 @@ macro_rules! sql_store {
             }
 
             async fn git_commits_put(&self, repo: RepoId, pairs: &[(ChangesetId, [u8; 20])]) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 for chunk in pairs.chunks(INSERT_CHUNK) {
                     let q = format!(
@@ -896,6 +941,7 @@ macro_rules! sql_store {
             }
 
             async fn create_account(&self, a: &NewAccount) -> StoreResult<User> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 let taken: Option<i64> = sqlx::query_scalar("SELECT org_id FROM orgs WHERE name = $1").bind(&a.name).fetch_optional(&mut *tx).await?;
                 if taken.is_some() {
@@ -945,6 +991,7 @@ macro_rules! sql_store {
             }
 
             async fn update_account(&self, user_id: i64, u: &AccountUpdate) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 if let Some(d) = &u.display_name {
                     sqlx::query("UPDATE users SET display_name = $1 WHERE user_id = $2").bind(d).bind(user_id).execute(&mut *tx).await?;
@@ -1076,6 +1123,7 @@ macro_rules! sql_store {
             }
 
             async fn create_org(&self, name: &str, display_name: &str, owner_user_id: i64) -> StoreResult<Org> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 let taken: Option<i64> = sqlx::query_scalar("SELECT user_id FROM users WHERE name = $1").bind(name).fetch_optional(&mut *tx).await?;
                 if taken.is_some() {
@@ -1167,6 +1215,7 @@ macro_rules! sql_store {
             }
 
             async fn set_org_member(&self, org_id: i64, user_id: i64, role: Option<&str>) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 match role {
                     Some(role) => {
@@ -1209,6 +1258,7 @@ macro_rules! sql_store {
             }
 
             async fn delete_team(&self, team_id: i64) -> StoreResult<()> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 sqlx::query("DELETE FROM team_members WHERE team_id = $1").bind(team_id).execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM repo_grants WHERE kind = 'team' AND subject_id = $1").bind(team_id).execute(&mut *tx).await?;
@@ -1410,6 +1460,7 @@ macro_rules! sql_store {
                 head: ChangesetId,
                 target: &[u8],
             ) -> StoreResult<Review> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 Self::lock_log(&mut tx, repo).await?;
                 let number: i64 = sqlx::query("SELECT COALESCE(MAX(number), 0) + 1 FROM reviews WHERE repo_id = $1")
@@ -1483,6 +1534,7 @@ macro_rules! sql_store {
             }
 
             async fn update_review(&self, repo: RepoId, number: i64, u: ReviewUpdate) -> StoreResult<Option<Review>> {
+                let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 let row = sqlx::query(
                     "SELECT number, title, body, author, head, target, state, landed, created_at, updated_at \
@@ -1608,7 +1660,7 @@ impl SqliteStore {
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, writer: Some(Default::default()) })
     }
 
     async fn backup_impl(pool: &sqlx::SqlitePool, path: &std::path::Path) -> StoreResult<()> {
@@ -1635,7 +1687,7 @@ impl PostgresStore {
     pub async fn open(url: &str) -> anyhow::Result<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(32).connect(url).await?;
         sqlx::migrate!("./migrations/postgres").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, writer: None })
     }
 
     async fn backup_impl(_pool: &sqlx::PgPool, _path: &std::path::Path) -> StoreResult<()> {

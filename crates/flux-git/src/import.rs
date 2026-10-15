@@ -204,14 +204,19 @@ fn read_batches(
     }
     let mut diffs = DiffTree::spawn(&repo, requests)?;
     let mut cat = CatFile::new(&repo)?;
+    let mut pool = git::CatPool::new(&repo, 4)?;
     let mut legacy = git::LegacyModes::scan(&repo)?;
     // Root tree per commit, for comparing legacy modes with the first parent.
     let mut trees: HashMap<Sha, Sha> = HashMap::new();
     let mut blobs: HashMap<Sha, (ContentId, u64)> = HashMap::new();
     for chunk in todo.chunks(batch.max(1)) {
         let mut out = ReadBatch { shas: vec![], changesets: vec![], uploads: vec![] };
-        for (sha, parents) in chunk {
-            let (ty, data) = cat.read(sha)?;
+        // Pass 1: commits and diffs, collecting the blobs this batch adds.
+        let commit_shas: Vec<Sha> = chunk.iter().map(|c| c.0).collect();
+        let mut staged = Vec::with_capacity(chunk.len());
+        let mut wanted: Vec<Sha> = Vec::new();
+        let mut wanted_set: std::collections::HashSet<Sha> = Default::default();
+        for ((sha, parents), (ty, data)) in chunk.iter().zip(cat.read_many(&commit_shas)?) {
             if ty != "commit" {
                 bail!("{} is a {ty}, expected commit", hex::encode(sha));
             }
@@ -238,27 +243,47 @@ fn read_batches(
                 apply_legacy_modes(&mut changes, &cur, &prev);
             }
             trees.insert(*sha, commit.tree);
+            for value in changes.values() {
+                if let Value::Set(Some((kind, bsha))) = value
+                    && !matches!(kind, FileKind::GitLink(_))
+                    && !blobs.contains_key(bsha)
+                    && wanted_set.insert(*bsha)
+                {
+                    wanted.push(*bsha);
+                }
+            }
+            staged.push((*sha, parents, commit, changes, first));
+        }
+        // Pass 2: read and hash the new blobs in parallel.
+        let fetched = pool.read_map(&wanted, |bsha, ty, data| {
+            if ty != "blob" {
+                bail!("{} is a {ty}, expected blob", hex::encode(bsha));
+            }
+            Ok((ContentId::hash(&data), Bytes::from(data)))
+        })?;
+        let mut data: HashMap<Sha, Bytes> = HashMap::with_capacity(wanted.len());
+        for (bsha, (id, bytes)) in wanted.iter().zip(fetched) {
+            blobs.insert(*bsha, (id, bytes.len() as u64));
+            data.insert(*bsha, bytes);
+        }
+        // Pass 3: changesets and uploads in commit order (bases first).
+        for (sha, parents, commit, changes, first) in staged {
             // Previous version of each modified path, for delta hints.
             let old: HashMap<&[u8], Sha> =
                 first.iter().filter(|e| e.old_mode & 0o170000 == 0o100000).map(|e| (e.path.as_slice(), e.old_sha)).collect();
             for (path, value) in &changes {
                 let Value::Set(Some((kind, bsha))) = value else { continue };
-                if matches!(kind, FileKind::GitLink(_)) || blobs.contains_key(bsha) {
+                if matches!(kind, FileKind::GitLink(_)) {
                     continue;
                 }
-                let (ty, data) = cat.read(bsha)?;
-                if ty != "blob" {
-                    bail!("{} is a {ty}, expected blob", hex::encode(bsha));
-                }
-                let id = ContentId::hash(&data);
-                blobs.insert(*bsha, (id, data.len() as u64));
+                let Some(bytes) = data.remove(bsha) else { continue };
                 let base = old.get(path.as_slice()).and_then(|o| blobs.get(o)).map(|b| b.0);
-                out.uploads.push((id, Bytes::from(data), base));
+                out.uploads.push((blobs[bsha].0, bytes, base));
             }
-            let p = Pending { sha: *sha, parents: parents.clone(), commit, changes };
+            let p = Pending { sha, parents: parents.clone(), commit, changes };
             let cs = to_changeset(&p, &mapped, &blobs).with_context(|| format!("converting commit {}", hex::encode(sha)))?;
-            mapped.insert(*sha, cs.id());
-            out.shas.push(*sha);
+            mapped.insert(sha, cs.id());
+            out.shas.push(sha);
             out.changesets.push(cs);
         }
         if tx.blocking_send(Ok(out)).is_err() {
@@ -294,28 +319,51 @@ async fn import_commits(
     let creator = {
         let client = client.clone();
         tokio::spawn(async move {
-            let mut created: Vec<(Sha, ChangesetId)> = Vec::new();
-            let (mut busy, mut idle) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-            let mut waited = Instant::now();
-            let mut last_log = Instant::now();
-            let mut since = 0usize;
-            while let Some(b) = create_rx.recv().await {
-                idle += waited.elapsed();
-                let t = Instant::now();
-                let infos = client.create_changesets_from_git(&b.changesets, &b.shas).await.context("creating changesets")?;
-                let pairs: Vec<_> = infos.iter().zip(&b.shas).map(|(i, s)| (i.id, *s)).collect();
-                busy += t.elapsed();
-                waited = Instant::now();
-                since += pairs.len();
-                created.extend(pairs.iter().map(|(c, s)| (*s, *c)));
-                if last_log.elapsed().as_secs() >= 5 {
-                    let rate = since as f64 / last_log.elapsed().as_secs_f64();
-                    tracing::info!(done = created.len(), total, "importing ({rate:.0} commits/s recent)");
-                    last_log = Instant::now();
-                    since = 0;
+            // Batches are pipelined: the server prepares batch k+1 while k
+            // commits. Responses are read concurrently, in order.
+            let (sender, mut receiver) = client.create_stream().await?;
+            let feeder = tokio::spawn(async move {
+                let (mut shas, mut idle) = (std::collections::VecDeque::new(), std::time::Duration::ZERO);
+                let mut waited = Instant::now();
+                while let Some(b) = create_rx.recv().await {
+                    idle += waited.elapsed();
+                    if sender.send(&b.changesets, &b.shas).await.is_err() {
+                        break; // the receiver reports the server's error
+                    }
+                    shas.push_back(b.shas);
+                    waited = Instant::now();
                 }
+                tracing::debug!(idle_ms = idle.as_millis() as u64, "stage create");
+                shas
+            });
+            let received = async {
+                let mut ids: Vec<ChangesetId> = Vec::new();
+                let (mut last_log, mut since) = (Instant::now(), 0usize);
+                while let Some(batch) = receiver.next().await.context("creating changesets")? {
+                    since += batch.len();
+                    ids.extend(batch);
+                    if last_log.elapsed().as_secs() >= 5 {
+                        let rate = since as f64 / last_log.elapsed().as_secs_f64();
+                        tracing::info!(done = ids.len(), total, "importing ({rate:.0} commits/s recent)");
+                        last_log = Instant::now();
+                        since = 0;
+                    }
+                }
+                anyhow::Ok(ids)
             }
-            tracing::debug!(busy_ms = busy.as_millis() as u64, idle_ms = idle.as_millis() as u64, "stage create");
+            .await;
+            let ids = match received {
+                Ok(ids) => ids,
+                Err(e) => {
+                    feeder.abort();
+                    return Err(e);
+                }
+            };
+            let shas: Vec<Sha> = feeder.await?.into_iter().flatten().collect();
+            if shas.len() != ids.len() {
+                bail!("created {} of {} changesets", ids.len(), shas.len());
+            }
+            let created: Vec<(Sha, ChangesetId)> = shas.into_iter().zip(ids).collect();
             anyhow::Ok(created)
         })
     };

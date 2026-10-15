@@ -32,7 +32,7 @@ Measured on an M-series laptop, git.git imported (85,558 changesets, 4,857 files
 | CLI: full checkout, 4,857 files / 48 MB | 350 ms |
 | Land with server-side rebase + three-way merge | ~10 ms |
 | `git clone` of git.git from flux (full history, 420k objects) | **8.7 s** (stock `git` serving its own repo: 14.4 s) |
-| git import, git.git, full history | 56–73 s (1,170–1,530 commits/s), SQLite or Postgres; every commit keeps its SHA-1 |
+| git import, git.git, full history | 41–55 s (1,550–2,090 commits/s), SQLite; every commit keeps its SHA-1 |
 | Storage for git.git | 312 MB blobs, history index included (git's own pack: 334 MB) |
 
 Every page shows its render time in the footer and in a `Server-Timing` header.
