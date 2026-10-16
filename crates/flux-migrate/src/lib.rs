@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use flux_proto::v1::update_ref_request::Expect;
+use futures::StreamExt as _;
 use serde_json::json;
 
 use crate::convert::{Converter, ImportBatch, Links, UserIn};
@@ -381,6 +382,9 @@ pub async fn migrate(gh: &GitHub, opts: &Options) -> Result<Report> {
     upload(&flux, r, "reviews", std::mem::take(&mut out.reviews), |b, v| b.reviews = v, &mut report).await?;
     report.add("comments", comments);
     upload(&flux, r, "releases", std::mem::take(&mut out.releases), |b, v| b.releases = v, &mut report).await?;
+    // Assets move GitHub → flux eight at a time (each is a download and an
+    // upload; doing them one by one leaves both links idle most of the time).
+    let mut transfers = Vec::new();
     for rel in &releases {
         if rel.assets.is_empty() {
             continue;
@@ -391,10 +395,17 @@ pub async fn migrate(gh: &GitHub, opts: &Options) -> Result<Report> {
                 report.warn(format!("release {}: asset {} is larger than 512 MiB; upload it by hand", rel.tag_name, a.name));
                 continue;
             }
-            let data = gh.download(&a.url).await.with_context(|| format!("downloading {}", a.name))?;
-            flux.upload_asset(r, id, &a.name, &a.content_type, data).await?;
-            report.add("assets", 1);
+            let flux = &flux;
+            transfers.push(async move {
+                let data = gh.download(&a.url).await.with_context(|| format!("downloading {}", a.name))?;
+                flux.upload_asset(r, id, &a.name, &a.content_type, data).await
+            });
         }
+    }
+    let mut pending = futures::stream::iter(transfers).buffer_unordered(8);
+    while let Some(done) = futures::StreamExt::next(&mut pending).await {
+        done?;
+        report.add("assets", 1);
     }
     report.phase("upload", t);
 
