@@ -114,6 +114,13 @@
   });
   window.addEventListener("popstate", () => navigate(location.href, false));
 
+  // Destructive forms ask first (data-confirm="…").
+  document.addEventListener("submit", (ev) => {
+    const f = ev.target;
+    const msg = f.dataset && f.dataset.confirm;
+    if (msg && !confirm(msg)) { ev.preventDefault(); ev.stopImmediatePropagation(); }
+  }, true);
+
   // GET forms (search) also navigate in place.
   document.addEventListener("submit", (ev) => {
     const f = ev.target;
@@ -198,7 +205,7 @@
     }
   }, true);
   document.addEventListener("click", (ev) => {
-    $$("details.picker[open], details.clone[open]").forEach((d) => { if (!d.contains(ev.target)) d.open = false; });
+    $$("details.picker[open], details.clone[open], details.menu[open], details.side-edit[open], details.edit-toggle[open]").forEach((d) => { if (!d.contains(ev.target)) d.open = false; });
   });
 
   // ── command palette (⌘K) and file finder (t) ─────────────────────
@@ -251,11 +258,13 @@
     const list = [];
     if (r) {
       list.push(["Go to code", r + "/-/tree/" + rev, "g c"], ["Go to changes", r + "/-/commits/" + rev, "g h"],
-        ["Go to reviews", r + "/-/reviews", "g r"], ["Go to branches", r + "/-/branches", "g b"],
-        ["Go to activity", r + "/-/activity", "g a"], ["Search code", r + "/-/search?rev=" + rev, "/"],
+        ["Go to issues", r + "/-/issues", "g i"], ["Go to reviews", r + "/-/reviews", "g r"],
+        ["Go to CI runs", r + "/-/runs", "g x"], ["Go to releases", r + "/-/releases", "g l"],
+        ["Go to branches", r + "/-/branches", "g b"], ["Go to activity", r + "/-/activity", "g a"],
+        ["Search code", r + "/-/search?rev=" + rev, "/"], ["New issue", r + "/-/issues/new", ""],
         ["New review", r + "/-/reviews/new", ""], ["Repository settings", r + "/-/settings", ""]);
     }
-    list.push(["All repositories", "/", "g g"], ["Toggle light / dark theme", "#theme", ""]);
+    list.push(["All repositories", "/", "g g"], ["Notifications", "/-/notifications", "g n"], ["Toggle light / dark theme", "#theme", ""]);
     return list;
   }
   async function openPalette(mode) {
@@ -375,7 +384,7 @@
       gPending = 0;
       const r = c.repo ? "/" + encodeURI(c.repo) : null;
       const rev = encodeURIComponent(c.rev || "main");
-      const dest = { g: "/", c: r && r + "/-/tree/" + rev, h: r && r + "/-/commits/" + rev, r: r && r + "/-/reviews", b: r && r + "/-/branches", a: r && r + "/-/activity" }[ev.key];
+      const dest = { g: "/", n: "/-/notifications", c: r && r + "/-/tree/" + rev, h: r && r + "/-/commits/" + rev, i: r && r + "/-/issues", r: r && r + "/-/reviews", x: r && r + "/-/runs", l: r && r + "/-/releases", b: r && r + "/-/branches", a: r && r + "/-/activity" }[ev.key];
       if (dest) { ev.preventDefault(); navigate(new URL(dest, location.href).toString(), true); }
       return;
     }
@@ -412,9 +421,12 @@
         navigate(location.href, false);
         return;
       }
+      if (e.kind === "ci" && /\/-\/runs\/?$/.test(path)) { navigate(location.href, false); return; }
+      if (e.kind === "ci" && $("pre.ci-log")) { refreshRun(); return; }
       let text = null;
       if (e.kind === "ref") text = `${e.actor} moved ${e.ref}`;
       else if (e.kind === "review") text = `Review #${e.review} ${e.detail}`;
+      else if ((e.kind === "issue" || e.kind === "comment") && path.includes("/-/issues")) text = `${e.actor} updated #${e.review}`;
       if (!text || !banner) return;
       banner.innerHTML = "";
       const span = document.createElement("span");
@@ -631,7 +643,58 @@
     if (el) loadDiff(el);
   });
 
+  // ── CI: live job logs ────────────────────────────────────────────
+  // Each running job's <pre> polls its log endpoint once a second for new
+  // output (?after=<seq>); state changes refresh the headers in place.
+  const DONE = new Set(["success", "failure", "cancelled", "skipped"]);
+  let logTimer;
+  async function refreshRun() {
+    const url = location.href;
+    cache.delete(url);
+    try {
+      const doc = new DOMParser().parseFromString(await fetchPage(url), "text/html");
+      if (location.href !== url) return;
+      for (const sel of [".review-head", ".job-nav"]) { const a = $(sel), b = $(sel, doc); if (a && b) a.replaceWith(b); }
+      $$(".card.job", doc).forEach((j) => {
+        const cur = document.getElementById(j.id);
+        const h = cur && $(".job-head", cur), nh = $(".job-head", j);
+        if (h && nh) h.replaceWith(nh);
+      });
+    } catch (_) {}
+  }
+  function pollLogs() {
+    clearTimeout(logTimer);
+    if (!$$("pre.ci-log[data-log-src]").some((p) => !DONE.has(p.dataset.state))) return;
+    const url = location.href;
+    logTimer = setTimeout(async () => {
+      if (location.href !== url) return;
+      const live = $$("pre.ci-log[data-log-src]").filter((p) => !DONE.has(p.dataset.state));
+      let changed = false;
+      await Promise.all(live.map(async (p) => {
+        try {
+          const r = await fetch(p.dataset.logSrc + "?after=" + (p.dataset.seq || 0), { credentials: "same-origin", cache: "no-store" });
+          if (!r.ok) return;
+          const text = await r.text();
+          if (text) {
+            const empty = $(".log-empty", p);
+            if (empty) empty.remove();
+            const stick = p.scrollTop + p.clientHeight >= p.scrollHeight - 24;
+            p.append(document.createTextNode(text));
+            if (stick) p.scrollTop = p.scrollHeight;
+          }
+          const seq = r.headers.get("x-flux-log-seq"), state = r.headers.get("x-flux-job-state");
+          if (seq) p.dataset.seq = seq;
+          if (state && state !== p.dataset.state) { p.dataset.state = state; changed = true; }
+        } catch (_) {}
+      }));
+      if (location.href !== url) return;
+      if (changed) await refreshRun();
+      pollLogs();
+    }, 1000);
+  }
+
   function onPage() {
+    pollLogs();
     watchDiffs();
     pollHighlight(0);
     applyLineHash();

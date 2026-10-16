@@ -13,11 +13,17 @@
 //! slashes: `/{repo}/-/tree/{rev}/{path}`.
 
 mod account;
+mod ci;
 mod diff;
+mod forms;
 pub mod highlight;
+mod inbox;
+mod issues;
 mod lang;
 mod markdown;
 mod pages;
+mod releases;
+mod repo_admin;
 mod view;
 
 pub use diff::is_binary;
@@ -112,6 +118,11 @@ pub fn router(flux: Arc<Flux>) -> Router {
         .route("/-/settings/tokens", get(account::tokens).post(account::token_create))
         .route("/-/settings/tokens/{id}/revoke", post(account::token_revoke))
         .route("/-/settings/orgs", get(account::my_orgs))
+        .route("/-/settings/keys", get(inbox::ssh_keys).post(inbox::ssh_key_add))
+        .route("/-/settings/keys/{id}/delete", post(inbox::ssh_key_delete))
+        .route("/-/notifications", get(inbox::notifications))
+        .route("/-/notifications/read", post(inbox::mark_all_read))
+        .route("/-/notifications/{id}/read", post(inbox::mark_read))
         .route("/-/settings/{what}", post(account::profile_post))
         .route("/-/orgs", post(account::org_create))
         .route("/-/orgs/{org}/people", get(account::org_people).post(account::org_people_post))
@@ -185,6 +196,19 @@ async fn dispatch_post(State(web): State<WebState>, req: axum::extract::Request)
         }
         return pages::repo_access_post(&web, &r, &pages::decode_repo(repo), &f).await.into_response();
     }
+    // Issues, releases, CI, repository administration and review sidebar
+    // forms parse their own bodies (repeated fields, file uploads).
+    let (repo, segs) = pages::split_repo(&p.0);
+    if forms::handles(&segs) {
+        if let Err(e) = account::check_origin(&headers) {
+            return e.into_response();
+        }
+        let fields = match forms::Fields::read(&headers, body).await {
+            Ok(f) => f,
+            Err(e) => return e.into_response(),
+        };
+        return forms::repo_post(&web, &r, &repo, &segs, fields).await.into_response();
+    }
     let form = match axum::extract::Form::<pages::ReviewForm>::from_request(axum::extract::Request::from_parts(parts, body), &web)
         .await
     {
@@ -248,6 +272,8 @@ pub struct Req {
     pub path: String,
     pub query: String,
     pub partial: bool,
+    /// Unread notifications of the signed-in user (page loads only).
+    pub unread: i64,
 }
 
 pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -274,6 +300,10 @@ impl FromRequestParts<WebState> for Req {
             // A stale cookie shouldn't lock anyone out: treat as anonymous.
             Err(_) => Principal { user: None, mode: web.flux.auth_mode, ..Default::default() },
         };
+        let unread = match (&principal.user, parts.method == axum::http::Method::GET) {
+            (Some(u), true) => web.flux.meta.unread_count(u.id).await.unwrap_or(0),
+            _ => 0,
+        };
         let host = parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
         let scheme = parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");
         Ok(Req {
@@ -283,6 +313,7 @@ impl FromRequestParts<WebState> for Req {
             path: parts.uri.path().to_string(),
             query: parts.uri.query().unwrap_or("").to_string(),
             partial: parts.headers.contains_key("x-flux-partial"),
+            unread,
         })
     }
 }

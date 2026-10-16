@@ -15,7 +15,10 @@ pub const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 pub enum Tab {
     Code,
     Commits,
+    Issues,
     Reviews,
+    Ci,
+    Releases,
     Branches,
     Activity,
     Search,
@@ -35,6 +38,17 @@ pub struct RepoNav<'a> {
     /// `scheme://host` this page was requested through (for clone URLs).
     pub origin: String,
     pub is_admin: bool,
+    /// Open issues (`None`: issues are turned off).
+    pub open_issues: Option<usize>,
+    /// Whether the viewer watches the repository (`None`: signed out).
+    pub watching: Option<bool>,
+    pub signed_in: bool,
+    /// `host:port` of the SSH server, for clone URLs.
+    pub ssh_host: Option<String>,
+    pub archived: bool,
+    pub fork_of: Option<String>,
+    /// A form result to show: (ok, message).
+    pub flash: Option<(bool, String)>,
 }
 
 // ───────────── icons (inline SVG, 16px) ─────────────
@@ -86,6 +100,27 @@ pub fn icon(name: &str) -> Markup {
         "shield" => "M8 1.5 2.75 3.5v4c0 3.25 2.25 5.75 5.25 7 3-1.25 5.25-3.75 5.25-7v-4Z",
         "logout" => "M6 2.5H3.25a.75.75 0 0 0-.75.75v9.5c0 .4.35.75.75.75H6M10.5 11l3-3-3-3M13.25 8H6",
         "chevron" => "M4 6l4 4 4-4",
+        "issue" => "M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5ZM8 7.1a.9.9 0 1 0 0 1.8.9.9 0 0 0 0-1.8Z",
+        "issue-closed" => "M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5ZM5.25 8.25l1.9 1.9 3.6-3.9",
+        "tag" => "M1.75 2.75v4.6l6.9 6.9a1 1 0 0 0 1.4 0l4.2-4.2a1 1 0 0 0 0-1.4l-6.9-6.9h-4.6a1 1 0 0 0-1 1ZM5 5h.01",
+        "play" => "M5 3.25v9.5L12.5 8Z",
+        "download" => "M8 2v8.5M4.5 7 8 10.5 11.5 7M2.5 13.5h11",
+        "upload" => "M8 10.5V2M4.5 5.5 8 2l3.5 3.5M2.5 13.5h11",
+        "eye" => "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8ZM8 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z",
+        "fork" => {
+            "M4.5 4.5v1c0 1.5 1 2.5 3.5 2.5s3.5-1 3.5-2.5v-1M8 8v3.25M5.75 3.25a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0ZM12.75 3.25a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0ZM9.25 12.75a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0Z"
+        }
+        "archive" => "M2 3h12v3H2ZM3 6v7.25c0 .4.35.75.75.75h8.5c.4 0 .75-.35.75-.75V6M6.5 8.75h3",
+        "trash" => "M2.5 4h11M6 4V2.5h4V4M4 4l.75 9.5h6.5L12 4",
+        "flag" | "milestone" => "M3.5 14.5V2M3.5 2.5h8.5l-1.75 3 1.75 3H3.5",
+        "bell" => "M4 11.25V7a4 4 0 0 1 8 0v4.25l1.25 1.25H2.75ZM6.5 14.25h3",
+        "stop" => "M4.5 4.5h7v7h-7Z",
+        "refresh" => "M13.25 8a5.25 5.25 0 1 1-1.55-3.7M13.25 2.25v3h-3",
+        "webhook" => "M6.25 6A2.5 2.5 0 1 1 10.4 7.7L12 10.5M4 13.25a2.5 2.5 0 0 1-.6-4.7M12 13.75a2.5 2.5 0 1 0-1.75-4.25H6.5",
+        "comment" => "M2.5 3h11v7.5H8l-3 2.75V10.5H2.5Z",
+        "inbox" => "M1.75 9.25 3.5 3h9l1.75 6.25V13H1.75ZM1.75 9.25h3.5l1 1.5h3.5l1-1.5h3.5",
+        "lock-open" => "M4.5 7V5a3.5 3.5 0 0 1 6.75-1.25M3.5 7h9v7h-9Z",
+        "draft" => "M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5Z",
         _ => "M2 2h12v12H2Z",
     };
     html! {
@@ -271,6 +306,9 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                         button.btn.ghost.icon-only.theme-toggle type="button" title="Toggle theme" aria-label="Toggle theme" { (icon("sun")) }
                         @match (&user, mode) {
                             (Some(u), _) => {
+                                a.btn.ghost.icon-only.bell href="/-/notifications" title=(if req.unread > 0 { format!("{} unread notifications", req.unread) } else { "Notifications".into() }) aria-label=(if req.unread > 0 { format!("Notifications, {} unread", req.unread) } else { "Notifications".into() }) {
+                                    (icon("bell")) @if req.unread > 0 { span.unread-dot {} }
+                                }
                                 a.btn.ghost.icon-only href="/-/new" title="New repository" aria-label="New repository" { (icon("plus")) }
                                 details.menu {
                                     summary.user aria-label="Account menu" { (avatar(u, "", false)) span.hide-sm { (u) } (icon("chevron")) }
@@ -278,7 +316,9 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                                         div.menu-head { "Signed in as " strong { (u) } }
                                         a href=(repo_url(u)) { (icon("user")) "Your profile" }
                                         a href="/-/settings/orgs" { (icon("org")) "Organizations" }
+                                        a href="/-/notifications" { (icon("inbox")) "Notifications" @if req.unread > 0 { span.count { (req.unread) } } }
                                         a href="/-/settings/tokens" { (icon("key")) "Access tokens" }
+                                        a href="/-/settings/keys" { (icon("key")) "SSH keys" }
                                         a href="/-/settings" { (icon("settings")) "Settings" }
                                         @if req.principal.user.as_ref().is_some_and(|u| u.is_admin) {
                                             a href="/-/admin" { (icon("shield")) "Site admin" }
@@ -296,10 +336,13 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
                     }
                 }
                 @if let Some(n) = &nav {
-                    (repo_head(n))
+                    (repo_head(n, &req.path))
                 }
                 main #main data-repo=[nav.as_ref().map(|n| n.repo)] data-rev=[nav.as_ref().map(|n| n.rev)] data-files=[nav.as_ref().map(|n| format!("/{}/-/files/{}", enc(n.repo), enc(n.rev)))] {
                     div #live-banner hidden {}
+                    @if let Some((ok, msg)) = nav.as_ref().and_then(|n| n.flash.as_ref()) {
+                        div.container { (flash(*ok, msg)) }
+                    }
                     (body)
                 }
                 footer.foot {
@@ -322,29 +365,58 @@ pub fn page(web: &Web, req: &Req, title: &str, nav: Option<RepoNav<'_>>, body: M
     html_response(req, markup)
 }
 
-fn repo_head(n: &RepoNav<'_>) -> Markup {
+fn repo_head(n: &RepoNav<'_>, here: &str) -> Markup {
     let (owner, name) = match n.repo.rsplit_once('/') {
         Some((o, r)) => (Some(o), r),
         None => (None, n.repo),
     };
     let flux_cmd = format!("flux attach {} {}", n.origin, n.repo);
     let git_url = format!("{}/{}.git", n.origin, n.repo);
+    let ssh_url = n.ssh_host.as_ref().map(|h| format!("ssh://git@{h}/{}.git", n.repo));
+    let base = format!("/{}/-", enc(n.repo));
     html! {
         section.repo-head {
             div.repo-head-inner {
                 div.repo-title {
                     h1 { (icon("repo")) @if let Some(o) = owner { span.owner { (o) " / " } } (name) }
+                    @if n.archived { span.pill.small.warn title="This repository is read-only" { (icon("archive")) "Archived" } }
                     div.spacer {}
-                    details.clone {
-                        summary.btn.small { (icon("code")) "Clone" span.caret {} }
-                        div.clone-menu {
-                            h4 { "flux · sparse working copy" }
-                            div.cmd { code { (flux_cmd) } button.copy-btn type="button" data-copy=(flux_cmd) title="Copy" { (icon("copy")) } }
-                            h4 { "git · clone over HTTP" }
-                            div.cmd { code { "git clone " (git_url) } button.copy-btn type="button" data-copy=(format!("git clone {git_url}")) title="Copy" { (icon("copy")) } }
-                            p.muted.small { "Pushes from git land through the same compare-and-swap as flux, and appear here instantly." }
+                    div.repo-actions {
+                        @if let Some(w) = n.watching {
+                            form method="post" action=(format!("{base}/watch")) {
+                                input type="hidden" name="state" value=(if w { "none" } else { "watching" });
+                                input type="hidden" name="next" value=(here);
+                                button.btn.small type="submit" aria-pressed=(if w { "true" } else { "false" }) title=(if w { "Stop getting notifications for every issue and review" } else { "Get notified about every issue and review" }) {
+                                    (icon("eye")) span.hide-sm { (if w { "Unwatch" } else { "Watch" }) }
+                                }
+                            }
+                        }
+                        @if n.signed_in {
+                            form method="post" action=(format!("{base}/fork")) {
+                                button.btn.small type="submit" title="Fork into your account" { (icon("fork")) span.hide-sm { "Fork" } }
+                            }
+                        }
+                        details.clone {
+                            summary.btn.small.primary { (icon("code")) "Code" span.caret {} }
+                            div.clone-menu {
+                                h4 { "flux · sparse working copy" }
+                                div.cmd { code { (flux_cmd) } button.copy-btn type="button" data-copy=(flux_cmd) title="Copy" aria-label="Copy flux command" { (icon("copy")) } }
+                                h4 { "git · clone over HTTPS" }
+                                div.cmd { code { "git clone " (git_url) } button.copy-btn type="button" data-copy=(format!("git clone {git_url}")) title="Copy" aria-label="Copy HTTPS clone command" { (icon("copy")) } }
+                                @if let Some(u) = &ssh_url {
+                                    h4 { "git · clone over SSH" }
+                                    div.cmd { code { "git clone " (u) } button.copy-btn type="button" data-copy=(format!("git clone {u}")) title="Copy" aria-label="Copy SSH clone command" { (icon("copy")) } }
+                                }
+                                div.clone-downloads {
+                                    a.btn.small href=(format!("{base}/archive/{}.zip", enc(n.rev))) download data-no-swap { (icon("download")) "Download ZIP" }
+                                    a.btn.small.ghost href=(format!("{base}/archive/{}.tar.gz", enc(n.rev))) download data-no-swap { "tar.gz" }
+                                }
+                            }
                         }
                     }
+                }
+                @if let Some(f) = &n.fork_of {
+                    p.repo-fork.muted.small { (icon("fork")) "forked from " a.link href=(repo_url(f)) { (f) } }
                 }
                 @if !n.description.is_empty() {
                     p.repo-desc { (n.description) }
@@ -355,18 +427,69 @@ fn repo_head(n: &RepoNav<'_>) -> Markup {
                     span { (icon("branch")) b { (n.branches) } " branches" }
                     @if n.open_reviews > 0 { span { (icon("review")) b { (n.open_reviews) } " open reviews" } }
                 }
-                nav.repo-tabs {
-                    (tab(n, Tab::Code, "code", "Code", None, &format!("/{}/-/tree/{}", enc(n.repo), enc(n.rev))))
-                    (tab(n, Tab::Commits, "history", "Changes", None, &format!("/{}/-/commits/{}", enc(n.repo), enc(n.rev))))
-                    (tab(n, Tab::Reviews, "review", "Reviews", (n.open_reviews > 0).then_some(n.open_reviews), &format!("/{}/-/reviews", enc(n.repo))))
-                    (tab(n, Tab::Branches, "branch", "Branches", None, &format!("/{}/-/branches", enc(n.repo))))
-                    (tab(n, Tab::Activity, "pulse", "Activity", None, &format!("/{}/-/activity", enc(n.repo))))
-                    (tab(n, Tab::Search, "search", "Search", None, &format!("/{}/-/search?rev={}", enc(n.repo), enc(n.rev))))
+                nav.repo-tabs aria-label="Repository" {
+                    (tab(n, Tab::Code, "code", "Code", None, &format!("{base}/tree/{}", enc(n.rev))))
+                    (tab(n, Tab::Commits, "history", "Changes", None, &format!("{base}/commits/{}", enc(n.rev))))
+                    @if let Some(open) = n.open_issues {
+                        (tab(n, Tab::Issues, "issue", "Issues", (open > 0).then_some(open), &format!("{base}/issues")))
+                    }
+                    (tab(n, Tab::Reviews, "review", "Reviews", (n.open_reviews > 0).then_some(n.open_reviews), &format!("{base}/reviews")))
+                    (tab(n, Tab::Ci, "play", "CI", None, &format!("{base}/runs")))
+                    (tab(n, Tab::Releases, "tag", "Releases", None, &format!("{base}/releases")))
+                    (tab(n, Tab::Branches, "branch", "Branches", None, &format!("{base}/branches")))
+                    (tab(n, Tab::Activity, "pulse", "Activity", None, &format!("{base}/activity")))
+                    (tab(n, Tab::Search, "search", "Search", None, &format!("{base}/search?rev={}", enc(n.rev))))
                     @if n.is_admin {
-                        (tab(n, Tab::Settings, "gear", "Settings", None, &format!("/{}/-/settings", enc(n.repo))))
+                        (tab(n, Tab::Settings, "gear", "Settings", None, &format!("{base}/settings")))
                     }
                 }
             }
+        }
+    }
+}
+
+/// A form result banner.
+pub fn flash(ok: bool, msg: &str) -> Markup {
+    html! {
+        @if ok { div.notice.ok role="status" { (icon("check")) (msg) } }
+        @else { div.notice.error role="alert" { (icon("alert")) (msg) } }
+    }
+}
+
+/// A commit status or CI state as a small colored dot.
+pub fn sdot(state: &str) -> Markup {
+    let cls = match state {
+        "success" => "success",
+        "failure" | "error" | "cancelled" => "failure",
+        "pending" | "queued" | "running" | "in_progress" | "waiting" => "pending",
+        _ => "neutral",
+    };
+    html! { span class=(format!("sdot {cls}")) title=(state) aria-label=(state) {} }
+}
+
+/// The combined state of several commit statuses.
+pub fn combine_states<'a>(states: impl Iterator<Item = &'a str>) -> Option<&'static str> {
+    let mut any = false;
+    let mut pending = false;
+    for s in states {
+        any = true;
+        match s {
+            "failure" | "error" => return Some("failure"),
+            "success" => {}
+            _ => pending = true,
+        }
+    }
+    any.then_some(if pending { "pending" } else { "success" })
+}
+
+/// A label: a colored swatch (an SVG fill, since CSP forbids inline
+/// styles) and its name.
+pub fn label_pill(name: &str, color: &str) -> Markup {
+    let color = if color.len() == 6 && color.bytes().all(|b| b.is_ascii_hexdigit()) { color } else { "8a8f98" };
+    html! {
+        span.label title=(name) {
+            svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" { circle cx="5" cy="5" r="4.5" fill=(format!("#{color}")) {} }
+            span { (name) }
         }
     }
 }

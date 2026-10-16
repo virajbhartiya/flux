@@ -33,12 +33,12 @@ const MAX_DIFF_FILE: u64 = 1 << 20;
 /// Lines shown in the file viewer before truncating.
 const MAX_VIEW_LINES: usize = 25_000;
 
-fn query_map(q: &str) -> HashMap<String, String> {
+pub(super) fn query_map(q: &str) -> HashMap<String, String> {
     url_decode_pairs(q).into_iter().collect()
 }
 
 /// Percent-decode (query strings: `+` is a space).
-fn url_decode(s: &str) -> String {
+pub(super) fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&percent_decode(s, true)).into_owned()
 }
 
@@ -82,17 +82,17 @@ fn url_decode_pairs(q: &str) -> Vec<(String, String)> {
 
 // ───────────── shared lookups ─────────────
 
-struct RepoCtx {
-    name: String,
-    id: RepoId,
-    refs: Arc<Vec<(String, ChangesetId)>>,
-    config: Arc<crate::repo_config::RepoConfig>,
+pub(super) struct RepoCtx {
+    pub(super) name: String,
+    pub(super) id: RepoId,
+    pub(super) refs: Arc<Vec<(String, ChangesetId)>>,
+    pub(super) config: Arc<crate::repo_config::RepoConfig>,
     /// The viewer's role on this repository.
-    role: Role,
+    pub(super) role: Role,
 }
 
 impl RepoCtx {
-    fn require(&self, need: Role) -> WebResult<()> {
+    pub(super) fn require(&self, need: Role) -> WebResult<()> {
         if self.role >= need {
             Ok(())
         } else {
@@ -100,11 +100,11 @@ impl RepoCtx {
         }
     }
 
-    fn can(&self, need: Role) -> bool {
+    pub(super) fn can(&self, need: Role) -> bool {
         self.role >= need
     }
 
-    fn default_branch(&self) -> Option<&str> {
+    pub(super) fn default_branch(&self) -> Option<&str> {
         if let Some(b) = self.config.default_branch.as_deref()
             && self.is_ref(b)
         {
@@ -117,13 +117,13 @@ impl RepoCtx {
             .or_else(|| self.refs.first().map(|r| r.0.as_str()))
     }
 
-    fn is_ref(&self, name: &str) -> bool {
+    pub(super) fn is_ref(&self, name: &str) -> bool {
         self.refs.iter().any(|(n, _)| n == name)
     }
 
     /// Split `rev/path...` where the rev may itself contain slashes: the
     /// longest prefix naming a ref wins, otherwise the first segment.
-    fn split_rev<'a>(&self, segs: &'a [String]) -> (String, &'a [String]) {
+    pub(super) fn split_rev<'a>(&self, segs: &'a [String]) -> (String, &'a [String]) {
         for k in (1..=segs.len()).rev() {
             let cand = segs[..k].join("/");
             if self.is_ref(&cand) {
@@ -137,7 +137,7 @@ impl RepoCtx {
     }
 }
 
-async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
+pub(super) async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
     let id = web.flux.repo(name).await?;
     let role = web.flux.authorize(&req.principal, id, Role::Read).await?;
     let refs = match web.refs.get(&id) {
@@ -155,7 +155,7 @@ async fn repo_ctx(web: &WebState, req: &Req, name: &str) -> WebResult<RepoCtx> {
 }
 
 async fn open_reviews(flux: &Flux, repo: RepoId) -> usize {
-    flux.meta.list_reviews(repo, Some("open"), 1000).await.map(|v| v.len()).unwrap_or(0)
+    flux.meta.review_count(repo, "open").await.map(|n| n as usize).unwrap_or(0)
 }
 
 fn path_from(segs: &[String]) -> WebResult<Option<RepoPath>> {
@@ -181,7 +181,7 @@ async fn lastmod_ready(flux: &Arc<Flux>, repo: RepoId, cs: &ChangesetId) -> Opti
     }
 }
 
-fn rev_label(rev: &str) -> String {
+pub(super) fn rev_label(rev: &str) -> String {
     if rev.len() == 64 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { rev[..10].to_string() } else { rev.to_string() }
 }
 
@@ -294,7 +294,7 @@ pub async fn repos_json(State(web): State<WebState>, req: Req) -> WebResult {
     Ok(json_response(serde_json::json!({ "repos": repos }), "private, max-age=10"))
 }
 
-fn json_response(v: serde_json::Value, cache: &'static str) -> Response {
+pub(super) fn json_response(v: serde_json::Value, cache: &'static str) -> Response {
     let mut r = v.to_string().into_response();
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
@@ -328,7 +328,7 @@ pub fn decode_repo(s: &str) -> String {
     url_decode(s)
 }
 
-fn split_repo(rest: &str) -> (String, Vec<String>) {
+pub(super) fn split_repo(rest: &str) -> (String, Vec<String>) {
     let rest = rest.trim_matches('/');
     match rest.split_once("/-/") {
         Some((repo, action)) => (url_decode(repo), action.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()),
@@ -414,6 +414,15 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
             let names: Vec<&str> = ctx.refs.iter().map(|(n, _)| n.as_str()).collect();
             Ok(json_response(serde_json::json!({ "refs": names }), "private, max-age=5"))
         }
+        "issues" => super::issues::issues_get(&web, &req, &ctx, args, &q).await,
+        "labels" => super::issues::labels_page(&web, &req, &ctx).await,
+        "milestones" => super::issues::milestones_page(&web, &req, &ctx, &q).await,
+        "releases" => super::releases::releases_get(&web, &req, &ctx, args).await,
+        "archive" => super::releases::archive(&web, &req, &ctx, args).await,
+        "runs" => super::ci::runs_get(&web, &req, &ctx, args, &q).await,
+        "settings" if matches!(args.first().map(String::as_str), Some("hooks" | "branches" | "secrets")) => {
+            super::repo_admin::settings_get(&web, &req, &ctx, args).await
+        }
         "settings" if args.first().map(String::as_str) == Some("access") => settings_access(&web, &req, &ctx).await,
         "difffile" => diff_file_fragment(&web, &req, &ctx, args, &q).await,
         "settings" => settings(&web, &req, &ctx).await,
@@ -438,26 +447,51 @@ pub async fn repo_get(State(web): State<WebState>, req: Req, Path(rest): Path<St
     }
 }
 
-fn parse_num(s: &str) -> WebResult<i64> {
+pub(super) fn parse_num(s: &str) -> WebResult<i64> {
     s.parse().map_err(|_| WebError::NotFound(format!("no review {s:?}")))
 }
 
-async fn nav<'a>(web: &WebState, req: &Req, ctx: &'a RepoCtx, tab: Tab, rev: &'a str) -> RepoNav<'a> {
+pub(super) async fn nav<'a>(web: &WebState, req: &Req, ctx: &'a RepoCtx, tab: Tab, rev: &'a str) -> RepoNav<'a> {
     let changesets = match web.flux.repo_graph(ctx.id).await {
         Ok(g) => g.graph.read().unwrap().len() as u64,
         Err(_) => 0,
     };
+    let flux = &web.flux;
+    let open_issues = match ctx.config.issues_disabled {
+        true => None,
+        false => Some(flux.meta.issue_counts(ctx.id).await.map(|c| c.0 as usize).unwrap_or(0)),
+    };
+    let watching = match &req.principal.user {
+        Some(u) => Some(flux.meta.subscription(u.id, ctx.id, 0).await.ok().flatten().as_deref() == Some("subscribed")),
+        None => None,
+    };
+    let fork_of = match flux.meta.fork_of(ctx.id).await.ok().flatten() {
+        Some(p) => Some(flux.repo_name(p).await).filter(|n| !n.is_empty()),
+        None => None,
+    };
+    let q = query_map(&req.query);
     RepoNav {
         repo: &ctx.name,
         tab,
         rev,
-        open_reviews: open_reviews(&web.flux, ctx.id).await,
+        open_reviews: open_reviews(flux, ctx.id).await,
         description: ctx.config.description.clone(),
         default_branch: ctx.default_branch().unwrap_or("main").to_string(),
         changesets,
         branches: ctx.refs.len(),
         origin: req.origin.clone(),
         is_admin: ctx.can(Role::Maintain),
+        open_issues,
+        watching,
+        signed_in: req.principal.user.is_some(),
+        ssh_host: flux.settings.ssh_host.clone(),
+        archived: ctx.config.archived,
+        fork_of,
+        flash: match (q.get("ok"), q.get("err")) {
+            (_, Some(e)) => Some((false, e.clone())),
+            (Some(m), None) => Some((true, m.clone())),
+            _ => None,
+        },
     }
 }
 
@@ -1035,11 +1069,20 @@ async fn blame(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: &RepoP
 
 // ───────────── history ─────────────
 
+/// Commit statuses by changeset, for status dots in lists.
+type Statuses = HashMap<ChangesetId, Vec<flux_store::CommitStatus>>;
+
 fn commit_row(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool) -> Markup {
-    commit_row_with(ctx, l, rev_for_tree, None)
+    commit_row_with(ctx, l, rev_for_tree, None, None)
 }
 
-fn commit_row_with(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool, graph: Option<Markup>) -> Markup {
+fn commit_row_with(
+    ctx: &RepoCtx,
+    l: &Loaded,
+    rev_for_tree: bool,
+    graph: Option<Markup>,
+    checks: Option<&Vec<flux_store::CommitStatus>>,
+) -> Markup {
     let (n, e) = person(&l.changeset.author);
     let id = l.id.to_hex();
     html! {
@@ -1054,6 +1097,7 @@ fn commit_row_with(ctx: &RepoCtx, l: &Loaded, rev_for_tree: bool, graph: Option<
                 }
             }
             div.commit-actions {
+                @if let Some(c) = checks { (super::ci::status_badge(c, &format!("{}#checks", url(&ctx.name, "commit", &id, None)))) }
                 button.sha.copy-btn type="button" data-copy=(id) title="Copy changeset id" { (short(&l.id)) }
                 @if rev_for_tree {
                     a.btn.small.icon-only href=(url(&ctx.name, "tree", &id, None)) title="Browse files at this changeset" { (icon("code")) }
@@ -1178,15 +1222,15 @@ fn graph_rows(items: &[Arc<Loaded>]) -> Vec<Markup> {
         .collect()
 }
 
-fn commit_list(ctx: &RepoCtx, items: &[Arc<Loaded>]) -> Markup {
-    commit_list_inner(ctx, items, false)
+fn commit_list(ctx: &RepoCtx, items: &[Arc<Loaded>], st: &Statuses) -> Markup {
+    commit_list_inner(ctx, items, false, st)
 }
 
-fn commit_list_graph(ctx: &RepoCtx, items: &[Arc<Loaded>]) -> Markup {
-    commit_list_inner(ctx, items, true)
+fn commit_list_graph(ctx: &RepoCtx, items: &[Arc<Loaded>], st: &Statuses) -> Markup {
+    commit_list_inner(ctx, items, true, st)
 }
 
-fn commit_list_inner(ctx: &RepoCtx, items: &[Arc<Loaded>], graph: bool) -> Markup {
+fn commit_list_inner(ctx: &RepoCtx, items: &[Arc<Loaded>], graph: bool, st: &Statuses) -> Markup {
     let mut graphs: Vec<Option<Markup>> =
         if graph { graph_rows(items).into_iter().map(Some).collect() } else { vec![None; items.len()] };
     let mut groups: Vec<(i64, Vec<(&Arc<Loaded>, Option<Markup>)>)> = Vec::new();
@@ -1201,7 +1245,7 @@ fn commit_list_inner(ctx: &RepoCtx, items: &[Arc<Loaded>], graph: bool) -> Marku
         @for (_, group) in groups {
             div.day {
                 div.day-label { (view::day_label(group[0].0.changeset.author_time.unix_ms)) }
-                ul.commits.card { @for (l, g) in group { (commit_row_with(ctx, l, true, g)) } }
+                ul.commits.card { @for (l, g) in group { (commit_row_with(ctx, l, true, g, st.get(&l.id))) } }
             }
         }
     }
@@ -1217,6 +1261,8 @@ async fn commits(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Opti
     let items = flux.log_page(ctx.id, &cs, &[], path.as_ref(), false, page_no * PAGE_SIZE, PAGE_SIZE + 1).await?;
     let more = items.len() > PAGE_SIZE;
     let items = &items[..items.len().min(PAGE_SIZE)];
+    let ids: Vec<ChangesetId> = items.iter().map(|l| l.id).collect();
+    let st = super::ci::statuses_for(web, ctx, &ids).await;
     let base = url(&ctx.name, "commits", rev, path.as_ref());
     let body = html! {
         div.container {
@@ -1227,7 +1273,7 @@ async fn commits(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str, path: Opti
                 }
             }
             @if items.is_empty() { (empty_state("No changes", html! { p { "Nothing has touched this path yet." } })) }
-            (if path.is_none() { commit_list_graph(ctx, items) } else { commit_list(ctx, items) })
+            (if path.is_none() { commit_list_graph(ctx, items, &st) } else { commit_list(ctx, items, &st) })
             div.pager {
                 @if page_no > 0 { a.btn href=(format!("{base}?page={}", page_no - 1)) { "← Newer" } }
                 @if more { a.btn href=(format!("{base}?page={}", page_no + 1)) { "Older →" } }
@@ -1436,6 +1482,92 @@ struct Comments<'a> {
     /// (path, line) → comments. Positive lines are new-side line numbers,
     /// negative ones old-side.
     threads: HashMap<(String, i64), Vec<&'a flux_store::ReviewEvent>>,
+    /// Suggested changes by comment sequence number.
+    suggest: &'a HashMap<i64, Suggest>,
+}
+
+/// What a ```suggestion block in a line comment replaces, and whether it
+/// can still be applied.
+pub(super) struct Suggest {
+    /// The commented line(s) when the comment was made.
+    original: Vec<String>,
+    /// The suggestion is already in the review head.
+    applied: bool,
+    /// POST target, for viewers who may apply it.
+    apply_url: Option<String>,
+}
+
+/// Split a comment into Markdown text and ```suggestion blocks.
+fn split_suggestions(body: &str) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_s = false;
+    for line in body.split_inclusive('\n') {
+        let t = line.trim();
+        if !in_s && t.starts_with("```suggestion") {
+            if !cur.trim().is_empty() {
+                out.push((false, std::mem::take(&mut cur)));
+            }
+            cur.clear();
+            in_s = true;
+            continue;
+        }
+        if in_s && t == "```" {
+            out.push((true, std::mem::take(&mut cur)));
+            in_s = false;
+            continue;
+        }
+        cur.push_str(line);
+    }
+    if in_s || !cur.trim().is_empty() {
+        out.push((in_s, cur));
+    }
+    out
+}
+
+/// The lines a suggestion block proposes (none: delete the line).
+fn suggestion_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![];
+    }
+    let t = text.strip_suffix('\n').unwrap_or(text);
+    t.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect()
+}
+
+/// A comment body: Markdown, with suggestion blocks shown as a small diff
+/// and an "Apply suggestion" button.
+fn comment_html(body: &str, seq: i64, sug: Option<&Suggest>) -> Markup {
+    let parts = split_suggestions(body);
+    html! {
+        @for (is_s, text) in &parts {
+            @if *is_s {
+                div.suggestion {
+                    div.suggestion-head {
+                        (icon("edit")) span { "Suggested change" }
+                        div.spacer {}
+                        @match sug {
+                            Some(s) if s.applied => { span.pill.small.ok { (icon("check")) "Applied" } }
+                            Some(Suggest { apply_url: Some(u), .. }) => {
+                                form method="post" action=(u) {
+                                    input type="hidden" name="seq" value=(seq);
+                                    button.btn.small.primary type="submit" { "Apply suggestion" }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    table.suggestion-diff {
+                        tbody {
+                            @if let Some(s) = sug { @for l in &s.original { tr.sl-del { td { span.mark { "-" } (l) } } } }
+                            @for l in suggestion_lines(text) { tr.sl-add { td { span.mark { "+" } (l) } } }
+                        }
+                    }
+                }
+            } @else {
+                div.markdown { (PreEscaped(markdown::render(text, None))) }
+            }
+        }
+    }
 }
 
 fn thread_row(c: &Comments<'_>, path: &str, line: i64, events: &[&flux_store::ReviewEvent]) -> Markup {
@@ -1444,16 +1576,16 @@ fn thread_row(c: &Comments<'_>, path: &str, line: i64, events: &[&flux_store::Re
             td colspan="3" {
                 div.thread-box {
                     @for e in events {
-                        div.c {
+                        div.c id=(format!("rc{}", e.seq)) {
                             div.c-head { (avatar(&e.author, "", false)) strong { (e.author) } span.faint { (time(e.ts_ms)) } }
-                            div.markdown { (PreEscaped(markdown::render(&e.body, None))) }
+                            (comment_html(&e.body, e.seq, c.suggest.get(&e.seq)))
                         }
                     }
                     @if c.can_write {
                         form method="post" action=(c.action) {
                             input type="hidden" name="path" value=(path);
                             input type="hidden" name="line" value=(line);
-                            textarea name="body" rows="2" placeholder="Reply…" required {}
+                            textarea name="body" rows="2" placeholder="Reply… (a ```suggestion block proposes a change)" required {}
                             div.form-actions { button.btn.small.primary type="submit" { "Reply" } }
                         }
                     }
@@ -1612,6 +1744,8 @@ async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResul
     let rest = view::body_text(&l.changeset.message);
     let hex = cs.to_hex();
     let rebased_from = l.changeset.extra.get("flux.rebased_from").map(|v| String::from_utf8_lossy(v).into_owned());
+    let checks = flux.meta.statuses(ctx.id, &cs).await?;
+    let checks_state = view::combine_states(checks.iter().map(|s| s.state.as_str()));
     let body = html! {
         div.container {
             div.card.commit-card {
@@ -1638,6 +1772,16 @@ async fn commit(web: &WebState, req: &Req, ctx: &RepoCtx, rev: &str) -> WebResul
                 }
                 @if let Some(from) = rebased_from {
                     div.notice.small { "Rebased by the server from " code { (&from[..from.len().min(10)]) } }
+                }
+            }
+            @if !checks.is_empty() {
+                details.card.checks-card #checks open[checks_state != Some("success")] {
+                    summary {
+                        (view::sdot(checks_state.unwrap_or("pending")))
+                        strong { @match checks_state { Some("success") => { "All checks passed" } Some("failure") => { "Some checks failed" } _ => { "Checks in progress" } } }
+                        span.muted.small { (checks.iter().filter(|c| c.state == "success").count()) " of " (checks.len()) " successful" }
+                    }
+                    (super::ci::checks_list(&checks))
                 }
             }
             (diff_view(ctx, &hex, &files, Some((l.changeset.parents.first().map(|p| p.to_hex()).as_deref().unwrap_or("-"), &hex))))
@@ -1685,7 +1829,7 @@ async fn compare(web: &WebState, req: &Req, ctx: &RepoCtx, spec: &str) -> WebRes
                         a.btn.primary href=(format!("/{}/-/reviews/new?head={}&target={}", enc(&ctx.name), enc(&head), enc(&base))) { (icon("review")) "Open a review" }
                     }
                 }
-                (commit_list(ctx, &items))
+                (commit_list(ctx, &items, &super::ci::statuses_for(web, ctx, &items.iter().map(|l| l.id).collect::<Vec<_>>()).await))
                 (diff_view(ctx, &h.to_hex(), &files, mb.map(|m| (m.to_hex(), h.to_hex())).as_ref().map(|(a, b)| (a.as_str(), b.as_str()))))
             }
         }
@@ -1972,7 +2116,7 @@ where
 
 // ───────────── reviews ─────────────
 
-fn state_badge(state: &str) -> Markup {
+pub(super) fn state_badge(state: &str) -> Markup {
     let (cls, ic) = match state {
         "open" => ("open", "review"),
         "landed" => ("landed", "merge"),
@@ -1986,6 +2130,10 @@ async fn reviews(web: &WebState, req: &Req, ctx: &RepoCtx, state: &str) -> WebRe
     let all = flux.meta.list_reviews(ctx.id, None, 1000).await?;
     let count = |s: &str| all.iter().filter(|r| r.state == s).count();
     let shown: Vec<&flux_store::Review> = all.iter().filter(|r| state == "all" || r.state == state).collect();
+    let numbers: Vec<i64> = shown.iter().map(|r| r.number).collect();
+    let labels = super::issues::labels_for(web, ctx, &numbers).await?;
+    let heads: Vec<ChangesetId> = shown.iter().filter(|r| r.state == "open").map(|r| r.head).collect();
+    let checks = super::ci::statuses_for(web, ctx, &heads).await;
     let body = html! {
         div.container {
             div.page-head.row {
@@ -2006,13 +2154,18 @@ async fn reviews(web: &WebState, req: &Req, ctx: &RepoCtx, state: &str) -> WebRe
                 }
                 ul.reviews {
                     @for r in &shown {
+                        @let href = format!("/{}/-/reviews/{}", enc(&ctx.name), r.number);
                         li {
                             (state_badge(&r.state))
                             div.review-main {
-                                a.review-title href=(format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)) { (r.title) }
+                                div.issue-line {
+                                    a.review-title href=(href) { (r.title) }
+                                    @if let Some(ls) = labels.get(&r.number) { @for l in ls { (l) } }
+                                }
                                 div.muted.small { "#" (r.number) " opened " (time(r.created_ms)) " by " strong { (r.author) } " · into " code { (String::from_utf8_lossy(&r.target)) } }
                             }
-                            span.muted.small { "updated " (time(r.updated_ms)) }
+                            @if let Some(st) = checks.get(&r.head) { (super::ci::status_badge(st, &format!("{href}#checks"))) }
+                            span.muted.small.hide-sm { "updated " (time(r.updated_ms)) }
                         }
                     }
                 }
@@ -2048,12 +2201,76 @@ async fn new_review(web: &WebState, req: &Req, ctx: &RepoCtx, q: &HashMap<String
                         }
                     }
                 }
-                button.btn.primary type="submit" { "Create review" }
+                label.check { input type="checkbox" name="draft" value="1"; " Open as a draft " span.muted.small { "(can't land until marked ready)" } }
+                div.form-actions { button.btn.primary type="submit" { "Create review" } }
             }
         }
     };
     let n = nav(web, req, ctx, Tab::Reviews, &target).await;
     Ok(page(web, req, &format!("New review · {}", ctx.name), Some(n), body))
+}
+
+/// A file's lines at a changeset (text files only).
+async fn file_lines(web: &WebState, ctx: &RepoCtx, cs: &ChangesetId, path: &[u8]) -> Option<Vec<String>> {
+    let p = RepoPath::new(path.to_vec()).ok()?;
+    let e = web.flux.entry_at(ctx.id, cs, &p).await.ok()??;
+    let data = web.flux.blobs.get_content_bytes(&e.content_id()?).await.ok()??;
+    if is_binary(&data) || data.len() > MAX_DIFF_FILE as usize {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data);
+    let mut v: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
+    if v.len() > 1 && v.last().is_some_and(|l| l.is_empty()) {
+        v.pop();
+    }
+    Some(v)
+}
+
+/// Suggestions in line comments: what they replace and whether they apply.
+async fn suggestions(
+    web: &WebState,
+    ctx: &RepoCtx,
+    r: &flux_store::Review,
+    events: &[flux_store::ReviewEvent],
+    can_apply: bool,
+    base_url: &str,
+) -> HashMap<i64, Suggest> {
+    let mut out = HashMap::new();
+    let mut cache: HashMap<(ChangesetId, Vec<u8>), Option<Vec<String>>> = HashMap::new();
+    for e in events.iter().filter(|e| e.kind == "comment" && e.body.contains("```suggestion")) {
+        let (Some(path), Some(line)) = (&e.path, e.line) else { continue };
+        if line <= 0 {
+            continue;
+        }
+        let Some((_, text)) = split_suggestions(&e.body).into_iter().find(|(s, _)| *s) else { continue };
+        let want = suggestion_lines(&text);
+        let at = e.cs.unwrap_or(r.head);
+        let mut get = async |cs: ChangesetId| -> Option<Vec<String>> {
+            let key = (cs, path.clone());
+            if !cache.contains_key(&key) {
+                let v = file_lines(web, ctx, &cs, path).await;
+                cache.insert(key.clone(), v);
+            }
+            cache.get(&key).cloned().flatten()
+        };
+        let original = get(at).await.and_then(|v| v.get(line as usize - 1).cloned()).into_iter().collect::<Vec<_>>();
+        let head = get(r.head).await;
+        let i = line as usize - 1;
+        let applied = at != r.head
+            && head.as_ref().is_some_and(|h| {
+                h.len() >= i + want.len() && h[i..i + want.len()] == want[..] && original.first() != want.first()
+            });
+        let open = r.state == "open";
+        out.insert(
+            e.seq,
+            Suggest {
+                original,
+                applied,
+                apply_url: (can_apply && open && !applied && head.is_some()).then(|| format!("{base_url}/suggestion")),
+            },
+        );
+    }
+    out
 }
 
 async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab: bool) -> WebResult {
@@ -2062,6 +2279,10 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
     let r = &d.review;
     let target = String::from_utf8_lossy(&r.target).into_owned();
     let can_write = ctx.can(Role::Write);
+    let me = req.principal.user.as_ref().map(|u| u.name.clone());
+    let is_author = me.as_deref() == Some(r.author.as_str());
+    let (draft, _) = flux.meta.review_flags(ctx.id, number).await?;
+    let open = r.state == "open";
     // Land readiness.
     let status: Option<(bool, usize, usize)> = match (r.state.as_str(), d.target_head) {
         ("open", Some(h)) => {
@@ -2071,6 +2292,12 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
         }
         _ => None,
     };
+    let gate = if open { Some(flux.review_gate(ctx.id, number).await?) } else { None };
+    let rule = flux.branch_rule(ctx.id, &r.target).await?;
+    let admin_bypass = ctx.can(Role::Admin) && !rule.as_ref().is_some_and(|x| x.enforce_admins);
+    let statuses = flux.meta.statuses(ctx.id, &r.head).await?;
+    let base_url = format!("/{}/-/reviews/{}", enc(&ctx.name), r.number);
+    let suggest = suggestions(web, ctx, r, &d.events, can_write, &base_url).await;
     let files = if files_tab {
         let (top, base) = match (r.state.as_str(), r.landed) {
             ("landed", Some(l)) => (l, d.stack.last().and_then(|c| c.changeset.parents.first().copied())),
@@ -2092,19 +2319,55 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
     } else {
         None
     };
-    let base_url = format!("/{}/-/reviews/{}", enc(&ctx.name), r.number);
-    let approvals: Vec<&str> = d.events.iter().filter(|e| e.kind == "approved").map(|e| e.author.as_str()).collect();
+    // Each reviewer's latest decision.
+    let mut decisions: HashMap<String, &'static str> = HashMap::new();
+    for e in &d.events {
+        match e.kind.as_str() {
+            "approved" => {
+                decisions.insert(e.author.clone(), "approved");
+            }
+            "changes_requested" => {
+                decisions.insert(e.author.clone(), "changes_requested");
+            }
+            "dismissed" => {
+                decisions.remove(&e.author);
+            }
+            _ => {}
+        }
+    }
+    let side = super::issues::review_side(web, ctx, number, &decisions).await?;
+    // Checks: reported statuses plus required contexts nobody reported yet.
+    let mut checks: Vec<flux_store::CommitStatus> = statuses.clone();
+    let required: Vec<String> = rule.as_ref().map(|x| x.required_checks.clone()).unwrap_or_default();
+    for c in &required {
+        if !checks.iter().any(|s| &s.context == c) {
+            checks.push(flux_store::CommitStatus {
+                context: c.clone(),
+                state: "missing".into(),
+                description: "Expected — waiting for this check to report".into(),
+                target_url: String::new(),
+                creator: String::new(),
+                created_ms: 0,
+                updated_ms: 0,
+            });
+        }
+    }
+    let checks_state =
+        view::combine_states(checks.iter().map(|s| if s.state == "missing" { "pending" } else { s.state.as_str() }));
+    let can_ready = open && draft && (is_author || can_write);
     let body = html! {
         div.container {
             div.review-head {
                 h1 { (r.title) span.muted { " #" (r.number) } }
                 div.review-sub {
                     (state_badge(&r.state))
+                    @if draft && open { span.state.draft { (icon("draft")) "Draft" } }
                     strong { (r.author) }
                     span.muted { " wants to land " (d.stack.len()) " changeset" @if d.stack.len() != 1 { "s" } " into " }
                     a.branch href=(url(&ctx.name, "tree", &target, None)) { (icon("branch")) (target) }
                     span.muted { " from " }
                     a.sha href=(url(&ctx.name, "commit", &r.head.to_hex(), None)) { (short(&r.head)) }
+                    @if let Some(st) = checks_state { a.checks-chip href=(format!("{base_url}#checks")) { (view::sdot(st)) span.muted.small { "checks" } } }
                 }
             }
             div.filter-tabs.under {
@@ -2124,6 +2387,7 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                         }
                         m
                     },
+                    suggest: &suggest,
                 };
                 (diff_view_with(ctx, &r.head.to_hex(), files, Some(&comments), None))
             } @else {
@@ -2143,79 +2407,144 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
                         @for e in &d.events {
                             @match e.kind.as_str() {
                                 "comment" => {
-                                    div.card.comment {
+                                    div.card.comment id=(format!("rc{}", e.seq)) {
                                         div.comment-head {
                                             (avatar(&e.author, "", false)) strong { (e.author) } span.muted { " commented " (time(e.ts_ms)) }
                                             @if let (Some(p), Some(line)) = (&e.path, e.line) {
                                                 div.spacer {}
-                                                a.comment-loc href=(format!("{base_url}/files")) { (String::from_utf8_lossy(p)) ":" (line.abs()) @if line < 0 { " (old)" } }
+                                                a.comment-loc href=(format!("{base_url}/files#rc{}", e.seq)) { (String::from_utf8_lossy(p)) ":" (line.abs()) @if line < 0 { " (old)" } }
                                             }
                                         }
-                                        div.comment-body { article.markdown { (PreEscaped(markdown::render(&e.body, None))) } }
+                                        div.comment-body { article.markdown { (comment_html(&e.body, e.seq, suggest.get(&e.seq))) } }
                                     }
                                 }
                                 "opened" => {}
                                 kind => {
                                     div.event {
-                                        span class=(format!("event-icon {kind}")) { (icon(match kind { "landed" => "merge", "approved" => "check", "closed" => "x", "updated" => "commit", _ => "review" })) }
+                                        span class=(format!("event-icon {kind}")) { (icon(match kind { "landed" => "merge", "approved" => "check", "closed" | "changes_requested" => "x", "updated" => "commit", "dismissed" => "refresh", _ => "review" })) }
                                         strong { (e.author) }
                                         span.muted {
                                             @match kind {
                                                 "landed" => { " landed this " }
                                                 "approved" => { " approved " }
+                                                "changes_requested" => { " requested changes " }
+                                                "dismissed" => { " dismissed their review " }
                                                 "closed" => { " closed this " }
                                                 "reopened" => { " reopened this " }
                                                 "updated" => { " pushed a new head " }
-                                                k => { " " (k) " " }
+                                                k => { " " (k.replace('_', " ")) " " }
                                             }
                                             (time(e.ts_ms))
                                         }
                                         @if let Some(c) = e.cs { @if kind == "updated" { " " a.sha href=(url(&ctx.name, "commit", &c.to_hex(), None)) { (short(&c)) } } }
-                                        @if !e.body.is_empty() && kind != "approved" { span.muted { " — " (e.body) } }
-                                        @if kind == "approved" && !e.body.is_empty() { div.event-body { (e.body) } }
+                                        @if !e.body.is_empty() && !matches!(kind, "approved" | "changes_requested") { span.muted { " — " (e.body) } }
+                                        @if matches!(kind, "approved" | "changes_requested") && !e.body.is_empty() { div.event-body { (e.body) } }
                                     }
                                 }
                             }
                         }
-                        @if r.state == "open" {
+                        @if open {
                             div.card.land-box {
+                                @if let Some(g) = &gate {
+                                    ul.gate {
+                                        @if draft {
+                                            li.bad {
+                                                (icon("draft"))
+                                                div { strong { "This review is a draft" } div.muted.small { "It can't land until it's marked ready for review." } }
+                                                @if can_ready {
+                                                    form method="post" action=(format!("{base_url}/ready")) { button.btn.small type="submit" { "Ready for review" } }
+                                                }
+                                            }
+                                        }
+                                        @let need = g.required_approvals as usize;
+                                        @let have = g.approvals.len();
+                                        li class=(if need > 0 && have < need { "bad" } else if have > 0 { "ok" } else { "neutral" }) {
+                                            (icon(if need > 0 && have < need { "x" } else { "check" }))
+                                            div {
+                                                strong { @if need > 0 { (have) " of " (need) " required approval" @if need != 1 { "s" } } @else if have > 0 { (have) " approval" @if have != 1 { "s" } } @else { "No approvals required" } }
+                                                @if !g.approvals.is_empty() { div.muted.small { "Approved by " (g.approvals.join(", ")) } }
+                                            }
+                                        }
+                                        @for b in g.blockers.iter().filter(|b| b.ends_with("requested changes")) {
+                                            li.bad { (icon("x")) div { strong { (b) } } }
+                                        }
+                                        @if !checks.is_empty() {
+                                            li class=(match checks_state { Some("success") => "ok", Some("failure") => "bad", _ => "wait" }) id="checks" {
+                                                (icon(match checks_state { Some("success") => "check", Some("failure") => "x", _ => "clock" }))
+                                                div.grow {
+                                                    @let ok = checks.iter().filter(|c| c.state == "success").count();
+                                                    strong { @match checks_state { Some("success") => { "All checks passed" } Some("failure") => { "Some checks failed" } _ => { "Checks in progress" } } }
+                                                    div.muted.small { (ok) " of " (checks.len()) " successful" @if !required.is_empty() { " · " (required.len()) " required" } }
+                                                    (super::ci::checks_list(&checks))
+                                                }
+                                            }
+                                        }
+                                        @if !g.missing_owners.is_empty() {
+                                            li.bad {
+                                                (icon("shield"))
+                                                div {
+                                                    strong { "Code owner review required" }
+                                                    ul.owners { @for (p, o) in g.missing_owners.iter().take(20) { li { code { (p) } span.muted.small { " · " (o.join(", ")) } } } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 @match status {
-                                    Some((true, _, _)) => { div.land-status.ok { (icon("check")) div { strong { "Ready to land" } div.muted.small { "Fast-forward: " (target) " is an ancestor of the head." } } } }
+                                    Some((true, _, _)) => { div.land-status.ok { (icon("check")) div { strong { "Fast-forward" } div.muted.small { (target) " is an ancestor of the head." } } } }
                                     Some((_, 0, _)) => { div.land-status.ok { (icon("check")) div { strong { "Nothing to land" } div.muted.small { "Every changeset here is already in " (target) ". You can close this review." } } } }
                                     Some((false, ahead, behind)) => { div.land-status.warn { (icon("merge")) div { strong { "Will rebase on land" } div.muted.small { (ahead) " ahead, " (behind) " behind " (target) ". flux re-applies the stack server-side and three-way merges overlapping files; real conflicts are reported." } } } }
                                     None => { div.land-status.ok { (icon("check")) div { strong { "Ready to land" } div.muted.small { (target) " doesn't exist yet; landing creates it." } } } }
                                 }
-                                @if !approvals.is_empty() { div.muted.small { (icon("check")) " Approved by " (approvals.join(", ")) } }
                                 @if can_write && !matches!(status, Some((_, 0, _))) {
-                                    form method="post" action=(format!("{base_url}/land")) {
-                                        button.btn.primary.big type="submit" { (icon("merge")) "Land into " (target) }
+                                    @let blocked = gate.as_ref().is_some_and(|g| !g.ok());
+                                    @let bypass = blocked && admin_bypass && !draft;
+                                    form.land-form method="post" action=(format!("{base_url}/land")) data-confirm=[bypass.then_some("Land past the failing checks as an administrator?")] {
+                                        select name="method" aria-label="Merge method" {
+                                            option value="rebase" { "Rebase and land" }
+                                            option value="squash" { "Squash and land" }
+                                        }
+                                        @if blocked && !bypass {
+                                            button.btn.primary.big type="submit" disabled title=(gate.as_ref().map(|g| g.blockers.join("; ")).unwrap_or_default()) { (icon("merge")) "Land into " (target) }
+                                        } @else {
+                                            button.btn.primary.big.warn[bypass] type="submit" { (icon("merge")) @if bypass { "Land anyway" } @else { "Land into " (target) } }
+                                        }
                                     }
+                                    @if blocked { div.muted.small { "Blocked: " (gate.as_ref().map(|g| g.blockers.join("; ")).unwrap_or_default()) @if bypass { ". As an administrator you may land anyway." } } }
                                 }
                             }
                         }
-                        @if can_write {
+                        @if me.is_some() && (can_write || open) {
                             form.card.comment-form method="post" action=(format!("{base_url}/comment")) {
-                                textarea name="body" rows="4" placeholder="Leave a comment (Markdown)" required {}
+                                textarea name="body" rows="4" placeholder="Leave a comment (Markdown)" required aria-label="Comment" {}
                                 div.form-actions {
-                                    @if r.state == "open" {
+                                    @if open && (can_write || is_author) {
                                         button.btn type="submit" formaction=(format!("{base_url}/close")) formnovalidate { "Close" }
+                                    }
+                                    @if open && can_write && !is_author {
+                                        button.btn.danger type="submit" formaction=(format!("{base_url}/request_changes")) formnovalidate { (icon("x")) "Request changes" }
                                         button.btn type="submit" formaction=(format!("{base_url}/approve")) formnovalidate { (icon("check")) "Approve" }
                                     }
-                                    @if r.state == "closed" {
+                                    @if r.state == "closed" && (can_write || is_author) {
                                         button.btn type="submit" formaction=(format!("{base_url}/reopen")) formnovalidate { "Reopen" }
                                     }
                                     button.btn.primary type="submit" { "Comment" }
                                 }
                             }
-                        } @else {
-                            div.notice.small { a href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" } " to comment or land." }
+                        } @else if me.is_none() {
+                            div.notice.small.rounded { a.link href=(format!("/-/login?next={}", enc(&req.path))) { "Sign in" } " to comment or land." }
                         }
                     }
                     aside.review-side {
-                        div.side-block { div.side-title { "Target" } code { (target) } }
+                        (side)
+                        div.side-block { div.side-title { "Target" } a.branch href=(url(&ctx.name, "tree", &target, None)) { (icon("branch")) (target) } }
                         div.side-block { div.side-title { "Head" } a.sha href=(url(&ctx.name, "commit", &r.head.to_hex(), None)) { (short(&r.head)) } }
                         @if let Some(l) = r.landed { div.side-block { div.side-title { "Landed as" } a.sha href=(url(&ctx.name, "commit", &l.to_hex(), None)) { (short(&l)) } } }
-                        div.side-block { div.side-title { "Approvals" } @if approvals.is_empty() { span.muted { "None yet" } } @for a in &approvals { div { (avatar(a, "", false)) " " (a) } } }
+                        @if open && !draft && (is_author || can_write) {
+                            div.side-block {
+                                form method="post" action=(format!("{base_url}/draft")) { button.btn.small.ghost type="submit" { (icon("draft")) "Convert to draft" } }
+                            }
+                        }
                         div.side-block.muted.small { "Land from the CLI: " code { "flux review land " (r.number) } }
                     }
                 }
@@ -2224,6 +2553,119 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
     };
     let n = nav(web, req, ctx, Tab::Reviews, &target).await;
     Ok(page(web, req, &format!("{} · Review #{}", r.title, r.number), Some(n), body))
+}
+
+/// Apply a line comment's suggestion: a changeset on top of the review
+/// head replacing the commented line, which becomes the new head.
+pub(super) async fn apply_suggestion(web: &WebState, req: &Req, ctx: &RepoCtx, n: i64, f: &super::forms::Fields) -> WebResult {
+    let back = format!("/{}/-/reviews/{n}/files", enc(&ctx.name));
+    let r = apply_suggestion_inner(web, req, ctx, n, f).await;
+    super::forms::done(&back, r.map(|_| "Suggestion applied".to_string()))
+}
+
+async fn apply_suggestion_inner(
+    web: &WebState,
+    req: &Req,
+    ctx: &RepoCtx,
+    n: i64,
+    f: &super::forms::Fields,
+) -> WebResult<ChangesetId> {
+    ctx.require(Role::Write)?;
+    let flux = &web.flux;
+    flux.check_writable(ctx.id).await?;
+    let seq: i64 = f.trim("seq").parse().map_err(|_| WebError::BadRequest("which comment?".into()))?;
+    let d = flux.review_detail(ctx.id, n).await?;
+    let r = &d.review;
+    if r.state != "open" {
+        return Err(WebError::Conflict(format!("the review is {}", r.state)));
+    }
+    let e = d
+        .events
+        .iter()
+        .find(|e| e.seq == seq && e.kind == "comment")
+        .ok_or_else(|| WebError::NotFound("comment not found".into()))?;
+    let (Some(path), Some(line)) = (&e.path, e.line.filter(|l| *l > 0)) else {
+        return Err(WebError::BadRequest("only comments on new lines carry suggestions".into()));
+    };
+    let Some((_, text)) = split_suggestions(&e.body).into_iter().find(|(s, _)| *s) else {
+        return Err(WebError::BadRequest("that comment has no suggestion".into()));
+    };
+    let want = suggestion_lines(&text);
+    let rp = RepoPath::new(path.clone()).map_err(|e| WebError::BadRequest(e.to_string()))?;
+    flux.check_write_paths(ctx.id, &req.principal, vec![path.clone()]).await?;
+    let entry = flux.entry_at(ctx.id, &r.head, &rp).await?.ok_or_else(|| WebError::Conflict(format!("{rp} no longer exists")))?;
+    let cid = entry.content_id().ok_or_else(|| WebError::BadRequest("not a regular file".into()))?;
+    let data = flux.blobs.get_content_bytes(&cid).await?.unwrap_or_default();
+    if is_binary(&data) {
+        return Err(WebError::BadRequest("cannot apply a suggestion to a binary file".into()));
+    }
+    let text = String::from_utf8_lossy(&data).into_owned();
+    let crlf = text.contains("\r\n");
+    let trailing = text.ends_with('\n');
+    let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
+    if trailing {
+        lines.pop();
+    }
+    let i = line as usize - 1;
+    if i >= lines.len() {
+        return Err(WebError::Conflict("the file changed since this suggestion".into()));
+    }
+    // The line must still read as it did when the suggestion was made.
+    if let Some(at) = e.cs.filter(|c| *c != r.head) {
+        let then = file_lines(web, ctx, &at, path).await.and_then(|v| v.get(i).cloned());
+        if then.as_deref() != Some(lines[i].as_str()) {
+            return Err(WebError::Conflict("the file changed since this suggestion".into()));
+        }
+    }
+    lines.splice(i..=i, want);
+    let nl = if crlf { "\r\n" } else { "\n" };
+    let mut out = lines.join(nl);
+    if trailing {
+        out.push_str(nl);
+    }
+    let (id, meta) = flux.put_content(out.as_bytes()).await?;
+    let actor = req.principal.name().to_string();
+    let now = view::now_ms();
+    let who = format!("{actor} <{actor}@flux>").into_bytes();
+    let cs = flux_core::Changeset {
+        parents: vec![r.head],
+        author: who.clone(),
+        author_time: flux_core::Timestamp { unix_ms: now, tz_offset_min: 0 },
+        committer: Some(who),
+        committer_time: Some(flux_core::Timestamp { unix_ms: now, tz_offset_min: 0 }),
+        message: format!("Apply suggestion from {}\n\nOn {rp}:{line} in review #{n}.\n", e.author).into_bytes(),
+        file_changes: BTreeMap::from([(
+            rp.clone(),
+            flux_core::FileChange::Change {
+                content_id: id,
+                size: meta.size,
+                kind: entry.file_kind().unwrap_or(FileKind::Regular),
+                copy_from: None,
+            },
+        )]),
+        extra: BTreeMap::from([("flux.web_edit".to_string(), b"1".to_vec())]),
+    };
+    let info = flux.create_changeset(ctx.id, cs).await?;
+    let new_id = ChangesetId::from_slice(&info.id).map_err(|e| WebError::Internal(e.to_string()))?;
+    flux.update_review(ctx.id, n, "update", &actor, "", Some(new_id)).await?;
+    // Branches that pointed at the old head follow it (best effort).
+    let target = String::from_utf8_lossy(&r.target).into_owned();
+    for (name, at) in ctx.refs.iter() {
+        if *at == r.head && *name != target && !name.starts_with("tags/") {
+            let _ = flux
+                .update_ref_as(
+                    &req.principal,
+                    ctx.id,
+                    name.as_bytes(),
+                    flux_store::RefExpect::Target(r.head),
+                    Some(new_id),
+                    format!("apply suggestion in review #{n}"),
+                )
+                .await;
+        }
+    }
+    web.refs.invalidate(&ctx.id);
+    Ok(new_id)
 }
 
 #[derive(Deserialize, Default)]
@@ -2260,6 +2702,8 @@ pub struct ReviewForm {
     head: String,
     #[serde(default)]
     target: String,
+    #[serde(default)]
+    draft: String,
 }
 
 pub async fn repo_post(
@@ -2284,15 +2728,25 @@ pub async fn repo_post(
             } else {
                 f.target.trim().to_string()
             };
+            flux.check_writable(ctx.id).await?;
             let r = flux.create_review(ctx.id, &f.title, &f.body, &actor, head, target.as_bytes()).await?;
+            if f.draft == "1" || f.draft == "on" {
+                flux.meta.set_review_draft(ctx.id, r.number, true).await?;
+            }
+            if let Some(u) = &req.principal.user {
+                flux.subscribe_participant(u.id, ctx.id, r.number).await;
+            }
             Ok(Redirect::to(&format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)).into_response())
         }
         ["reviews", n, "land"] => {
             ctx.require(Role::Write)?;
             let n = parse_num(n)?;
             let method: crate::protect::MergeMethod = f.method.parse()?;
-            flux.land_review_as(&req.principal, ctx.id, n, method).await?;
-            Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
+            let r = flux.land_review_as(&req.principal, ctx.id, n, method).await.map(|r| {
+                let how = if method == crate::protect::MergeMethod::Squash { "Squashed and landed" } else { "Landed" };
+                format!("{how} as {}", short(&r.head))
+            });
+            super::forms::done(&format!("/{}/-/reviews/{n}", enc(&ctx.name)), r)
         }
         ["reviews", n, "comment"] if !f.path.is_empty() => {
             ctx.require(Role::Read)?;
@@ -2304,9 +2758,31 @@ pub async fn repo_post(
         ["reviews", n, action @ ("comment" | "approve" | "request_changes" | "close" | "reopen")] => {
             let n = parse_num(n)?;
             let author = flux.review(ctx.id, n).await?.author == actor;
-            ctx.require(crate::rbac::review_action_role(action, author))?;
-            flux.update_review(ctx.id, n, action, &actor, &f.body, None).await?;
-            Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
+            let back = format!("/{}/-/reviews/{n}", enc(&ctx.name));
+            if author && *action == "approve" {
+                return super::forms::done(
+                    &back,
+                    Err::<String, _>(WebError::BadRequest("authors cannot approve their own review".into())),
+                );
+            }
+            if let Err(e) = ctx.require(crate::rbac::review_action_role(action, author)) {
+                return super::forms::done(&back, Err::<String, _>(e));
+            }
+            if req.principal.user.is_none() && req.principal.mode != crate::auth::AuthMode::Open {
+                return super::forms::done(&back, Err::<String, _>(WebError::Unauthorized("sign in first".into())));
+            }
+            let msg = match *action {
+                "approve" => "Approved",
+                "request_changes" => "Requested changes",
+                "close" => "Review closed",
+                "reopen" => "Review reopened",
+                _ => "",
+            };
+            let r = flux.update_review(ctx.id, n, action, &actor, &f.body, None).await.map(|_| msg.to_string());
+            if let Some(u) = &req.principal.user {
+                flux.subscribe_participant(u.id, ctx.id, n).await;
+            }
+            super::forms::done(&back, r)
         }
         ["edit"] => {
             ctx.require(Role::Write)?;
@@ -2379,18 +2855,24 @@ async fn settings(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
                 }
                 div.form-actions { button.btn.primary type="submit" { "Save settings" } }
             }
+            @if ctx.can(Role::Admin) { (super::repo_admin::danger_zone(ctx)) }
         }
     };
     let n = nav(web, req, ctx, Tab::Settings, &default).await;
     Ok(page(web, req, &format!("Settings · {}", ctx.name), Some(n), body))
 }
 
-fn settings_tabs(ctx: &RepoCtx, active: &str) -> Markup {
+pub(super) fn settings_tabs(ctx: &RepoCtx, active: &str) -> Markup {
     let base = format!("/{}/-/settings", enc(&ctx.name));
     html! {
-        nav.filter-tabs.under {
+        nav.filter-tabs.under aria-label="Settings" {
             a.active[active == "general"] href=(base) { (icon("settings")) "General" }
-            @if ctx.can(Role::Admin) { a.active[active == "access"] href=(format!("{base}/access")) { (icon("people")) "Access" } }
+            @if ctx.can(Role::Admin) {
+                a.active[active == "access"] href=(format!("{base}/access")) { (icon("people")) "Access" }
+                a.active[active == "branches"] href=(format!("{base}/branches")) { (icon("shield")) "Branches" }
+                a.active[active == "hooks"] href=(format!("{base}/hooks")) { (icon("webhook")) "Webhooks" }
+                a.active[active == "secrets"] href=(format!("{base}/secrets")) { (icon("key")) "Secrets" }
+            }
         }
     }
 }
@@ -2398,13 +2880,10 @@ fn settings_tabs(ctx: &RepoCtx, active: &str) -> Markup {
 async fn settings_access(web: &WebState, req: &Req, ctx: &RepoCtx) -> WebResult {
     ctx.require(Role::Admin)?;
     let content = super::account::repo_access(web, ctx.id, &ctx.name).await?;
-    let q = query_map(&req.query);
     let body = html! {
         div.container.narrow {
             div.page-head { h1 { "Settings" } p.muted { "Who can see and change " (ctx.name) "." } }
             (settings_tabs(ctx, "access"))
-            @if let Some(m) = q.get("ok") { div.notice.ok { (icon("check")) (m) } }
-            @if let Some(m) = q.get("err") { div.notice.error { (icon("alert")) (m) } }
             (content)
         }
     };
