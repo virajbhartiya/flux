@@ -51,6 +51,8 @@ pub fn route(rest: &str) -> Option<(String, Op)> {
 fn git_ref(flux_name: &[u8]) -> Vec<u8> {
     match flux_name.strip_prefix(b"tags/") {
         Some(t) => [b"refs/tags/".as_slice(), t].concat(),
+        // Imported pull request heads keep GitHub's names (read-only).
+        None if flux_name.starts_with(b"pull/") => [b"refs/".as_slice(), flux_name].concat(),
         None => [b"refs/heads/".as_slice(), flux_name].concat(),
     }
 }

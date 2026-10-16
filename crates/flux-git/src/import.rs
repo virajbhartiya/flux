@@ -159,9 +159,15 @@ pub async fn import(client: &Client, opts: &ImportOptions) -> Result<ImportStats
 
     if opts.set_refs {
         for (name, sha) in &refs {
-            let flux_name = name.strip_prefix("refs/heads/").unwrap_or(name);
+            // refs/heads/x → x, refs/tags/x → tags/x, refs/pull/1/head → pull/1/head
+            // (the names the git frontend serves back under refs/).
+            let flux_name = name
+                .strip_prefix("refs/heads/")
+                .map(str::to_string)
+                .or_else(|| name.strip_prefix("refs/").map(str::to_string))
+                .unwrap_or_else(|| name.clone());
             let cs = mapped.get(sha).ok_or_else(|| anyhow!("ref {name} points at unimported commit"))?;
-            client.update_ref(flux_name, Expect::Any(true), Some(*cs), "git import").await?;
+            client.update_ref(&flux_name, Expect::Any(true), Some(*cs), "git import").await?;
             stats.refs_updated += 1;
         }
     }
