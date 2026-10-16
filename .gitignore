@@ -3,3 +3,6 @@
 *.db-*
 /.flux-data
 .playwright-mcp/
+
+# Local agent worktrees and settings
+.claude/

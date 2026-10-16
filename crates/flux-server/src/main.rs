@@ -48,6 +48,79 @@ struct Serve {
     /// Create these repositories at startup if they don't exist.
     #[arg(long = "create-repo")]
     create_repos: Vec<String>,
+    /// The URL people and webhooks use to reach this server
+    /// (https://flux.example.com); used in links, payloads and sign-in redirects.
+    #[arg(long, env = "FLUX_PUBLIC_URL")]
+    public_url: Option<String>,
+    /// Serve git over SSH on this address (e.g. 0.0.0.0:2222).
+    #[arg(long, env = "FLUX_SSH_LISTEN")]
+    ssh_listen: Option<std::net::SocketAddr>,
+    /// SSH host key (OpenSSH format); created on first start if missing.
+    /// Default: <data-dir>/ssh_host_ed25519_key.
+    #[arg(long, env = "FLUX_SSH_HOST_KEY")]
+    ssh_host_key: Option<PathBuf>,
+    /// host[:port] shown in SSH clone URLs (default: from --public-url and --ssh-listen).
+    #[arg(long, env = "FLUX_SSH_HOST")]
+    ssh_host: Option<String>,
+    /// 32-byte key (64 hex chars) for encrypting CI secrets and two-factor
+    /// secrets. Default: <data-dir>/secret.key, created if missing. Every
+    /// instance of a deployment must use the same key.
+    #[arg(long, env = "FLUX_SECRET_KEY_FILE")]
+    secret_key_file: Option<PathBuf>,
+    /// Let webhooks reach loopback and private networks (off: SSRF guard).
+    #[arg(long, env = "FLUX_WEBHOOK_ALLOW_PRIVATE")]
+    webhook_allow_private: bool,
+    /// Require two-factor authentication for password sign-ins.
+    #[arg(long, env = "FLUX_REQUIRE_2FA")]
+    require_2fa: bool,
+    #[arg(long, env = "FLUX_GITHUB_CLIENT_ID", requires = "github_client_secret")]
+    github_client_id: Option<String>,
+    #[arg(long, env = "FLUX_GITHUB_CLIENT_SECRET", hide_env_values = true)]
+    github_client_secret: Option<String>,
+    #[arg(long, env = "FLUX_GOOGLE_CLIENT_ID", requires = "google_client_secret")]
+    google_client_id: Option<String>,
+    #[arg(long, env = "FLUX_GOOGLE_CLIENT_SECRET", hide_env_values = true)]
+    google_client_secret: Option<String>,
+    /// OpenID Connect issuer URL for single sign-on (Okta, Auth0, Entra ID, Keycloak, ...).
+    #[arg(long, env = "FLUX_OIDC_ISSUER", requires_all = ["oidc_client_id", "oidc_client_secret"])]
+    oidc_issuer: Option<String>,
+    #[arg(long, env = "FLUX_OIDC_CLIENT_ID")]
+    oidc_client_id: Option<String>,
+    #[arg(long, env = "FLUX_OIDC_CLIENT_SECRET", hide_env_values = true)]
+    oidc_client_secret: Option<String>,
+    /// Sign-in button label for the OIDC provider.
+    #[arg(long, env = "FLUX_OIDC_LABEL", default_value = "SSO")]
+    oidc_label: String,
+    /// Create accounts for first-time external sign-ins (otherwise only
+    /// linked accounts and imported placeholders may sign in).
+    #[arg(long, env = "FLUX_OAUTH_SIGNUP", default_value_t = true, action = clap::ArgAction::Set)]
+    oauth_signup: bool,
+}
+
+/// Read or create the secrets key.
+fn secret_key(explicit: Option<&PathBuf>, state_dir: Option<&std::path::Path>) -> anyhow::Result<Option<[u8; 32]>> {
+    let path = match (explicit, state_dir) {
+        (Some(p), _) => p.clone(),
+        (None, Some(d)) => d.join("secret.key"),
+        (None, None) => return Ok(None),
+    };
+    if !path.exists() {
+        if explicit.is_some() {
+            anyhow::bail!("secret key file {} does not exist", path.display());
+        }
+        let mut k = [0u8; 32];
+        getrandom::fill(&mut k).map_err(|e| anyhow::anyhow!("random: {e}"))?;
+        std::fs::write(&path, hex::encode(k))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(path = %path.display(), "generated secrets key");
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let bytes = hex::decode(raw.trim()).map_err(|_| anyhow::anyhow!("{} must hold 64 hex characters", path.display()))?;
+    Ok(Some(bytes.try_into().map_err(|_| anyhow::anyhow!("{} must hold 64 hex characters", path.display()))?))
 }
 
 #[derive(Subcommand)]
@@ -110,8 +183,10 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr: stdout carries command output (tokens, reports).
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
     if let Some(Cmd::Cache { upstream, dir, listen }) = &cli.cmd {
@@ -122,12 +197,45 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(%addr, %upstream, dir = %dir.display(), "flux-cache listening");
         return flux_server::cache::serve(cache, listener, shutdown_signal()).await;
     }
-    let cfg = match (cli.storage.data_dir, cli.storage.meta_url, cli.storage.blob_url) {
-        (Some(dir), _, _) => StorageConfig::data_dir(&dir)?,
-        (None, Some(meta_url), Some(blob_url)) => StorageConfig { meta_url, blob_url },
-        _ => StorageConfig::data_dir(&PathBuf::from(".flux-data"))?,
+    let (cfg, state_dir) = match (cli.storage.data_dir, cli.storage.meta_url, cli.storage.blob_url) {
+        (Some(dir), _, _) => (StorageConfig::data_dir(&dir)?, Some(dir)),
+        (None, Some(meta_url), Some(blob_url)) => (StorageConfig { meta_url, blob_url }, None),
+        _ => {
+            let dir = PathBuf::from(".flux-data");
+            (StorageConfig::data_dir(&dir)?, Some(dir))
+        }
     };
-    let flux = flux_server::open_with_options(&cfg, cli.serve.auth, cli.serve.signup).await?;
+    let s = &cli.serve;
+    let mut oauth = Vec::new();
+    if let (Some(id), Some(secret)) = (&s.github_client_id, &s.github_client_secret) {
+        oauth.push(flux_server::settings::OAuthProvider::github(id.clone(), secret.clone()));
+    }
+    if let (Some(id), Some(secret)) = (&s.google_client_id, &s.google_client_secret) {
+        oauth.push(flux_server::settings::OAuthProvider::google(id.clone(), secret.clone()));
+    }
+    if let (Some(iss), Some(id), Some(secret)) = (&s.oidc_issuer, &s.oidc_client_id, &s.oidc_client_secret) {
+        let mut p = flux_server::settings::OAuthProvider::oidc(iss, id.clone(), secret.clone());
+        p.label = s.oidc_label.clone();
+        oauth.push(p);
+    }
+    for p in &mut oauth {
+        p.allow_signup = s.oauth_signup;
+    }
+    let ssh_host = s.ssh_host.clone().or_else(|| {
+        let port = s.ssh_listen?.port();
+        let host = s.public_url.as_deref().and_then(|u| url::Url::parse(u).ok()?.host_str().map(str::to_string))?;
+        Some(if port == 22 { host } else { format!("{host}:{port}") })
+    });
+    let settings = flux_server::settings::Settings {
+        public_url: s.public_url.clone(),
+        webhook_allow_private: s.webhook_allow_private,
+        secret_key: secret_key(s.secret_key_file.as_ref(), state_dir.as_deref())?,
+        smtp: None,
+        oauth,
+        ssh_host,
+        require_2fa: s.require_2fa,
+    };
+    let flux = flux_server::open_with_settings(&cfg, s.auth, s.signup, settings).await?;
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => {}
         Cmd::Token { user, admin, label } => {
@@ -237,6 +345,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     flux_server::warm(&flux);
+    if let Some(ssh) = cli.serve.ssh_listen {
+        let key_path = cli
+            .serve
+            .ssh_host_key
+            .clone()
+            .or_else(|| state_dir.as_ref().map(|d| d.join("ssh_host_ed25519_key")))
+            .ok_or_else(|| anyhow::anyhow!("--ssh-host-key is required with --meta-url/--blob-url"))?;
+        let key = flux_server::git::ssh::host_key(&key_path)?;
+        let listener = tokio::net::TcpListener::bind(ssh).await?;
+        tracing::info!(addr = %ssh, "git over SSH listening");
+        let flux = flux.clone();
+        tokio::spawn(async move {
+            if let Err(e) = flux_server::git::ssh::serve(flux, listener, key, shutdown_signal()).await {
+                tracing::error!(error = %e, "SSH server stopped");
+            }
+        });
+    }
     let (listener, addr) = flux_server::bind(cli.serve.listen).await?;
     tracing::info!(
         %addr,

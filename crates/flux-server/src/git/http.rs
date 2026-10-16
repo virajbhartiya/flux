@@ -113,9 +113,7 @@ pub async fn handle(flux: Arc<Flux>, repo_name: &str, op: Op, headers: &HeaderMa
     }
     // git needs whole trees, so a principal restricted from reading any path
     // can't use plain git on this repository (flux checkouts work).
-    if let Ok(cfg) = flux.repo_config(repo).await
-        && cfg.acl.iter().any(|r| !cfg.allows(&principal, r.path.as_bytes(), false))
-    {
+    if path_restricted(&flux, repo, &principal).await {
         return err(
             StatusCode::FORBIDDEN,
             "this repository has path restrictions that apply to you; use `flux attach` (sparse) instead of git",
@@ -142,6 +140,10 @@ pub async fn handle(flux: Arc<Flux>, repo_name: &str, op: Op, headers: &HeaderMa
             err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
     }
+}
+
+pub(crate) async fn path_restricted(flux: &Flux, repo: RepoId, principal: &Principal) -> bool {
+    flux.repo_config(repo).await.is_ok_and(|cfg| cfg.acl.iter().any(|r| !cfg.allows(principal, r.path.as_bytes(), false)))
 }
 
 fn typed(body: impl Into<Body>, ctype: &'static str) -> Response {
@@ -171,13 +173,29 @@ async fn git_refs(flux: &Flux, repo: RepoId) -> FluxResult<(Vec<(Vec<u8>, Sha)>,
 }
 
 async fn advertise(flux: &Flux, repo: RepoId, service: &str) -> FluxResult<Response> {
+    let out = advertisement(flux, repo, service, true).await?;
+    let ctype = if service == "git-upload-pack" {
+        "application/x-git-upload-pack-advertisement"
+    } else {
+        "application/x-git-receive-pack-advertisement"
+    };
+    Ok(typed(out, ctype))
+}
+
+/// The ref advertisement. Over HTTP it starts with a `# service=` header
+/// and offers `multi_ack_detailed` (stateless negotiation); over SSH the
+/// negotiation is stateful and uses the basic ACK/NAK protocol.
+pub(crate) async fn advertisement(flux: &Flux, repo: RepoId, service: &str, http: bool) -> FluxResult<Vec<u8>> {
     let (refs, head) = git_refs(flux, repo).await?;
     let mut out = Vec::new();
-    pkt_str(&mut out, &format!("# service={service}\n"));
-    flush(&mut out);
+    if http {
+        pkt_str(&mut out, &format!("# service={service}\n"));
+        flush(&mut out);
+    }
     let caps = if service == "git-upload-pack" {
         let symref = head.as_ref().map(|h| format!(" symref=HEAD:{}", String::from_utf8_lossy(h))).unwrap_or_default();
-        format!("multi_ack_detailed side-band-64k ofs-delta thin-pack no-progress include-tag{symref} {AGENT}")
+        let ack = if http { "multi_ack_detailed " } else { "" };
+        format!("{ack}side-band-64k ofs-delta thin-pack no-progress include-tag{symref} {AGENT}")
     } else {
         format!("report-status delete-refs side-band-64k ofs-delta atomic quiet {AGENT}")
     };
@@ -203,17 +221,28 @@ async fn advertise(flux: &Flux, repo: RepoId, service: &str) -> FluxResult<Respo
         pkt(&mut out, &l);
     }
     flush(&mut out);
-    let ctype = if service == "git-upload-pack" {
-        "application/x-git-upload-pack-advertisement"
-    } else {
-        "application/x-git-receive-pack-advertisement"
-    };
-    Ok(typed(out, ctype))
+    Ok(out)
 }
 
 // ───────────── fetch ─────────────
 
 async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<Response> {
+    let (out, pack) = upload_pack_stream(flux, repo, body).await?;
+    Ok(match pack {
+        None => typed(out, "application/x-git-upload-pack-result"),
+        Some(rx) => {
+            let first = futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(out)) });
+            let rest = tokio_stream::wrappers::ReceiverStream::new(rx);
+            typed(Body::from_stream(futures::StreamExt::chain(first, rest)), "application/x-git-upload-pack-result")
+        }
+    })
+}
+
+pub(crate) type PackStream = tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>;
+
+/// Answer one upload-pack request: the negotiation lines (ACK/NAK), and,
+/// once the client said `done`, the pack as a stream.
+pub(crate) async fn upload_pack_stream(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<(Vec<u8>, Option<PackStream>)> {
     let (lines, _) = read_pkts(body).map_err(FluxError::InvalidArgument)?;
     let mut wants: Vec<Sha> = Vec::new();
     let mut haves: Vec<Sha> = Vec::new();
@@ -254,7 +283,7 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
             pkt_str(&mut out, &format!("ACK {} ready\n", hex(s)));
         }
         pkt_str(&mut out, "NAK\n");
-        return Ok(typed(out, "application/x-git-upload-pack-result"));
+        return Ok((out, None));
     }
     match have_cs.last() {
         Some((s, _)) => pkt_str(&mut out, &format!("ACK {}\n", hex(s))),
@@ -289,7 +318,6 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
         "upload-pack planned"
     );
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    let _ = tx.send(Ok(Bytes::from(out))).await;
     let flux = flux.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
@@ -303,8 +331,7 @@ async fn upload_pack(flux: &Arc<Flux>, repo: RepoId, body: &[u8]) -> FluxResult<
             let _ = tx.send(Ok(Bytes::from(msg))).await;
         }
     });
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Ok(typed(Body::from_stream(stream), "application/x-git-upload-pack-result"))
+    Ok((out, Some(rx)))
 }
 
 /// One object to send: its git identity, where its data comes from, and an
@@ -769,6 +796,16 @@ async fn diff(r: &mut Resolver<'_>, a: Option<Sha>, b: Option<Sha>) -> FluxResul
 }
 
 async fn receive_pack(flux: &Arc<Flux>, repo: RepoId, principal: &Principal, body: &[u8]) -> FluxResult<Response> {
+    Ok(typed(receive_pack_report(flux, repo, principal, body).await?, "application/x-git-receive-pack-result"))
+}
+
+/// Apply a push (commands, then the pack) and return the status report.
+pub(crate) async fn receive_pack_report(
+    flux: &Arc<Flux>,
+    repo: RepoId,
+    principal: &Principal,
+    body: &[u8],
+) -> FluxResult<Vec<u8>> {
     let (lines, pack_at) = read_pkts(body).map_err(FluxError::InvalidArgument)?;
     let mut cmds = Vec::new();
     let mut caps = String::new();
@@ -847,7 +884,7 @@ async fn receive_pack(flux: &Arc<Flux>, repo: RepoId, principal: &Principal, bod
     } else {
         out = report;
     }
-    Ok(typed(out, "application/x-git-receive-pack-result"))
+    Ok(out)
 }
 
 /// Parse a pushed pack; thin-pack bases are fetched from flux on demand.
