@@ -302,7 +302,7 @@ impl From<object_store::Error> for StoreError {
 pub type StoreResult<T> = Result<T, StoreError>;
 
 #[async_trait]
-pub trait MetaStore: Send + Sync + 'static {
+pub trait MetaStore: crate::collab::CollabStore + Send + Sync + 'static {
     // repos
     async fn create_repo(&self, name: &str) -> StoreResult<RepoId>;
     async fn get_repo(&self, name: &str) -> StoreResult<Option<RepoInfo>>;

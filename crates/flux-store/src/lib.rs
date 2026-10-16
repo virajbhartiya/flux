@@ -6,6 +6,7 @@
 //!   `object_store` backend (local fs, S3-compatible, in-memory).
 
 mod blob;
+mod collab;
 pub mod dict;
 mod meta;
 pub mod segment;
@@ -14,6 +15,7 @@ mod sql;
 pub use blob::{
     BlobStats, BlobStore, CHUNK_THRESHOLD, ChunkSink, ContentLayout, MetaHasher, ObjectCodec, PutObject, content_meta,
 };
+pub use collab::*;
 pub use meta::*;
 pub use sql::{PostgresStore, SqliteStore};
 

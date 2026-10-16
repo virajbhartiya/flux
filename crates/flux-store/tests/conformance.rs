@@ -237,3 +237,193 @@ async fn accounts_orgs_teams_and_grants() {
         assert_eq!(s.audit_list(None, 10).await.unwrap()[0].action, "org.create");
     }
 }
+
+#[tokio::test]
+async fn issues_share_numbers_with_reviews() {
+    for (label, s) in backends().await {
+        let repo = s.create_repo(&unique("iss")).await.unwrap();
+        let head = ChangesetId::hash(b"h");
+        let r = s.create_review(repo, "r", "", "ann", head, b"main").await.unwrap();
+        assert_eq!(r.number, 1, "{label}");
+        let i = s
+            .create_issue(
+                repo,
+                &NewIssue { title: "bug".into(), body: "it Breaks".into(), author: "bob".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(i.number, 2, "{label}");
+        assert_eq!(i.state, "open");
+        let r2 = s.create_review(repo, "r2", "", "ann", head, b"main").await.unwrap();
+        assert_eq!(r2.number, 3, "{label}");
+        // Imports keep their numbers; taken numbers conflict.
+        let imp = s
+            .create_issue(repo, &NewIssue { number: Some(10), title: "old".into(), author: "x".into(), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(imp.number, 10);
+        assert!(matches!(
+            s.create_issue(repo, &NewIssue { number: Some(1), title: "dup".into(), author: "x".into(), ..Default::default() })
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(s.next_item_number(repo).await.unwrap(), 11);
+        assert_eq!(s.item_kind(repo, 1).await.unwrap(), Some("review"));
+        assert_eq!(s.item_kind(repo, 2).await.unwrap(), Some("issue"));
+        assert_eq!(s.item_kind(repo, 5).await.unwrap(), None);
+        let imported = s
+            .import_review(
+                repo,
+                &ImportedReview {
+                    number: 20,
+                    title: "pr".into(),
+                    body: "".into(),
+                    author: "gh".into(),
+                    head,
+                    target: b"main".to_vec(),
+                    state: "landed".into(),
+                    landed: Some(head),
+                    draft: false,
+                    created_ms: 5,
+                    updated_ms: 6,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((imported.number, imported.created_ms), (20, 5));
+
+        // Comments, labels, people and filters.
+        let c = s.add_issue_event(repo, 2, "comment", "ann", "me too", None, Some("gh-1")).await.unwrap();
+        let again = s.add_issue_event(repo, 2, "comment", "ann", "me too", None, Some("gh-1")).await.unwrap();
+        assert_eq!(c.seq, again.seq, "{label}: external ids are idempotent");
+        assert_eq!(s.get_issue(repo, 2).await.unwrap().unwrap().comments, 1);
+        s.put_label(repo, &Label { name: "bug".into(), color: "ff0000".into(), description: "".into() }).await.unwrap();
+        s.set_item_labels(repo, 2, &["bug".into()]).await.unwrap();
+        s.set_item_people(repo, 2, "assignee", &["carol".into()]).await.unwrap();
+        let q = |f: fn(&mut IssueQuery)| {
+            let mut q = IssueQuery { limit: 50, ..Default::default() };
+            f(&mut q);
+            q
+        };
+        assert_eq!(s.list_issues(repo, &q(|q| q.label = Some("bug".into()))).await.unwrap().1, 1);
+        assert_eq!(s.list_issues(repo, &q(|q| q.assignee = Some("carol".into()))).await.unwrap().1, 1);
+        assert_eq!(s.list_issues(repo, &q(|q| q.text = Some("BREAKS".into()))).await.unwrap().1, 1);
+        assert_eq!(s.list_issues(repo, &q(|q| q.state = Some("open".into()))).await.unwrap().1, 2);
+        s.update_issue(repo, 2, &IssueUpdate { state: Some("closed".into()), ..Default::default() }).await.unwrap();
+        assert_eq!(s.issue_counts(repo).await.unwrap(), (1, 1));
+        assert!(s.get_issue(repo, 2).await.unwrap().unwrap().closed_ms.is_some());
+        s.rename_label(repo, "bug", &Label { name: "defect".into(), color: "00ff00".into(), description: "".into() })
+            .await
+            .unwrap();
+        assert_eq!(s.item_labels(repo, &[2]).await.unwrap(), vec![(2, "defect".to_string())]);
+        assert!(s.delete_issue_event(repo, c.seq).await.unwrap());
+        assert_eq!(s.get_issue(repo, 2).await.unwrap().unwrap().comments, 0);
+
+        let m = s.create_milestone(repo, None, "v1", "", None).await.unwrap();
+        s.update_issue(repo, 10, &IssueUpdate { milestone: Some(Some(m.number)), ..Default::default() }).await.unwrap();
+        let ms = s.list_milestones(repo).await.unwrap();
+        assert_eq!((ms[0].open_items, ms[0].closed_items), (1, 0), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn statuses_hooks_keys_notifications() {
+    for (label, s) in backends().await {
+        let repo = s.create_repo(&unique("st")).await.unwrap();
+        let c = ChangesetId::hash(b"c");
+        let st = |state: &str| CommitStatus {
+            context: "ci/test".into(),
+            state: state.into(),
+            description: "".into(),
+            target_url: "".into(),
+            creator: "bot".into(),
+            created_ms: 0,
+            updated_ms: 0,
+        };
+        s.put_status(repo, &c, &st("pending")).await.unwrap();
+        s.put_status(repo, &c, &st("success")).await.unwrap();
+        let all = s.statuses(repo, &c).await.unwrap();
+        assert_eq!(all.len(), 1, "{label}");
+        assert_eq!(all[0].state, "success");
+        assert_eq!(s.statuses_many(repo, &[c, ChangesetId::hash(b"z")]).await.unwrap().len(), 1);
+
+        let h = s
+            .create_webhook(&Webhook {
+                id: 0,
+                scope_kind: "repo".into(),
+                scope_id: repo.0,
+                url: "http://x".into(),
+                secret: "s".into(),
+                events: vec!["push".into(), "issues".into()],
+                active: true,
+                created_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(s.list_webhooks("repo", repo.0).await.unwrap()[0].events, vec!["push", "issues"]);
+        let d = s.enqueue_delivery(h.id, "push", "g1", "{}").await.unwrap();
+        let claimed = s.claim_deliveries(i64::MAX / 2, i64::MAX / 2 + 1000, 10).await.unwrap();
+        assert!(claimed.iter().any(|x| x.id == d), "{label}");
+        let again = s.claim_deliveries(i64::MAX / 2, i64::MAX / 2 + 1000, 10).await.unwrap();
+        assert!(!again.iter().any(|x| x.id == d), "{label}: leased deliveries are not handed out twice");
+        s.finish_delivery(d, "ok", 0, 200, "fine", 12).await.unwrap();
+        assert_eq!(s.get_delivery(d).await.unwrap().unwrap().state, "ok");
+
+        let u = s.create_user(&unique("u"), false).await.unwrap();
+        let fp = unique("SHA256:");
+        s.add_ssh_key(u.id, "laptop", &fp, "ssh-ed25519 AAAA").await.unwrap();
+        assert!(matches!(s.add_ssh_key(u.id, "again", &fp, "x").await, Err(StoreError::Conflict(_))));
+        assert_eq!(s.ssh_key_by_fingerprint(&fp).await.unwrap().unwrap().user_id, u.id);
+
+        s.notify(u.id, repo, 3, "issue", "mention", "t").await.unwrap();
+        s.notify(u.id, repo, 3, "issue", "comment", "t").await.unwrap();
+        assert_eq!(s.unread_count(u.id).await.unwrap(), 1, "{label}");
+        s.mark_read(u.id, None).await.unwrap();
+        assert_eq!(s.unread_count(u.id).await.unwrap(), 0);
+        assert_eq!(s.notifications(u.id, false, 10).await.unwrap().len(), 1);
+
+        s.link_identity("github", "42", u.id, "octo").await.unwrap();
+        let other = s.create_user(&unique("v"), false).await.unwrap();
+        assert!(s.link_identity("github", "42", other.id, "octo").await.is_err(), "{label}");
+        assert_eq!(s.identity("github", "42").await.unwrap().unwrap().user_id, u.id);
+        s.set_totp(u.id, Some("ABC"), &["h1".into()]).await.unwrap();
+        assert_eq!(s.totp(u.id).await.unwrap(), (Some("ABC".to_string()), vec!["h1".to_string()]));
+    }
+}
+
+#[tokio::test]
+async fn ci_queue_claims_once() {
+    for (label, s) in backends().await {
+        let repo = s.create_repo(&unique("ci")).await.unwrap();
+        let run = CiRun {
+            id: 0,
+            repo_id: repo,
+            workflow: "ci".into(),
+            event: "push".into(),
+            ref_name: "main".into(),
+            cs: ChangesetId::hash(b"c"),
+            review: None,
+            state: "queued".into(),
+            actor: "a".into(),
+            created_ms: 0,
+            updated_ms: 0,
+        };
+        let jobs = vec![
+            NewCiJob { name: "build".into(), needs: vec![], labels: vec!["linux".into()], spec: "{}".into() },
+            NewCiJob { name: "deploy".into(), needs: vec!["build".into()], labels: vec![], spec: "{}".into() },
+        ];
+        let (run, jobs) = s.create_ci_run(&run, &jobs).await.unwrap();
+        assert_eq!(jobs[1].state, "blocked", "{label}");
+        assert!(s.claim_ci_job("r1", &["mac".into()], 10, 100).await.unwrap().is_none_or(|j| j.run_id != run.id));
+        let j = s.claim_ci_job("r1", &["linux".into()], 10, 100).await.unwrap().unwrap();
+        assert_eq!(j.id, jobs[0].id);
+        let none = s.claim_ci_job("r2", &["linux".into()], 10, 100).await.unwrap();
+        assert!(none.is_none_or(|x| x.run_id != run.id), "{label}");
+        s.append_ci_log(j.id, 1, b"hello ").await.unwrap();
+        s.append_ci_log(j.id, 2, b"world").await.unwrap();
+        assert_eq!(s.ci_log(j.id, 1).await.unwrap(), vec![(2, b"world".to_vec())]);
+        assert!(!s.set_ci_job(j.id, "intruder", "success", Some(0), 0, 20).await.unwrap());
+        assert!(s.set_ci_job(j.id, "r1", "success", Some(0), 0, 20).await.unwrap());
+        assert_eq!(s.get_ci_job(j.id).await.unwrap().unwrap().finished_ms, Some(20));
+    }
+}

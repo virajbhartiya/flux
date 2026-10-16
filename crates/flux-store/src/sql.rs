@@ -12,6 +12,8 @@ use sqlx::Row;
 
 use crate::meta::*;
 
+mod collab;
+
 const IN_CHUNK: usize = 500;
 
 fn now_ms() -> i64 {
@@ -1463,7 +1465,11 @@ macro_rules! sql_store {
                 let _w = self.write_lock().await;
                 let mut tx = self.pool.begin().await?;
                 Self::lock_log(&mut tx, repo).await?;
-                let number: i64 = sqlx::query("SELECT COALESCE(MAX(number), 0) + 1 FROM reviews WHERE repo_id = $1")
+                // Reviews and issues share one number space.
+                let number: i64 = sqlx::query(
+                    "SELECT COALESCE(MAX(n), 0) + 1 FROM (SELECT MAX(number) AS n FROM reviews WHERE repo_id = $1 \
+                     UNION ALL SELECT MAX(number) AS n FROM issues WHERE repo_id = $1) AS t",
+                )
                     .bind(repo.0)
                     .fetch_one(&mut *tx)
                     .await?
