@@ -54,6 +54,10 @@ flux-import-git --repo demo verify /path/to/repo.git --sample 200
 # Plain git works against the same server.
 git clone http://127.0.0.1:7878/demo.git
 
+# Move a GitHub repository over: history, issues, pull requests, releases
+# (docs/migrating-from-github.md). `flux mirror` keeps it in sync.
+flux migrate github acme/widget --server 127.0.0.1:7878 --to demo2
+
 # Or start from scratch.
 flux attach 127.0.0.1:7878 demo work && cd work
 echo hello > README.md

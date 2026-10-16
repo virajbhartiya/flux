@@ -1270,6 +1270,7 @@ dependencies = [
  "dirs",
  "flux-client",
  "flux-core",
+ "flux-migrate",
  "flux-proto",
  "flux-server",
  "fuser",
@@ -1285,6 +1286,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1365,6 +1367,29 @@ dependencies = [
  "flux-proto",
  "flux-server",
  "hex",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "flux-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "dirs",
+ "flux-client",
+ "flux-git",
+ "flux-proto",
+ "flux-server",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tracing",

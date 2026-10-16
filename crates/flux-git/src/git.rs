@@ -478,17 +478,22 @@ impl LegacyModes {
 }
 
 /// List `(ref name, sha)` for `refs/heads/*` (or the given patterns).
+/// Annotated tags are peeled to the commit they tag; refs to other objects
+/// are skipped.
 pub fn list_refs(repo: &Path, patterns: &[String]) -> Result<Vec<(String, Sha)>> {
-    let mut args = vec!["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)"];
+    let mut args = vec!["for-each-ref", "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)"];
     let pats: Vec<&str> = if patterns.is_empty() { vec!["refs/heads/"] } else { patterns.iter().map(String::as_str).collect() };
     args.extend(pats);
     let out = String::from_utf8(run(repo, &args)?)?;
     let mut refs = Vec::new();
     for line in out.lines() {
-        let mut it = line.splitn(3, ' ');
-        let (sha, ty, name) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or(""));
-        if ty == "commit" {
-            refs.push((name.to_string(), parse_sha(sha)?));
+        let mut it = line.splitn(5, ' ');
+        let mut field = || it.next().unwrap_or("");
+        let (sha, ty, peeled, peeled_ty, name) = (field(), field(), field(), field(), field());
+        match (ty, peeled_ty) {
+            ("commit", _) => refs.push((name.to_string(), parse_sha(sha)?)),
+            ("tag", "commit") => refs.push((name.to_string(), parse_sha(peeled)?)),
+            _ => {}
         }
     }
     Ok(refs)

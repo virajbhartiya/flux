@@ -1,5 +1,6 @@
 //! `flux`: the command-line client (SPEC §13.1).
 
+mod migrate;
 #[cfg(target_os = "linux")]
 mod vfs;
 mod wc;
@@ -232,6 +233,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Migrate repositories from another forge.
+    Migrate {
+        #[command(subcommand)]
+        cmd: migrate::MigrateCmd,
+    },
+    /// Keep a flux repository in sync with a GitHub repository (git and
+    /// metadata, incremental) until stopped: for a gradual cutover.
+    Mirror(migrate::MirrorArgs),
 }
 
 #[derive(Subcommand)]
@@ -403,9 +412,14 @@ fn save_credentials(c: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// `$FLUX_TOKEN`, or the stored token for a (normalized) server URL.
+fn token_for(server: &str) -> Option<String> {
+    std::env::var("FLUX_TOKEN").ok().or_else(|| load_credentials().get(server).cloned())
+}
+
 async fn connect(server: &str, repo: &str) -> Result<Client> {
     let server = normalize_server(server);
-    let token = std::env::var("FLUX_TOKEN").ok().or_else(|| load_credentials().get(&server).cloned());
+    let token = token_for(&server);
     // Route through a running fluxd for this server (objects from local
     // disk); start one in the background if the user asked for that.
     if std::env::var_os("FLUX_NO_DAEMON").is_none() {
@@ -1088,8 +1102,21 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{url}");
             let _ = open::that(&url);
         }
+        Cmd::Migrate { cmd } => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            migrate::migrate(&server, token_for(&server), cmd).await?;
+        }
+        Cmd::Mirror(args) => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            migrate::mirror(&server, token_for(&server), args).await?;
+        }
     }
     Ok(())
+}
+
+fn migrate_server(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<String> {
+    let server = cli.server.clone().or_else(|| wc.map(|w| w.config.server.clone()));
+    Ok(normalize_server(&server.context("which flux server? pass --server or set FLUX_SERVER")?))
 }
 
 fn human(n: u64) -> String {

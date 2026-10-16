@@ -16,6 +16,8 @@ flux-derive = { path = "crates/flux-derive" }
 flux-proto = { path = "crates/flux-proto" }
 flux-server = { path = "crates/flux-server" }
 flux-client = { path = "crates/flux-client" }
+flux-git = { path = "crates/flux-git" }
+flux-migrate = { path = "crates/flux-migrate" }
 
 anyhow = "1"
 async-trait = "0.1"
