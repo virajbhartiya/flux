@@ -431,7 +431,7 @@ pub async fn logout(State(web): State<WebState>, headers: HeaderMap) -> WebResul
 
 // ───────────── personal settings ─────────────
 
-fn settings_layout(web: &WebState, req: &Req, title: &str, active: &str, content: Markup) -> Response {
+pub(super) fn settings_layout(web: &WebState, req: &Req, title: &str, active: &str, content: Markup) -> Response {
     let is_admin = req.principal.user.as_ref().is_some_and(|u| u.is_admin);
     let item = |href: &str, key: &str, ic: &str, label: &str| {
         html! { a.side-link.active[active == key] href=(href) { (icon(ic)) (label) } }
@@ -444,6 +444,8 @@ fn settings_layout(web: &WebState, req: &Req, title: &str, active: &str, content
                     (item("/-/settings", "profile", "user", "Profile"))
                     (item("/-/settings/security", "security", "lock", "Password & security"))
                     (item("/-/settings/tokens", "tokens", "key", "Access tokens"))
+                    (item("/-/settings/keys", "keys", "key", "SSH keys"))
+                    (item("/-/notifications", "notifications", "inbox", "Notifications"))
                     (item("/-/settings/orgs", "orgs", "org", "Organizations"))
                     @if is_admin {
                         div.side-title { "Site admin" }

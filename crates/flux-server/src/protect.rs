@@ -54,7 +54,7 @@ pub struct BranchRule {
 }
 
 /// The classic defaults used when a repository configures no rules.
-fn default_rules() -> Vec<BranchRule> {
+pub fn default_rules() -> Vec<BranchRule> {
     ["main", "master", "trunk", "release/*"].into_iter().map(|p| BranchRule { pattern: p.into(), ..Default::default() }).collect()
 }
 
