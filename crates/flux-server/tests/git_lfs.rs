@@ -49,9 +49,15 @@ async fn lfs_push_and_clone() {
     let out = git(&src, &["push", "-q", &url, "main"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
+    // Fetch LFS content explicitly: the machine may not have git-lfs set up
+    // globally (then a plain clone leaves pointer files).
     let c = dir.path().join("clone");
     let out = git(dir.path(), &["clone", "-q", &url, c.to_str().unwrap()]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for args in [&["lfs", "install", "--local"][..], &["lfs", "pull"]] {
+        let out = git(&c, args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
     assert_eq!(std::fs::read(c.join("large.bin")).unwrap(), large);
     assert_eq!(std::fs::read(c.join("small.bin")).unwrap(), b"small\n");
     // The repository stores pointers; the server indexes the objects.
