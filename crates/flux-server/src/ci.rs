@@ -1,6 +1,6 @@
 //! Built-in CI: GitHub Actions–style workflows run by `flux-runner`.
 //!
-//! Workflows live in `.flux/workflows/*.yml` or `.github/workflows/*.yml`.
+//! Workflows live in `.flux-ci/workflows/*.yml` or `.github/workflows/*.yml`.
 //! The supported subset covers most real pipelines:
 //! * triggers `push`, `pull_request` (flux reviews) and `workflow_dispatch`,
 //!   with `branches`, `branches-ignore`, `tags`, `tags-ignore`, `paths` and
@@ -29,7 +29,7 @@ use crate::auth::{Principal, now_ms};
 use crate::core::{Event, Flux, FluxError, FluxResult};
 use crate::rbac::Role;
 
-const WORKFLOW_DIRS: [&str; 2] = [".flux/workflows", ".github/workflows"];
+const WORKFLOW_DIRS: [&str; 2] = [".flux-ci/workflows", ".github/workflows"];
 const MAX_JOBS: usize = 256;
 /// How long a claimed job stays with its runner without a heartbeat.
 pub const LEASE_MS: i64 = 90_000;

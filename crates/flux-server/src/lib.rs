@@ -23,7 +23,14 @@ pub mod repos;
 pub mod search;
 pub mod secrets;
 pub mod settings;
+pub mod sshkeys;
 pub mod web;
+
+/// Helpers shared by the web UI and the API.
+pub mod web_util {
+    pub use crate::web::{is_binary, language};
+}
+pub mod api;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -238,11 +245,12 @@ macro_rules! grpc_service {
 /// The combined application: every gRPC service plus (optionally) the web UI.
 pub fn app(flux: Arc<Flux>, opts: ServeOptions) -> axum::Router {
     use tower_http::compression::Predicate as _;
+    flux.start_background();
     let svc = grpc::Services::new(flux.clone());
     let router = if opts.web {
-        web::router(flux)
+        api::router(flux.clone()).merge(web::router(flux))
     } else {
-        axum::Router::new().fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "not found") })
+        api::router(flux).fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "not found") })
     };
     let router = grpc_service!(router, ObjectServiceServer<grpc::Services>, svc.clone());
     let router = grpc_service!(router, RepoServiceServer<grpc::Services>, svc.clone());

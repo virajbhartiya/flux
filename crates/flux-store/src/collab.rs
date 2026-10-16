@@ -309,6 +309,20 @@ pub trait CollabStore: Send + Sync + 'static {
 
     // ───── reviews (extensions) ─────
     async fn import_review(&self, repo: RepoId, r: &ImportedReview) -> StoreResult<Review>;
+    /// Append an imported review timeline entry with its original time.
+    /// Returns false when `external_id` was imported before.
+    async fn import_review_event(
+        &self,
+        repo: RepoId,
+        number: i64,
+        kind: &str,
+        author: &str,
+        body: &str,
+        path: Option<&[u8]>,
+        line: Option<i64>,
+        ts_ms: i64,
+        external_id: &str,
+    ) -> StoreResult<bool>;
     async fn set_review_draft(&self, repo: RepoId, number: i64, draft: bool) -> StoreResult<()>;
     async fn review_flags(&self, repo: RepoId, number: i64) -> StoreResult<(bool, i64)>;
     async fn set_review_source(&self, repo: RepoId, number: i64, source: RepoId) -> StoreResult<()>;

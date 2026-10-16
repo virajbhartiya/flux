@@ -44,14 +44,12 @@ impl Flux {
                 }
                 self.notify_thread(repo, *number, "review", actor, None, kind == "opened").await?;
             }
-            Event::Issue { number, action, actor, .. } => {
-                if !matches!(action.as_str(), "labeled" | "milestoned") {
-                    let body = match action.as_str() {
-                        "opened" => self.meta.get_issue(repo, *number).await?.map(|i| i.body),
-                        _ => None,
-                    };
-                    self.notify_thread(repo, *number, "issue", actor, body.as_deref(), action == "opened").await?;
-                }
+            Event::Issue { number, action, actor, .. } if !matches!(action.as_str(), "labeled" | "milestoned") => {
+                let body = match action.as_str() {
+                    "opened" => self.meta.get_issue(repo, *number).await?.map(|i| i.body),
+                    _ => None,
+                };
+                self.notify_thread(repo, *number, "issue", actor, body.as_deref(), action == "opened").await?;
             }
             Event::Comment { number, on, actor, body, .. } => {
                 self.notify_thread(repo, *number, on, actor, Some(body), false).await?;

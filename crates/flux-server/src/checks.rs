@@ -91,7 +91,7 @@ impl Flux {
         if context.len() > 255 || description.len() > 1024 || target_url.len() > 2048 {
             return Err(FluxError::InvalidArgument("context, description or URL too long".into()));
         }
-        if !target_url.is_empty() && !(target_url.starts_with("https://") || target_url.starts_with("http://")) {
+        if !(target_url.is_empty() || target_url.starts_with("https://") || target_url.starts_with("http://")) {
             return Err(FluxError::InvalidArgument("target_url must be an http(s) URL".into()));
         }
         self.load_one_arc(repo, &cs).await?;

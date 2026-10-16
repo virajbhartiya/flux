@@ -112,10 +112,10 @@ async fn reviews_lifecycle() {
     let d = flux.review_detail(repo, 1).await.unwrap();
     assert_eq!(d.stack.len(), 1);
     assert_eq!(d.events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["opened", "comment", "approved"]);
-    let landed = flux.land_review(repo, 1, "bob").await.unwrap();
+    let landed = flux.land_review(repo, 1, "bob", Default::default()).await.unwrap();
     assert_eq!(flux.meta.get_ref(repo, b"main").await.unwrap().unwrap().target, landed.head);
     assert_eq!(flux.review(repo, 1).await.unwrap().state, "landed");
-    assert!(flux.land_review(repo, 1, "bob").await.is_err(), "cannot land twice");
+    assert!(flux.land_review(repo, 1, "bob", Default::default()).await.is_err(), "cannot land twice");
     assert!(flux.update_review(repo, 1, "close", "bob", "", None).await.is_err());
 }
 

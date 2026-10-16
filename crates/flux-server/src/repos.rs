@@ -433,9 +433,16 @@ impl Flux {
         let mut contents: BTreeMap<usize, bytes::Bytes> = BTreeMap::new();
         {
             use futures::StreamExt as _;
-            let mut s = futures::stream::iter(files.iter().enumerate().filter_map(|(i, f)| f.content_id.map(|c| (i, c))))
-                .map(|(i, c)| async move { (i, self.blobs.get_content_bytes(&c).await) })
-                .buffered(32);
+            let futs: Vec<_> = files
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| f.content_id.map(|c| (i, c)))
+                .map(|(i, c)| {
+                    let blobs = self.blobs.clone();
+                    async move { (i, blobs.get_content_bytes(&c).await) }
+                })
+                .collect();
+            let mut s = futures::stream::iter(futs).buffered(32);
             while let Some((i, r)) = s.next().await {
                 contents.insert(i, r?.unwrap_or_default());
             }

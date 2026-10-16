@@ -281,7 +281,7 @@ macro_rules! collab_store {
 
             async fn create_issue(&self, repo: RepoId, n: &NewIssue) -> StoreResult<Issue> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 Self::lock_log(&mut tx, repo).await?;
                 let number = match n.number {
                     Some(num) => {
@@ -366,7 +366,7 @@ macro_rules! collab_store {
 
             async fn update_issue(&self, repo: RepoId, number: i64, u: &IssueUpdate) -> StoreResult<Option<Issue>> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let row = sqlx::query(&format!("SELECT {ISSUE_COLS} FROM issues WHERE repo_id = $1 AND number = $2"))
                     .bind(repo.0)
                     .bind(number)
@@ -446,7 +446,7 @@ macro_rules! collab_store {
                 external_id: Option<&str>,
             ) -> StoreResult<IssueEvent> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 if let Some(x) = external_id {
                     let row = sqlx::query(
                         "SELECT seq, number, kind, author, body, created_at, updated_at FROM issue_events \
@@ -527,7 +527,7 @@ macro_rules! collab_store {
 
             async fn delete_issue_event(&self, repo: RepoId, seq: i64) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let row = sqlx::query("SELECT number, kind FROM issue_events WHERE repo_id = $1 AND seq = $2")
                     .bind(repo.0)
                     .bind(seq)
@@ -549,7 +549,7 @@ macro_rules! collab_store {
             }
 
             async fn next_item_number(&self, repo: RepoId) -> StoreResult<i64> {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with("BEGIN").await?;
                 let n = Self::next_number_tx(&mut tx, repo).await?;
                 tx.rollback().await?;
                 Ok(n)
@@ -576,7 +576,7 @@ macro_rules! collab_store {
 
             async fn import_review(&self, repo: RepoId, r: &ImportedReview) -> StoreResult<Review> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 Self::lock_log(&mut tx, repo).await?;
                 let existing: Option<i64> = sqlx::query_scalar("SELECT number FROM reviews WHERE repo_id = $1 AND number = $2")
                     .bind(repo.0)
@@ -642,6 +642,36 @@ macro_rules! collab_store {
                 Ok(out)
             }
 
+            async fn import_review_event(
+                &self,
+                repo: RepoId,
+                number: i64,
+                kind: &str,
+                author: &str,
+                body: &str,
+                path: Option<&[u8]>,
+                line: Option<i64>,
+                ts_ms: i64,
+                external_id: &str,
+            ) -> StoreResult<bool> {
+                let r = sqlx::query(
+                    "INSERT INTO review_events (repo_id, number, kind, author, body, cs_id, path, line, ts, external_id) \
+                     VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+                )
+                .bind(repo.0)
+                .bind(number)
+                .bind(kind)
+                .bind(author)
+                .bind(body)
+                .bind(path)
+                .bind(line)
+                .bind(ts_ms)
+                .bind(external_id)
+                .execute(&self.pool)
+                .await?;
+                Ok(r.rows_affected() > 0)
+            }
+
             async fn set_review_draft(&self, repo: RepoId, number: i64, draft: bool) -> StoreResult<()> {
                 sqlx::query("UPDATE reviews SET draft = $3, updated_at = $4 WHERE repo_id = $1 AND number = $2")
                     .bind(repo.0)
@@ -701,7 +731,7 @@ macro_rules! collab_store {
 
             async fn rename_label(&self, repo: RepoId, old: &str, l: &Label) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let n = sqlx::query("UPDATE labels SET name = $3, color = $4, description = $5 WHERE repo_id = $1 AND name = $2")
                     .bind(repo.0)
                     .bind(old)
@@ -725,7 +755,7 @@ macro_rules! collab_store {
 
             async fn delete_label(&self, repo: RepoId, name: &str) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let n = sqlx::query("DELETE FROM labels WHERE repo_id = $1 AND name = $2")
                     .bind(repo.0)
                     .bind(name)
@@ -749,7 +779,7 @@ macro_rules! collab_store {
 
             async fn set_item_labels(&self, repo: RepoId, number: i64, labels: &[String]) -> StoreResult<()> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 sqlx::query("DELETE FROM item_labels WHERE repo_id = $1 AND number = $2")
                     .bind(repo.0)
                     .bind(number)
@@ -787,7 +817,7 @@ macro_rules! collab_store {
 
             async fn set_item_people(&self, repo: RepoId, number: i64, kind: &str, names: &[String]) -> StoreResult<()> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 sqlx::query("DELETE FROM item_people WHERE repo_id = $1 AND number = $2 AND kind = $3")
                     .bind(repo.0)
                     .bind(number)
@@ -834,7 +864,7 @@ macro_rules! collab_store {
                 due_ms: Option<i64>,
             ) -> StoreResult<Milestone> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let number = match number {
                     Some(n) => n,
                     None => sqlx::query_scalar("SELECT COALESCE(MAX(number), 0) + 1 FROM milestones WHERE repo_id = $1")
@@ -902,7 +932,7 @@ macro_rules! collab_store {
 
             async fn delete_milestone(&self, repo: RepoId, number: i64) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let n = sqlx::query("DELETE FROM milestones WHERE repo_id = $1 AND number = $2")
                     .bind(repo.0)
                     .bind(number)
@@ -981,7 +1011,7 @@ macro_rules! collab_store {
 
             async fn delete_release(&self, repo: RepoId, id: i64) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let n = sqlx::query("DELETE FROM releases WHERE repo_id = $1 AND release_id = $2")
                     .bind(repo.0)
                     .bind(id)
@@ -1162,7 +1192,7 @@ macro_rules! collab_store {
 
             async fn delete_webhook(&self, id: i64) -> StoreResult<bool> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let n = sqlx::query("DELETE FROM webhooks WHERE hook_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
                 sqlx::query("DELETE FROM webhook_deliveries WHERE hook_id = $1").bind(id).execute(&mut *tx).await?;
                 tx.commit().await?;
@@ -1586,7 +1616,7 @@ macro_rules! collab_store {
 
             async fn delete_repo(&self, repo: RepoId) -> StoreResult<()> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 for t in [
                     "refs",
                     "ref_log",
@@ -1682,7 +1712,7 @@ macro_rules! collab_store {
 
             async fn create_ci_run(&self, run: &CiRun, jobs: &[NewCiJob]) -> StoreResult<(CiRun, Vec<CiJob>)> {
                 let _w = self.write_lock().await;
-                let mut tx = self.pool.begin().await?;
+                let mut tx = self.pool.begin_with(Self::BEGIN_WRITE).await?;
                 let now = now_ms();
                 let row = sqlx::query(
                     "INSERT INTO ci_runs (repo_id, workflow, event, ref_name, cs_id, review, state, actor, created_at, updated_at) \

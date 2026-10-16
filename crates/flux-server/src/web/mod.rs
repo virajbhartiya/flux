@@ -20,6 +20,9 @@ mod markdown;
 mod pages;
 mod view;
 
+pub use diff::is_binary;
+pub use lang::language;
+
 use std::sync::Arc;
 use std::time::Instant;
 

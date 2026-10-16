@@ -321,10 +321,10 @@ impl Flux {
         Ok(false)
     }
 
-    /// The CODEOWNERS file at a changeset (first of `.flux/CODEOWNERS`,
+    /// The CODEOWNERS file at a changeset (first of
     /// `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`).
     pub async fn codeowners(&self, repo: RepoId, at: &ChangesetId) -> FluxResult<CodeOwners> {
-        for p in [".flux/CODEOWNERS", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"] {
+        for p in ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"] {
             let path = flux_core::RepoPath::new(p.as_bytes().to_vec())?;
             if let Some(e) = self.entry_at(repo, at, &path).await?
                 && !e.is_dir()
@@ -500,13 +500,12 @@ impl Flux {
         self.check_ref_limits(who, name)?;
         let current = self.meta.get_ref(repo, name).await?;
         self.check_ref_update(who, repo, name, current.map(|c| c.target), new, false).await?;
-        if let Some(new) = new {
-            if let Some(cur) = current
-                && cur.target != new
-            {
-                let paths = self.changed_paths(repo, &cur.target, &new).await?;
-                self.check_write_paths(repo, who, paths).await?;
-            }
+        if let Some(new) = new
+            && let Some(cur) = current
+            && cur.target != new
+        {
+            let paths = self.changed_paths(repo, &cur.target, &new).await?;
+            self.check_write_paths(repo, who, paths).await?;
         }
         // Pin an unconditional update to the value the checks saw.
         let expect = match (expect, current) {

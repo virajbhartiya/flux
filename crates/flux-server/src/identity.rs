@@ -376,8 +376,29 @@ impl Flux {
         expires_days: Option<i64>,
     ) -> FluxResult<String> {
         let me = signed_in(who)?;
-        if !["read", "write", "all"].contains(&scopes) {
-            return Err(FluxError::InvalidArgument("scopes: read, write or all".into()));
+        // `read | write | all`, optionally narrowed by `repo:<id>` and
+        // `ref:<glob>` (tokens for CI jobs and agents).
+        let mut parts = scopes.split_whitespace();
+        let base_ok = parts.next().is_some_and(|b| ["read", "write", "all"].contains(&b));
+        let rest_ok = parts.all(|p| {
+            p.strip_prefix("repo:").is_some_and(|n| n.parse::<i64>().is_ok())
+                || p.strip_prefix("ref:")
+                    .is_some_and(|g| !g.is_empty() && crate::core::validate_ref_name(g.replace('*', "x").as_bytes()).is_ok())
+        });
+        if !base_ok || !rest_ok {
+            return Err(FluxError::InvalidArgument("scopes: read, write or all, then optional repo:<id> and ref:<glob>".into()));
+        }
+        // A restricted credential only mints equally restricted tokens.
+        if let Some(mine) = crate::rbac::repo_limits(&who.scopes) {
+            let theirs = crate::rbac::repo_limits(scopes).unwrap_or_default();
+            if theirs.is_empty() || theirs.iter().any(|r| !mine.contains(r)) {
+                return Err(FluxError::PermissionDenied("this token can only create tokens for its own repositories".into()));
+            }
+        }
+        if crate::rbac::ref_limits(&who.scopes).is_some()
+            && crate::rbac::ref_limits(scopes) != crate::rbac::ref_limits(&who.scopes)
+        {
+            return Err(FluxError::PermissionDenied("this token can only create tokens with its own ref limits".into()));
         }
         // A token can't grant more than the credential creating it.
         if crate::rbac::scope_cap(scopes) > crate::rbac::scope_cap(&who.scopes) {
