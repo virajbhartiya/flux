@@ -3,6 +3,7 @@
 //! Git LFS.
 
 pub mod http;
+pub mod lfs;
 pub mod objects;
 pub mod pack;
 pub mod packcache;

@@ -76,7 +76,7 @@ fn unauthorized(msg: &str) -> Response {
 
 /// Token from `Authorization: Bearer <t>` or Basic auth (password, or the
 /// username when the password is empty) — what git credential helpers send.
-fn token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn token(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     if let Some(t) = v.strip_prefix("Bearer ") {
         return Some(t.trim().to_string());
@@ -106,6 +106,8 @@ pub async fn handle(flux: Arc<Flux>, repo_name: &str, op: Op, headers: &HeaderMa
     let need = if write { Role::Write } else { Role::Read };
     if let Err(e) = flux.authorize(&principal, repo, need).await {
         return match e {
+            // git only sends credentials after a challenge.
+            _ if principal.user.is_none() => unauthorized("authentication required"),
             FluxError::Unauthenticated(_) => unauthorized("authentication required"),
             FluxError::NotFound(_) => err(StatusCode::NOT_FOUND, "repository not found"),
             other => err(StatusCode::FORBIDDEN, &other.to_string()),

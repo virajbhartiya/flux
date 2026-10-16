@@ -90,10 +90,18 @@ pub struct Settings {
     pub ssh_host: Option<String>,
     /// Require two-factor auth for every account with a password.
     pub require_2fa: bool,
+    /// Where the HTTP listener is, for links made outside a request (SSH,
+    /// webhooks) when no public URL is set.
+    pub listen_url: Option<String>,
 }
 
 impl Settings {
     pub fn base_url(&self) -> String {
-        self.public_url.clone().unwrap_or_else(|| "http://localhost:8080".into()).trim_end_matches('/').to_string()
+        self.public_url
+            .clone()
+            .or_else(|| self.listen_url.clone())
+            .unwrap_or_else(|| "http://localhost:7878".into())
+            .trim_end_matches('/')
+            .to_string()
     }
 }

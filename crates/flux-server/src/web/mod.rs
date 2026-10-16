@@ -133,13 +133,42 @@ pub fn router(flux: Arc<Flux>) -> Router {
         .route("/-/healthz", get(|| async { "ok" }))
         .route("/-/readyz", get(pages::readyz))
         .route("/-/metrics", get(pages::metrics))
-        .route("/{*rest}", get(dispatch_get).post(dispatch_post))
+        .route("/{*rest}", get(dispatch_get).post(dispatch_post).put(dispatch_put))
         .fallback(|| async { WebError::NotFound("page not found".into()) })
         .with_state(web)
 }
 
+/// Git LFS requests (`<repo>.git/info/lfs/...`), if this is one.
+async fn lfs(web: &WebState, req: axum::extract::Request) -> Result<Response, axum::extract::Request> {
+    let path = req.uri().path().trim_start_matches('/').to_string();
+    let Some((repo, rest)) = crate::git::lfs::route(&path) else { return Err(req) };
+    let (parts, body) = req.into_parts();
+    let token = crate::git::http::token(&parts.headers);
+    let who = match web.flux.principal(token.as_deref()).await {
+        Ok(p) => p,
+        Err(_) => {
+            let mut r = (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+            r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"flux\""));
+            return Ok(r);
+        }
+    };
+    Ok(crate::git::lfs::handle(web.flux.clone(), who, &pages::decode_repo(&repo), &rest, &parts.method, &parts.headers, body)
+        .await)
+}
+
+async fn dispatch_put(State(web): State<WebState>, req: axum::extract::Request) -> Response {
+    match lfs(&web, req).await {
+        Ok(r) => r,
+        Err(_) => WebError::NotFound("page not found".into()).into_response(),
+    }
+}
+
 /// git smart-HTTP requests share the repository URL space with the web UI.
 async fn dispatch_get(State(web): State<WebState>, req: axum::extract::Request) -> Response {
+    let req = match lfs(&web, req).await {
+        Ok(r) => return r,
+        Err(req) => req,
+    };
     let path = req.uri().path().trim_start_matches('/').to_string();
     if let Some((repo, op)) = crate::git::http::route(&path) {
         let query = req.uri().query().unwrap_or("").to_string();
@@ -159,6 +188,10 @@ async fn dispatch_get(State(web): State<WebState>, req: axum::extract::Request) 
 
 async fn dispatch_post(State(web): State<WebState>, req: axum::extract::Request) -> Response {
     use axum::extract::FromRequest;
+    let req = match lfs(&web, req).await {
+        Ok(r) => return r,
+        Err(req) => req,
+    };
     let path = req.uri().path().trim_start_matches('/').to_string();
     if let Some((repo, op)) = crate::git::http::route(&path) {
         let query = req.uri().query().unwrap_or("").to_string();

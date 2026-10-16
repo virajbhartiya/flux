@@ -213,6 +213,17 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    if let Some(rest) = command.trim().strip_prefix("git-lfs-authenticate ") {
+        let mut args = rest.split_whitespace();
+        let repo = args.next().unwrap_or_default().trim_matches(|c| c == '\'' || c == '"');
+        let repo = repo.trim_start_matches('/').trim_end_matches('/');
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        let op = args.next().unwrap_or("download");
+        let out = super::lfs::ssh_authenticate(flux, who, repo, op).await?;
+        stdout.write_all(out.as_bytes()).await.map_err(|e| FluxError::Internal(e.into()))?;
+        stdout.write_all(b"\n").await.map_err(|e| FluxError::Internal(e.into()))?;
+        return Ok(());
+    }
     let (service, name) = parse_command(command)?;
     let repo = flux.repo(&name).await.map_err(|_| FluxError::NotFound(format!("repository {name} not found")))?;
     let write = service == "git-receive-pack";

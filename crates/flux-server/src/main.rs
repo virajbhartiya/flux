@@ -250,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
         oauth,
         ssh_host,
         require_2fa: s.require_2fa,
+        listen_url: Some(format!("http://{}", s.listen)),
     };
     let flux = flux_server::open_with_settings(&cfg, s.auth, s.signup, settings).await?;
     match cli.cmd.unwrap_or(Cmd::Serve) {
