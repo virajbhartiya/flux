@@ -56,6 +56,7 @@ hmac = "0.12"
 chacha20poly1305 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 russh = "0.63.1"
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "rustls-native-certs", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 
 [dev-dependencies]
 tempfile.workspace = true

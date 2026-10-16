@@ -231,6 +231,8 @@ pub struct Flux {
     pub recovery_display: moka::sync::Cache<String, Vec<String>>,
     /// API requests per caller in the current minute: (window, count).
     pub(crate) rate: moka::sync::Cache<String, (i64, u32)>,
+    /// Email queue (set when the reactor starts; `None` without SMTP).
+    pub(crate) mailer: std::sync::OnceLock<Option<tokio::sync::mpsc::Sender<crate::mail::Mail>>>,
 }
 
 impl Flux {
@@ -298,6 +300,7 @@ impl Flux {
             tickets: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(600)).max_capacity(100_000).build(),
             recovery_display: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
             rate: moka::sync::Cache::builder().time_to_idle(std::time::Duration::from_secs(120)).max_capacity(1_000_000).build(),
+            mailer: Default::default(),
         }
     }
 

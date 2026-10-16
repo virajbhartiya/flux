@@ -142,6 +142,7 @@ docker compose exec flux flux-server token --user admin --admin
 - **Sign-in:** `--github-client-id/--github-client-secret`, `--google-client-id/…`, or any OpenID Connect IdP (`--oidc-issuer`, endpoints discovered automatically) add "Continue with …" buttons. Identities link by verified email or from Settings. Accounts imported from GitHub are claimed the first time their owner signs in with GitHub. **Two-factor auth** uses TOTP with QR enrollment and ten recovery codes; every first factor (password or provider) then asks for a code, as does `flux login`.
 - **Branch protection:** per-pattern rules (`main`, `release/*`, `tags/v*`). Options: require reviews, require N approvals from writers, require code-owner approval (`CODEOWNERS`, `.github/CODEOWNERS`), dismiss stale approvals, require status checks, allow or deny force pushes and deletions, a push allow-list, and whether the rules apply to admins. They are enforced on every path a ref can move: git (HTTP and SSH), gRPC, the REST API, landing and the web UI. Without rules, `main`, `master`, `trunk` and `release/*` only fast-forward.
 - **CI:** workflows in `.flux-ci/workflows` or `.github/workflows` run on `flux-runner` machines, using a GitHub Actions subset: matrices, `needs`, `if`, expressions, `GITHUB_OUTPUT`/`GITHUB_ENV`, `actions/checkout`, containers and encrypted secrets. Each job reports a commit status that protection can require. See [crates/flux-runner](crates/flux-runner/README.md).
+- **Notifications:** an in-app inbox, plus email with `--smtp-url smtps://user:pass@host:465 --smtp-from "flux <flux@example.com>"`. You are notified for mentions, review requests, assignments and threads you take part in or watch.
 - **Webhooks:** per repository or organization, with GitHub-shaped payloads, `X-Hub-Signature-256` signatures, durable retries and a delivery log with redelivery. Private network targets are refused unless `--webhook-allow-private` is set.
 - **Secrets:** CI secrets and 2FA secrets are sealed with ChaCha20-Poly1305 under `--secret-key-file`, which is generated in `--data-dir` mode. Every instance of a deployment needs the same key.
 - **Durability:** objects are fsynced before any metadata references them. Segment files are append-only with per-record CRCs, and a torn tail is truncated on restart. The importer resumes after any crash. A test kills the server with `SIGKILL` three times during a git.git import, then resumes, verifies and runs `fsck --full`.
@@ -185,7 +186,7 @@ FLUX_BLESS=1 cargo test -p flux-core --test golden                              
 
 `protoc` is vendored, so no system install is needed.
 
-**Not done yet:** shallow and partial git clones (use `flux attach --sparse`), GitHub Actions marketplace actions beyond the native ones, Pages, Packages and Discussions, and email notifications.
+**Not done yet:** shallow and partial git clones (use `flux attach --sparse`), GitHub Actions marketplace actions beyond the native ones, Pages, Packages and Discussions.
 
 ## License
 

@@ -20,6 +20,7 @@ impl Flux {
         if self.reactor.set(tx).is_err() {
             return;
         }
+        let _ = self.mailer.set(crate::mail::start(self));
         crate::hooks::start_worker(self.clone());
         crate::ci::start_scheduler(self.clone());
         let flux = self.clone();
@@ -118,6 +119,29 @@ impl Flux {
                 continue;
             }
             self.meta.notify(uid, repo, number, kind, reason, &title).await?;
+            if self.settings.smtp.is_some() {
+                let name = self.repo_name(repo).await;
+                let path = if kind == "issue" { "issues" } else { "reviews" };
+                let url = format!("{}/{name}/-/{path}/{number}", self.settings.base_url());
+                let why = match reason {
+                    "mention" => "You were mentioned.",
+                    "review_requested" => "Your review was requested.",
+                    "assigned" => "You were assigned.",
+                    "author" => "You opened this.",
+                    _ => "You are subscribed to this thread.",
+                };
+                let excerpt: String = body.unwrap_or("").chars().take(4000).collect();
+                self.queue_mail(crate::mail::Mail {
+                    to_user: uid,
+                    subject: format!("[{name}] {title} (#{number})"),
+                    body: format!(
+                        "{actor} {}\n\n{excerpt}\n\n—\n{url}\n{why} Manage notifications: {}/-/notifications\n",
+                        if body.is_some() { "wrote:" } else { "updated this." },
+                        self.settings.base_url()
+                    ),
+                    thread: format!("{name}/{number}").replace('/', "."),
+                });
+            }
         }
         Ok(())
     }

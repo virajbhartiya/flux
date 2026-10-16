@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod identity;
 pub mod issues;
 pub mod land;
+pub mod mail;
 pub mod metrics;
 pub mod ops;
 pub mod protect;

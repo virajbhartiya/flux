@@ -73,6 +73,12 @@ struct Serve {
     /// Require two-factor authentication for password sign-ins.
     #[arg(long, env = "FLUX_REQUIRE_2FA")]
     require_2fa: bool,
+    /// Email notifications: smtps://user:pass@host:465 or smtp://user:pass@host:587 (STARTTLS).
+    #[arg(long, env = "FLUX_SMTP_URL", requires = "smtp_from", hide_env_values = true)]
+    smtp_url: Option<String>,
+    /// Sender address, e.g. "flux <flux@example.com>".
+    #[arg(long, env = "FLUX_SMTP_FROM")]
+    smtp_from: Option<String>,
     /// REST and MCP requests per minute per signed-in caller (anonymous
     /// callers: a tenth, per address). 0 turns limiting off.
     #[arg(long, env = "FLUX_API_RATE", default_value_t = 3000)]
@@ -250,7 +256,10 @@ async fn main() -> anyhow::Result<()> {
         public_url: s.public_url.clone(),
         webhook_allow_private: s.webhook_allow_private,
         secret_key: secret_key(s.secret_key_file.as_ref(), state_dir.as_deref())?,
-        smtp: None,
+        smtp: s
+            .smtp_url
+            .clone()
+            .map(|url| flux_server::settings::SmtpConfig { url, from: s.smtp_from.clone().unwrap_or_default() }),
         oauth,
         ssh_host,
         require_2fa: s.require_2fa,
