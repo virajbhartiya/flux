@@ -210,6 +210,8 @@ pub struct Flux {
         std::sync::Mutex<std::collections::HashMap<RepoId, (ChangesetId, std::time::Instant, std::time::Instant)>>,
     pub(crate) ahead_behind_cache: moka::sync::Cache<(RepoId, ChangesetId, ChangesetId), (usize, usize)>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
+    /// Search corpora by root tree (see `search`).
+    pub(crate) search_corpora: moka::sync::Cache<TreeId, crate::search::Corpus>,
     /// Server-wide settings (public URL, webhooks, secrets key, sign-in providers).
     pub settings: crate::settings::Settings,
     /// Events for the background reactor (webhooks, notifications, CI).
@@ -277,6 +279,13 @@ impl Flux {
             file_lists: moka::sync::Cache::builder()
                 .weigher(|_, l: &crate::search::FileList| (l.len() * 80 + 64) as u32)
                 .max_capacity(256 << 20)
+                .build(),
+            search_corpora: moka::sync::Cache::builder()
+                .weigher(|_, c: &crate::search::Corpus| {
+                    c.iter().map(|(p, d)| d.len() + p.as_bytes().len() + 48).sum::<usize>().min(u32::MAX as usize) as u32
+                })
+                .max_capacity(1 << 30)
+                .time_to_idle(std::time::Duration::from_secs(3600))
                 .build(),
             settings: Default::default(),
             reactor: Default::default(),

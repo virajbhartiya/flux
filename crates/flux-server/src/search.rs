@@ -36,6 +36,7 @@ pub struct SearchResult {
 }
 
 pub type FileList = Arc<Vec<(RepoPath, ContentId, u64)>>;
+pub type Corpus = Arc<Vec<(RepoPath, bytes::Bytes)>>;
 
 impl Flux {
     /// Every regular file under `root` (cached by tree id).
@@ -73,30 +74,11 @@ impl Flux {
             .size_limit(8 << 20)
             .build()
             .map_err(|e| FluxError::InvalidArgument(format!("bad pattern: {e}")))?;
-        let files = self.file_list(root).await?;
-        let candidates: Vec<(RepoPath, ContentId)> = files
-            .iter()
-            .filter(|(p, _, size)| *size <= MAX_SEARCH_FILE && prefix.is_none_or(|pre| p.starts_with(pre)))
-            .map(|(p, c, _)| (p.clone(), *c))
-            .collect();
-        // Fetch concurrently (content cache, then storage).
-        let contents: Vec<FluxResult<Option<(RepoPath, bytes::Bytes)>>> = futures::stream::iter(candidates)
-            .map(|(p, c)| {
-                let blobs = self.blobs.clone();
-                async move {
-                    let data = blobs.get_content_bytes(&c).await?;
-                    Ok(data.map(|d| (p, d)))
-                }
-            })
-            .buffered(64)
-            .collect()
-            .await;
-        let mut docs = Vec::with_capacity(contents.len());
-        for c in contents {
-            if let Some(d) = c? {
-                docs.push(d);
-            }
-        }
+        let corpus = self.search_corpus(root).await?;
+        let docs: Vec<(RepoPath, bytes::Bytes)> = match prefix {
+            None => corpus.to_vec(),
+            Some(pre) => corpus.iter().filter(|(p, _)| p.starts_with(pre)).cloned().collect(),
+        };
         let scanned = docs.len();
         let re = Arc::new(re);
         let result = tokio::task::spawn_blocking(move || {
@@ -140,6 +122,37 @@ impl Flux {
         .await
         .map_err(|e| FluxError::Internal(e.into()))?;
         Ok(result)
+    }
+
+    /// Every searchable file of a tree with its bytes, cached per tree. The
+    /// bytes are shared with the content cache (no copies); keeping the
+    /// whole corpus together means a tree searched once stays searchable
+    /// from memory even when bulk writes churn the content cache.
+    async fn search_corpus(&self, root: TreeId) -> FluxResult<Corpus> {
+        if let Some(c) = self.search_corpora.get(&root) {
+            return Ok(c);
+        }
+        let files = self.file_list(root).await?;
+        let candidates: Vec<(RepoPath, ContentId)> =
+            files.iter().filter(|(_, _, size)| *size <= MAX_SEARCH_FILE).map(|(p, c, _)| (p.clone(), *c)).collect();
+        // Fetch concurrently (content cache, then storage).
+        let futs: Vec<_> = candidates
+            .into_iter()
+            .map(|(p, c)| {
+                let blobs = self.blobs.clone();
+                async move { blobs.get_content_bytes(&c).await.map(|d| d.map(|d| (p, d))) }
+            })
+            .collect();
+        let fetched: Vec<_> = futures::stream::iter(futs).buffered(128).collect().await;
+        let mut docs = Vec::with_capacity(fetched.len());
+        for f in fetched {
+            if let Some(d) = f? {
+                docs.push(d);
+            }
+        }
+        let corpus: Corpus = Arc::new(docs);
+        self.search_corpora.insert(root, corpus.clone());
+        Ok(corpus)
     }
 
     /// Fuzzy path finder: subsequence match scored by contiguity, word
