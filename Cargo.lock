@@ -1280,6 +1280,7 @@ dependencies = [
  "libc",
  "open",
  "rayon",
+ "reqwest",
  "rpassword",
  "serde",
  "serde_json",
@@ -1287,6 +1288,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

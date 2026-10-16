@@ -1,6 +1,7 @@
 //! `flux`: the command-line client (SPEC §13.1).
 
 mod migrate;
+mod rest;
 #[cfg(target_os = "linux")]
 mod vfs;
 mod wc;
@@ -241,6 +242,31 @@ enum Cmd {
     /// Keep a flux repository in sync with a GitHub repository (git and
     /// metadata, incremental) until stopped: for a gradual cutover.
     Mirror(migrate::MirrorArgs),
+    /// Issues: list, view, create, comment, close.
+    Issue {
+        #[command(subcommand)]
+        cmd: rest::IssueCmd,
+    },
+    /// CI runs and logs, and waiting for a revision's checks.
+    Checks {
+        #[command(subcommand)]
+        cmd: rest::CiCmd,
+    },
+    /// Your SSH keys (for git over SSH).
+    Key {
+        #[command(subcommand)]
+        cmd: rest::KeyCmd,
+    },
+    /// Mint access tokens, e.g. narrowly scoped ones for agents.
+    Token {
+        #[command(subcommand)]
+        cmd: rest::TokenCmd,
+    },
+    /// Call the REST API: `flux api repos/acme/app/issues`.
+    Api(rest::ApiArgs),
+    /// Run an MCP server on stdio for coding agents (Claude Code, Codex,
+    /// Cursor), backed by this server: `claude mcp add flux -- flux mcp`.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -1117,8 +1143,43 @@ async fn run(cli: Cli) -> Result<()> {
             let server = migrate_server(&cli, wc.as_ref())?;
             migrate::mirror(&server, token_for(&server), args).await?;
         }
+        Cmd::Issue { cmd } => {
+            let (api, repo) = rest_for(&cli, wc.as_ref())?;
+            rest::issue(&api, &repo, cmd).await?;
+        }
+        Cmd::Checks { cmd } => {
+            let (api, repo) = rest_for(&cli, wc.as_ref())?;
+            rest::ci(&api, &repo, cmd).await?;
+        }
+        Cmd::Key { cmd } => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            rest::key(&rest::Api::new(&server, token_for(&server))?, cmd).await?;
+        }
+        Cmd::Token { cmd } => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            rest::token(&rest::Api::new(&server, token_for(&server))?, cmd).await?;
+        }
+        Cmd::Api(args) => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            rest::api(&rest::Api::new(&server, token_for(&server))?, args).await?;
+        }
+        Cmd::Mcp => {
+            let server = migrate_server(&cli, wc.as_ref())?;
+            rest::mcp(&rest::Api::new(&server, token_for(&server))?).await?;
+        }
     }
     Ok(())
+}
+
+/// The REST client and repository for repository-scoped commands.
+fn rest_for(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<(rest::Api, String)> {
+    let server = migrate_server(cli, wc)?;
+    let repo = cli
+        .repo
+        .clone()
+        .or_else(|| wc.map(|w| w.config.repo.clone()))
+        .context("which repository? pass --repo or run inside a working copy")?;
+    Ok((rest::Api::new(&server, token_for(&server))?, repo))
 }
 
 fn migrate_server(cli: &Cli, wc: Option<&WorkingCopy>) -> Result<String> {
@@ -1638,4 +1699,13 @@ async fn review(cli: &Cli, wc: Option<WorkingCopy>, cmd: &ReviewCmd, st: &Style)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    #[test]
+    fn command_line_is_well_formed() {
+        // Catches duplicate names, aliases and flags (global ones included).
+        <super::Cli as clap::CommandFactory>::command().debug_assert();
+    }
 }
