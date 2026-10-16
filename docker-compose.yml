@@ -40,15 +40,21 @@ services:
       FLUX_META_URL: postgres://flux:flux@postgres:5432/flux
       FLUX_BLOB_URL: s3://flux/objects
       FLUX_AUTH: token
+      FLUX_PUBLIC_URL: ${FLUX_PUBLIC_URL:-http://localhost:7878}
+      FLUX_SSH_LISTEN: 0.0.0.0:2222
       AWS_ENDPOINT: http://minio:9000
       AWS_ALLOW_HTTP: "true"
       AWS_ACCESS_KEY_ID: flux
       AWS_SECRET_ACCESS_KEY: fluxflux123
       AWS_REGION: us-east-1
       RUST_LOG: info
-    ports: ["7878:7878"]
+    # Keys (secrets key, SSH host key) live here; losing them makes stored
+    # CI secrets and 2FA enrollments unreadable.
+    volumes: [flux:/var/lib/flux]
+    ports: ["7878:7878", "2222:2222"]
     restart: unless-stopped
 
 volumes:
   pg: {}
   minio: {}
+  flux: {}

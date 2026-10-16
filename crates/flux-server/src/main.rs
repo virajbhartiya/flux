@@ -21,8 +21,10 @@ struct Cli {
 
 #[derive(ClapArgs)]
 struct Storage {
-    /// Directory for the all-in-one SQLite + segment-file layout.
-    #[arg(long, env = "FLUX_DATA_DIR", global = true, conflicts_with_all = ["meta_url", "blob_url"])]
+    /// Directory for the all-in-one SQLite + segment-file layout. With
+    /// --meta-url and --blob-url it only holds the server's keys (secrets
+    /// key, SSH host key).
+    #[arg(long, env = "FLUX_DATA_DIR", global = true)]
     data_dir: Option<PathBuf>,
     #[arg(long, env = "FLUX_META_URL", global = true, requires = "blob_url")]
     meta_url: Option<String>,
@@ -208,8 +210,13 @@ async fn main() -> anyhow::Result<()> {
         return flux_server::cache::serve(cache, listener, shutdown_signal()).await;
     }
     let (cfg, state_dir) = match (cli.storage.data_dir, cli.storage.meta_url, cli.storage.blob_url) {
+        (dir, Some(meta_url), Some(blob_url)) => {
+            if let Some(d) = &dir {
+                std::fs::create_dir_all(d)?;
+            }
+            (StorageConfig { meta_url, blob_url }, dir)
+        }
         (Some(dir), _, _) => (StorageConfig::data_dir(&dir)?, Some(dir)),
-        (None, Some(meta_url), Some(blob_url)) => (StorageConfig { meta_url, blob_url }, None),
         _ => {
             let dir = PathBuf::from(".flux-data");
             (StorageConfig::data_dir(&dir)?, Some(dir))
