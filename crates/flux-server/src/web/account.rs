@@ -311,55 +311,70 @@ pub async fn security(State(web): State<WebState>, req: Req) -> WebResult {
     let shown_codes: Vec<String> =
         query(&req, "codes").and_then(|h| flux.recovery_display.remove(&format!("{}:{h}", user.id))).unwrap_or_default();
     let content = html! {
-        h2 { "Two-factor authentication" }
+        div.page-head { h2 { "Password & security" } }
+        @if !shown_codes.is_empty() {
+            div.notice.ok { (icon("check")) "Two-factor authentication is on. Save these recovery codes somewhere safe: each works once, and they are shown only now." }
+            div.card {
+                div.card-head { (icon("key")) "Recovery codes" }
+                div.pad { div.recovery-codes { @for c in &shown_codes { code { (c) } } } }
+            }
+        }
         div.card {
-            @if !shown_codes.is_empty() {
-                div.notice.ok { (icon("check")) "Two-factor authentication is on. Save these recovery codes somewhere safe — each works once, and they are shown only now." }
-                div.recovery-codes { @for c in &shown_codes { code { (c) } } }
+            div.card-head {
+                (icon("shield")) "Two-factor authentication"
+                @if enabled { span.state.open { "On" } } @else { span.pill { "Off" } }
             }
             @if enabled {
-                p { span.state.open { "Enabled" } " Sign-ins ask for a code from your authenticator app. " (left) " recovery code" @if left != 1 { "s" } " left." }
-                form.form.row-form method="post" action="/-/settings/security/disable-2fa" {
-                    label { "Code to turn it off" input type="text" name="code" required autocomplete="one-time-code" inputmode="numeric"; }
-                    button.btn.danger type="submit" { "Turn off" }
+                div.pad {
+                    p.muted { "Sign-ins ask for a code from your authenticator app. " (left) " recovery code" @if left != 1 { "s" } " left." }
+                    form.form method="post" action="/-/settings/security/disable-2fa" {
+                        label { "Code" span.hint { "A code from your app, or a recovery code, to turn it off." }
+                            input type="text" name="code" required autocomplete="one-time-code" inputmode="numeric"; }
+                        div.form-actions { button.btn.danger type="submit" { "Turn off" } }
+                    }
                 }
             } @else if let Some(e) = &pending {
-                p { "Scan this QR code with an authenticator app (1Password, Google Authenticator, Authy, ...), then enter the code it shows." }
-                div.qr { (maud::PreEscaped(crate::twofactor::qr_svg(&e.uri))) }
-                p.muted.small { "Or enter this key manually: " code { (e.secret_b32) } }
-                form.form.row-form method="post" action="/-/settings/security/enable-2fa" {
-                    label { "Code" input type="text" name="code" required autofocus autocomplete="one-time-code" inputmode="numeric" maxlength="8"; }
-                    button.btn.primary type="submit" { "Turn on" }
+                div.pad {
+                    p { "Scan this QR code with an authenticator app (1Password, Google Authenticator, Authy, ...), then enter the 6-digit code it shows." }
+                    div.qr { (maud::PreEscaped(crate::twofactor::qr_svg(&e.uri))) }
+                    p.muted.small { "Can't scan it? Enter this key: " code.mono { (e.secret_b32) } }
+                    form.form method="post" action="/-/settings/security/enable-2fa" {
+                        label { "Code" input type="text" name="code" required autofocus autocomplete="one-time-code" inputmode="numeric" maxlength="8" placeholder="123456"; }
+                        div.form-actions { button.btn.primary type="submit" { "Turn on" } }
+                    }
                 }
             } @else {
-                p { span.pill { "Off" } " Protect your account with a code from your phone at every sign-in." }
-                @if flux.settings.require_2fa { div.notice.error { (icon("alert")) "This server requires two-factor authentication." } }
-                form method="post" action="/-/settings/security/start-2fa" { button.btn.primary type="submit" { "Set up two-factor authentication" } }
+                div.pad {
+                    p.muted { "Protect your account with a code from your phone at every sign-in, including sign-ins through GitHub, Google or SSO." }
+                    @if flux.settings.require_2fa { div.notice.error { (icon("alert")) "This server requires two-factor authentication." } }
+                    form method="post" action="/-/settings/security/start-2fa" {
+                        div.form-actions { button.btn.primary type="submit" { "Set up two-factor authentication" } }
+                    }
+                }
             }
         }
         @if !flux.settings.oauth.is_empty() {
-            h2 { "Sign-in providers" }
             div.card {
-                table.table {
-                    tbody {
-                        @for p in &flux.settings.oauth {
-                            @let linked = identities.iter().find(|i| i.provider == p.name);
-                            tr {
-                                td { strong { (p.label) } }
-                                td.muted { @if let Some(i) = linked { "Linked" @if !i.login.is_empty() { " as " (i.login) } } @else { "Not linked" } }
-                                td.end {
-                                    @if linked.is_some() {
-                                        @if has_password || identities.len() > 1 {
-                                            form method="post" action="/-/settings/security/unlink" {
-                                                input type="hidden" name="provider" value=(p.name);
-                                                button.btn.small type="submit" { "Unlink" }
-                                            }
-                                        }
-                                    } @else {
-                                        a.btn.small href=(format!("/-/oauth/{}/start?link=1&next=/-/settings/security", p.name)) { "Link" }
-                                    }
+                div.card-head { (icon("link")) "Sign-in providers" }
+                @for p in &flux.settings.oauth {
+                    @let linked = identities.iter().find(|i| i.provider == p.name);
+                    div.list-row {
+                        span.list-icon { (icon("user")) }
+                        div.list-main {
+                            strong { (p.label) }
+                            div.muted.small {
+                                @if let Some(i) = linked { "Linked" @if !i.login.is_empty() { " as " (i.login) } " · " (time(i.created_ms)) } @else { "Not linked" }
+                            }
+                        }
+                        @if linked.is_some() {
+                            @if has_password || identities.len() > 1 {
+                                form method="post" action="/-/settings/security/unlink" {
+                                    input type="hidden" name="provider" value=(p.name);
+                                    button.btn.small type="submit" { "Unlink" }
                                 }
                             }
+                        } @else {
+                            a.btn.small href=(format!("/-/oauth/{}/start?link=1&next=/-/settings/security", p.name)) { "Link " (p.label) }
                         }
                     }
                 }
