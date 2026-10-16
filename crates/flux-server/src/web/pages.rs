@@ -2496,6 +2496,7 @@ async fn save_edit(web: &WebState, req: &Req, ctx: &RepoCtx, actor: &str, f: Rev
         content = content.replace('\n', "\r\n");
     }
     let kind = existing.as_ref().and_then(|e| e.file_kind()).unwrap_or(FileKind::Regular);
+    flux.scan_new_contents(ctx.id, &[(path.to_string(), bytes::Bytes::from(content.clone().into_bytes()))]).await?;
     let (id, meta) = flux.put_content(content.as_bytes()).await?;
     let now = view::now_ms();
     let who = format!("{actor} <{actor}@flux>").into_bytes();

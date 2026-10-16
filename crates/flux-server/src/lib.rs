@@ -22,6 +22,7 @@ pub mod repo_config;
 pub mod repos;
 pub mod search;
 pub mod secrets;
+pub mod secretscan;
 pub mod settings;
 pub mod sshkeys;
 pub mod sso;

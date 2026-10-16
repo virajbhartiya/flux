@@ -1030,14 +1030,19 @@ async fn import_commits(
             shas.iter().copied().zip(flux.meta.content_by_sha1(&shas).await?).filter_map(|(s, c)| c.map(|c| (s, c))).collect();
         let mut uploads: Vec<(Bytes, Option<ContentId>)> = Vec::new();
         let mut upload_shas: Vec<Sha> = Vec::new();
-        for (_, mode, sha) in &blobs_needed {
+        let mut scanned: Vec<(String, Bytes)> = Vec::new();
+        for (path, mode, sha) in &blobs_needed {
             if *mode == 0o160000 || existing.contains_key(sha) || upload_shas.contains(sha) {
                 continue;
             }
             let o = objs.get(sha).ok_or_else(|| FluxError::InvalidArgument(format!("blob {} missing from push", hex(sha))))?;
-            uploads.push((Bytes::from(o.data.clone()), None));
+            let data = Bytes::from(o.data.clone());
+            scanned.push((path.to_string(), data.clone()));
+            uploads.push((data, None));
             upload_shas.push(*sha);
         }
+        // Push protection: only content new to the server is scanned.
+        flux.scan_new_contents(repo, &scanned).await?;
         let stored = flux.put_contents(uploads).await?;
         let mut contents = existing;
         for (s, (cid, _)) in upload_shas.iter().zip(&stored) {

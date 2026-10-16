@@ -761,6 +761,8 @@ pub async fn changes(c: &Ctx, repo: RepoId) -> ApiResult {
         };
         uploads.push((p, kind(FileKind::Regular), bytes::Bytes::from(data)));
     }
+    let scanned: Vec<(String, bytes::Bytes)> = uploads.iter().map(|(p, _, d)| (p.to_string(), d.clone())).collect();
+    flux.scan_new_contents(repo, &scanned).await?;
     let stored = flux.put_contents(uploads.iter().map(|(_, _, d)| (d.clone(), None)).collect()).await?;
     for ((p, k, _), (cid, meta)) in uploads.into_iter().zip(stored) {
         fc.insert(p, FileChange::Change { content_id: cid, size: meta.size, kind: k, copy_from: None });

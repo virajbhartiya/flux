@@ -385,4 +385,25 @@ async fn api_end_to_end() {
     assert_eq!(rv["source_repo"], "bob/app");
     let (_, diff) = api.get(&alice, &format!("repos/app/reviews/{}/diff", rv["number"])).await;
     assert!(diff.as_str().unwrap().contains("+    43"), "{diff}");
+
+    // ── push protection ──
+    let leaked = format!("token = \"{}_{}\"\n", "ghp", "x".repeat(36));
+    let (s, v) = api
+        .post(
+            &alice,
+            "repos/app/changes",
+            json!({ "message": "oops", "branch": "agent/leak", "files": [{ "path": "cfg.toml", "content": leaked }] }),
+        )
+        .await;
+    assert_eq!(s, 403, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("cfg.toml:1: GitHub token"), "{v}");
+    let fixture = format!("{} # flux:allow-secret\n", leaked.trim());
+    let (s, _) = api
+        .post(
+            &alice,
+            "repos/app/changes",
+            json!({ "message": "fixture", "branch": "agent/fixture", "files": [{ "path": "t.toml", "content": fixture }] }),
+        )
+        .await;
+    assert_eq!(s, 201);
 }

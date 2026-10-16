@@ -30,6 +30,10 @@ pub struct RepoConfig {
     /// Issues are enabled unless turned off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub issues_disabled: bool,
+    /// Push protection (credential scanning of new content) is on unless
+    /// turned off here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret_scanning_disabled: bool,
     /// Mirrored from another server; set by `flux mirror`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<MirrorInfo>,
