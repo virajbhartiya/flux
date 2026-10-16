@@ -943,3 +943,13 @@ flux/
 4. **Hash agility.** BLAKE3 is fixed for v1. A `v2` context string reserves room for a future migration.
 5. **Merge-queue semantics vs. pre-merge CI.** Some adopters will want a gated queue, meaning pre-land CI on the rebased tip. flux-land can support this as a policy (`require_check_on_rebased_tip`), at a throughput cost. This is to be specified in phase 3a.
 6. **Monorepo tooling integrations** (Bazel and Buck2 remote file state, Turborepo): mapping `ChangedTargets` to build-graph targets is out of scope for core and belongs in plugins.
+
+## Implementation note: collaboration, CI and agents (October 2026)
+
+Beyond the core described above, the server now implements:
+
+- **Collaboration store** (`flux-store` `CollabStore`, migrations 0006–0007): issues, which share the number space with reviews; timelines; labels; assignees and requested reviewers; milestones; releases with assets; commit statuses; webhooks with a durable delivery queue (lease-based claims, so several instances never double-send); SSH keys; notifications and subscriptions; external identities; TOTP secrets; LFS indexes; CI runs, jobs, logs and runners; encrypted secrets. SQLite write transactions begin `IMMEDIATE`.
+- **Policy entry points** (`protect.rs`): `update_ref_as`, `land_as` and `land_review_as` combine role checks, archived state, path rules, token ref limits (`ref:<glob>`) and branch protection, and every surface calls them. Review gates count approvals only from users who could land the review themselves, plus code-owner approvals and required checks.
+- **Reactor:** an unbounded in-process event channel feeds webhook fan-out, notifications (mentions, review requests, subscriptions), code-owner review requests and CI triggers.
+- **CI:** workflows are parsed and matrix-expanded on the server. Jobs are leased to runners (90 s, renewed by log heartbeats) and re-claimed if a runner dies. `needs` and `if: always()/failure()` drive scheduling. Each job publishes a commit status, and job tokens are scoped to `read repo:<id>`.
+- **APIs:** REST `/api/v1` (GitHub-shaped where useful); MCP at `/api/mcp`, whose tools map onto REST routes so policy is shared; git over SSH (russh; basic ACK/NAK negotiation; push reads the pack until EOF); Git LFS (streaming, chunked, SHA-256 verified).

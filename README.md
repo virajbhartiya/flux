@@ -6,9 +6,12 @@
 - **Changesets are deltas.** Creating one costs O(change), not O(repo). Trees, history indexes and blame are *derived data*.
 - **Everything is content-addressed** (BLAKE3, domain separated) and verified on every fetch, by every tier.
 - **Refs move only by compare-and-swap**, and **landing is a server-side rebase** with line-level three-way merges, so many people and agents can land on `main` concurrently without a merge queue lock.
-- **Git compatible:** import any git repository (incremental and resumable), and `git clone`, `fetch` and `push` straight from the flux server, with commit SHA-1s preserved.
+- **Git compatible:** import any git repository (incremental and resumable), then `git clone`, `fetch` and `push` straight from the flux server over HTTP or SSH, Git LFS included, with commit SHA-1s preserved.
+- **A complete forge:** issues, code review with approvals, code owners and required checks, branch protection, built-in CI that runs GitHub Actions workflows, signed webhooks, releases, forks, notifications, organizations, teams, SSO and two-factor auth.
+- **Built for agents:** an MCP server, commits without a clone, batch reads, waiting on checks, and tokens bound to a repository and to `agent/*` branches ([docs/agents.md](docs/agents.md)).
+- **Leaving GitHub takes one command.** `flux migrate github` brings history, issues, pull requests (as reviews, with line comments and approvals), labels, milestones, releases, branch protection and users, keeping numbers. `flux mirror` keeps flux in sync during a gradual cutover ([docs/migrating-from-github.md](docs/migrating-from-github.md)).
 
-It ships as one binary for the server, gRPC API and web UI (`flux-server`), one CLI (`flux`), a per-machine cache daemon (`fluxd`) and a git importer (`flux-import-git`).
+It ships as one binary for the server, REST and gRPC APIs, MCP endpoint and web UI (`flux-server`), one CLI (`flux`), a per-machine cache daemon (`fluxd`), a CI runner (`flux-runner`) and a git importer (`flux-import-git`).
 
 ![Repository browser](docs/img/tree.png)
 
@@ -51,7 +54,8 @@ open http://127.0.0.1:7878
 flux-import-git --repo demo import /path/to/repo.git
 flux-import-git --repo demo verify /path/to/repo.git --sample 200
 
-# Plain git works against the same server.
+# Plain git works against the same server (add --ssh-listen 0.0.0.0:2222
+# and `flux key add` for ssh://git@host:2222/demo.git).
 git clone http://127.0.0.1:7878/demo.git
 
 # Move a GitHub repository over: history, issues, pull requests, releases
@@ -88,6 +92,16 @@ flux watch                       # live ref moves and review activity
 flux daemon enable               # local cache daemon: objects from disk, new revisions prefetched
 flux mount /mnt/repo --rev main  # Linux: read-only FUSE view, files load on first read
 flux web                         # open this file/directory in the browser
+
+# Collaboration, CI and automation:
+flux issue create -t "Login loop" -l bug
+flux issue list --label bug
+flux checks wait @               # block until CI and other checks settle
+flux checks logs 42 --follow
+flux key add                     # your SSH key, for git over SSH
+flux token create --scope write --for-repo acme/app --ref 'agent/*'
+flux api repos/acme/app/reviews  # any REST endpoint (docs/api.md)
+claude mcp add flux -- flux mcp  # give Claude Code (or Codex, Cursor) flux tools
 ```
 
 ### The web UI
@@ -117,10 +131,14 @@ docker compose exec flux flux-server token --user admin --admin
 - **Accounts:** the first account created on a server (`/-/signup`) becomes the site admin. After that, sign-up is `--signup closed` (admins create accounts under Site admin) or `open`. Passwords are hashed with argon2id, and sign-in is throttled per account and client. Web sessions last 30 days and are revoked on sign-out. Personal access tokens (Settings → Access tokens) are scoped `read`, `write` or `all`, can expire, and are shown once. `flux login` asks for your username and password and stores a token (`--password-stdin` for scripts, `--token` to paste one).
 - **Organizations and teams:** organizations own repositories (`acme/api`), and have owners and members with a base role. Teams group members and get roles on repositories. User and organization pages live at `/{name}`.
 - **Roles:** `read` < `triage` < `write` < `maintain` < `admin` per repository. A user's role is the highest of: their ownership, org ownership, the org's base role, team and direct grants, and visibility (`public`, `internal`, `private`). Token scopes cap it. Private repositories are invisible to people without access, in the UI, the API and git. Security events (sign-ins, failed sign-ins, grants, membership and visibility changes) go to an audit log under Site admin.
-- **Server auth mode** (`--auth`):
+- **Server auth mode** (`--auth`): `open` (no authentication; for a single user or a trusted network), `token` (anonymous reads, authenticated writes) or `private` (everything needs a token).
 - **Path ACLs:** admins set per-path rules on the settings page (`infra/secrets | ops | ops`). The rules are enforced on gRPC, the web UI and git, and the most specific rule wins. See SPEC §12.2 for the limits of v1.
-- **Git:** `/<repo>.git` speaks smart HTTP. Use your token as the password (`git clone http://x:TOKEN@host/repo.git`) or send it as a Bearer header. Pushes to protected refs must be fast-forwards.
-- **Protected refs:** non-admins can only fast-forward `main`, `master`, `trunk` and `release/*`. Rebased work reaches them through `flux land` or a review.
+- **Git:** `/<repo>.git` speaks smart HTTP. Use your token as the password (`git clone http://x:TOKEN@host/repo.git`) or send it as a Bearer header. `--ssh-listen 0.0.0.0:2222` adds git over SSH with account keys (`flux key add`, or Settings → SSH keys); the host key is created on first start. **Git LFS** works over both, and objects are chunked and deduplicated across repositories.
+- **Sign-in:** `--github-client-id/--github-client-secret`, `--google-client-id/…`, or any OpenID Connect IdP (`--oidc-issuer`, endpoints discovered automatically) add "Continue with …" buttons. Identities link by verified email or from Settings. Accounts imported from GitHub are claimed the first time their owner signs in with GitHub. **Two-factor auth** uses TOTP with QR enrollment and ten recovery codes; every first factor (password or provider) then asks for a code, as does `flux login`.
+- **Branch protection:** per-pattern rules (`main`, `release/*`, `tags/v*`). Options: require reviews, require N approvals from writers, require code-owner approval (`CODEOWNERS`, `.github/CODEOWNERS`), dismiss stale approvals, require status checks, allow or deny force pushes and deletions, a push allow-list, and whether the rules apply to admins. They are enforced on every path a ref can move: git (HTTP and SSH), gRPC, the REST API, landing and the web UI. Without rules, `main`, `master`, `trunk` and `release/*` only fast-forward.
+- **CI:** workflows in `.flux-ci/workflows` or `.github/workflows` run on `flux-runner` machines, using a GitHub Actions subset: matrices, `needs`, `if`, expressions, `GITHUB_OUTPUT`/`GITHUB_ENV`, `actions/checkout`, containers and encrypted secrets. Each job reports a commit status that protection can require. See [crates/flux-runner](crates/flux-runner/README.md).
+- **Webhooks:** per repository or organization, with GitHub-shaped payloads, `X-Hub-Signature-256` signatures, durable retries and a delivery log with redelivery. Private network targets are refused unless `--webhook-allow-private` is set.
+- **Secrets:** CI secrets and 2FA secrets are sealed with ChaCha20-Poly1305 under `--secret-key-file`, which is generated in `--data-dir` mode. Every instance of a deployment needs the same key.
 - **Durability:** objects are fsynced before any metadata references them. Segment files are append-only with per-record CRCs, and a torn tail is truncated on restart. The importer resumes after any crash. A test kills the server with `SIGKILL` three times during a git.git import, then resumes, verifies and runs `fsck --full`.
 - **Integrity:** `flux-server fsck [--full]` re-hashes changesets, trees and file contents, checks graph closure and refs, and re-derives missing derived data. It is safe to run online.
 - **Storage tuning:** `flux-server storage-stats` breaks stored bytes down by kind and codec. `flux-server train-dict REPO` trains zstd dictionaries for small trees and files; new writes use them.
@@ -142,11 +160,13 @@ docker compose exec flux flux-server token --user admin --admin
 | `flux-core` | ids, deterministic CBOR, paths, changesets, trees; golden vectors pin object identity |
 | `flux-store` | metadata stores (SQLite, Postgres; one conformance suite), blob store: segment files with delta chains and FastCDC chunking, or any object store |
 | `flux-derive` | `tree_v1` and `lastmod_v1` derivation, tree walk and diff |
-| `flux-server` | core operations, commit graph, landing, reviews, search, auth and ACLs, gRPC, web UI, git smart HTTP, cache tier, fsck and backup |
+| `flux-server` | core operations, commit graph, landing, reviews, issues, protection, CI scheduling, webhooks, search, auth (SSO, 2FA) and ACLs, REST, MCP, gRPC, web UI, git over HTTP and SSH, LFS, cache tier, fsck and backup |
 | `flux-client` | Rust client; verifies every object it fetches |
 | `flux-cli` | the `flux` command |
 | `flux-daemon` | `fluxd`: per-machine cache with automatic routing and prefetch |
 | `flux-git` | `flux-import-git` (import and verify) |
+| `flux-migrate` | `flux migrate github` and `flux mirror`: history and metadata from GitHub |
+| `flux-runner` | the CI job runner |
 
 The full design, with the deviations implemented so far, is in [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -160,7 +180,7 @@ FLUX_BLESS=1 cargo test -p flux-core --test golden                              
 
 `protoc` is vendored, so no system install is needed.
 
-**Not done yet:** path-level ACL domains, the git smart-HTTP frontend, the virtual filesystem (phase 4), trained zstd dictionaries and Windows support (untested).
+**Not done yet:** shallow and partial git clones (use `flux attach --sparse`), GitHub Actions marketplace actions beyond the native ones, Pages, Packages and Discussions, and email notifications.
 
 ## License
 
