@@ -229,6 +229,8 @@ pub struct Flux {
     pub tickets: moka::sync::Cache<String, crate::sso::Ticket>,
     /// Recovery codes waiting for their one-time display.
     pub recovery_display: moka::sync::Cache<String, Vec<String>>,
+    /// API requests per caller in the current minute: (window, count).
+    pub(crate) rate: moka::sync::Cache<String, (i64, u32)>,
 }
 
 impl Flux {
@@ -295,6 +297,7 @@ impl Flux {
             totp_used: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
             tickets: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(600)).max_capacity(100_000).build(),
             recovery_display: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
+            rate: moka::sync::Cache::builder().time_to_idle(std::time::Duration::from_secs(120)).max_capacity(1_000_000).build(),
         }
     }
 

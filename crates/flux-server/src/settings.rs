@@ -93,6 +93,9 @@ pub struct Settings {
     /// Where the HTTP listener is, for links made outside a request (SSH,
     /// webhooks) when no public URL is set.
     pub listen_url: Option<String>,
+    /// REST/MCP requests per minute for signed-in callers (0: unlimited);
+    /// anonymous callers get a tenth, per address.
+    pub api_rate_per_minute: u32,
 }
 
 impl Settings {

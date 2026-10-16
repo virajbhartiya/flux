@@ -73,6 +73,10 @@ struct Serve {
     /// Require two-factor authentication for password sign-ins.
     #[arg(long, env = "FLUX_REQUIRE_2FA")]
     require_2fa: bool,
+    /// REST and MCP requests per minute per signed-in caller (anonymous
+    /// callers: a tenth, per address). 0 turns limiting off.
+    #[arg(long, env = "FLUX_API_RATE", default_value_t = 3000)]
+    api_rate_per_minute: u32,
     #[arg(long, env = "FLUX_GITHUB_CLIENT_ID", requires = "github_client_secret")]
     github_client_id: Option<String>,
     #[arg(long, env = "FLUX_GITHUB_CLIENT_SECRET", hide_env_values = true)]
@@ -251,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         ssh_host,
         require_2fa: s.require_2fa,
         listen_url: Some(format!("http://{}", s.listen)),
+        api_rate_per_minute: s.api_rate_per_minute,
     };
     let flux = flux_server::open_with_settings(&cfg, s.auth, s.signup, settings).await?;
     match cli.cmd.unwrap_or(Cmd::Serve) {

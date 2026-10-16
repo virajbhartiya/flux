@@ -254,6 +254,14 @@ async fn dispatch(State(flux): State<Arc<Flux>>, req: axum::extract::Request) ->
             Err(e) => return e.into_response(),
         }
     };
+    let limit = rate_check(&flux, &who, &parts.headers);
+    if let Some((_, _, true, reset)) = limit {
+        let mut r = ApiError(StatusCode::TOO_MANY_REQUESTS, format!("rate limit exceeded; retry in {reset} s")).into_response();
+        if let Ok(v) = HeaderValue::from_str(&reset.to_string()) {
+            r.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+        return r;
+    }
     let ctx = Ctx { flux, who, method, headers: parts.headers, query, body, origin: format!("{scheme}://{host}") };
     let seg: Vec<&str> = segs.iter().map(String::as_str).collect();
     let result = route(&ctx, &seg).await;
@@ -263,7 +271,46 @@ async fn dispatch(State(flux): State<Arc<Flux>>, req: axum::extract::Request) ->
         h.insert("server-timing", v);
     }
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if let Some((lim, used, _, reset)) = limit {
+        for (k, v) in
+            [("x-ratelimit-limit", lim), ("x-ratelimit-remaining", lim.saturating_sub(used)), ("x-ratelimit-reset", reset)]
+        {
+            if let Ok(v) = HeaderValue::from_str(&v.to_string()) {
+                h.insert(k, v);
+            }
+        }
+    }
     resp
+}
+
+/// Fixed one-minute windows per caller (user, else client address).
+/// Returns (limit, used, exceeded, seconds to reset), or None when off.
+fn rate_check(flux: &Flux, who: &Principal, headers: &HeaderMap) -> Option<(u32, u32, bool, u32)> {
+    let per_min = flux.settings.api_rate_per_minute;
+    if per_min == 0 {
+        return None;
+    }
+    let (key, limit) = match &who.user {
+        Some(u) => (format!("u:{}", u.id), per_min),
+        None => {
+            let ip = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .unwrap_or("local")
+                .trim()
+                .to_string();
+            (format!("a:{ip}"), (per_min / 10).max(10))
+        }
+    };
+    let now = crate::auth::now_ms() / 1000;
+    let window = now / 60;
+    let entry = flux.rate.entry(key).and_upsert_with(|cur| match cur.map(|e| e.into_value()) {
+        Some((w, n)) if w == window => (w, n.saturating_add(1)),
+        _ => (window, 1),
+    });
+    let (_, used) = entry.into_value();
+    Some((limit, used, used > limit, (60 - (now % 60)) as u32))
 }
 
 fn percent_encoding_decode(s: &str) -> String {

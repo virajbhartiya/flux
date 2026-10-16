@@ -407,3 +407,31 @@ async fn api_end_to_end() {
         .await;
     assert_eq!(s, 201);
 }
+
+#[tokio::test]
+async fn rate_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = flux_server::StorageConfig::data_dir(dir.path()).unwrap();
+    let settings = flux_server::settings::Settings { api_rate_per_minute: 20, ..Default::default() };
+    let flux = flux_server::open_with_settings(&cfg, AuthMode::Token, Default::default(), settings).await.unwrap();
+    let (_, tok) = flux.issue_token("alice", true, "t").await.unwrap();
+    let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
+    let http = reqwest::Client::new();
+    let get = |auth: bool| {
+        let r = http.get(format!("http://{addr}/api/v1/repos"));
+        if auth { r.bearer_auth(&tok) } else { r }
+    };
+    // Anonymous: a tenth of the limit (at least 10).
+    let mut codes = Vec::new();
+    for _ in 0..11 {
+        codes.push(get(false).send().await.unwrap().status().as_u16());
+    }
+    assert_eq!(codes.iter().filter(|c| **c == 200).count(), 10, "{codes:?}");
+    assert_eq!(*codes.last().unwrap(), 429);
+    // Signed in: its own budget, with headers.
+    let r = get(true).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-ratelimit-limit"], "20");
+    assert_eq!(r.headers()["x-ratelimit-remaining"], "19");
+}
