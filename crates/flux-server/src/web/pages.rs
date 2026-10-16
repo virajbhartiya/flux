@@ -2229,6 +2229,8 @@ async fn review(web: &WebState, req: &Req, ctx: &RepoCtx, number: i64, files_tab
 #[derive(Deserialize, Default)]
 pub struct ReviewForm {
     #[serde(default)]
+    method: String,
+    #[serde(default)]
     description: String,
     #[serde(default)]
     default_branch: String,
@@ -2288,9 +2290,8 @@ pub async fn repo_post(
         ["reviews", n, "land"] => {
             ctx.require(Role::Write)?;
             let n = parse_num(n)?;
-            let rv = flux.review(ctx.id, n).await?;
-            flux.check_land_paths(ctx.id, &req.principal, &rv.head, &rv.target).await?;
-            flux.land_review(ctx.id, n, &actor).await?;
+            let method: crate::protect::MergeMethod = f.method.parse()?;
+            flux.land_review_as(&req.principal, ctx.id, n, method).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}", enc(&ctx.name))).into_response())
         }
         ["reviews", n, "comment"] if !f.path.is_empty() => {
@@ -2300,7 +2301,7 @@ pub async fn repo_post(
             flux.comment_review_at(ctx.id, n, &actor, &f.body, f.path.trim().as_bytes(), line).await?;
             Ok(Redirect::to(&format!("/{}/-/reviews/{n}/files", enc(&ctx.name))).into_response())
         }
-        ["reviews", n, action @ ("comment" | "approve" | "close" | "reopen")] => {
+        ["reviews", n, action @ ("comment" | "approve" | "request_changes" | "close" | "reopen")] => {
             let n = parse_num(n)?;
             let author = flux.review(ctx.id, n).await?.author == actor;
             ctx.require(crate::rbac::review_action_role(action, author))?;
@@ -2310,7 +2311,7 @@ pub async fn repo_post(
         ["edit"] => {
             ctx.require(Role::Write)?;
             flux.check_write_paths(ctx.id, &req.principal, vec![f.path.trim().trim_matches('/').as_bytes().to_vec()]).await?;
-            save_edit(&web, &ctx, &actor, f).await
+            save_edit(&web, &req, &ctx, &actor, f).await
         }
         ["settings"] => {
             ctx.require(Role::Maintain)?;
@@ -2329,10 +2330,12 @@ pub async fn repo_post(
                     write: list(2),
                 });
             }
+            // Keep settings this form does not edit (protection, mirror, ...).
             let cfg = crate::repo_config::RepoConfig {
                 description: f.description.trim().to_string(),
                 default_branch: Some(f.default_branch.trim().to_string()).filter(|b| !b.is_empty()),
                 acl,
+                ..(*ctx.config).clone()
             };
             // Path rules are access control: admins only.
             if cfg.acl != ctx.config.acl {
@@ -2477,7 +2480,7 @@ async fn edit_form(
     Ok(page(web, req, &format!("Edit · {}", ctx.name), Some(n), body))
 }
 
-async fn save_edit(web: &WebState, ctx: &RepoCtx, actor: &str, f: ReviewForm) -> WebResult {
+async fn save_edit(web: &WebState, req: &Req, ctx: &RepoCtx, actor: &str, f: ReviewForm) -> WebResult {
     let flux = &web.flux;
     let base = flux.resolve_rev(ctx.id, &f.base).await?;
     let path = RepoPath::new(f.path.trim().trim_matches('/').as_bytes()).map_err(|e| WebError::BadRequest(e.to_string()))?;
@@ -2514,15 +2517,15 @@ async fn save_edit(web: &WebState, ctx: &RepoCtx, actor: &str, f: ReviewForm) ->
     let info = flux.create_changeset(ctx.id, cs).await?;
     let new_id = ChangesetId::from_slice(&info.id).map_err(|e| WebError::Internal(e.to_string()))?;
     if f.mode == "direct" && ctx.is_ref(&f.branch) {
-        let r = flux.land(ctx.id, new_id, f.branch.as_bytes(), actor, "web edit").await?;
-        let _ = r;
+        flux.land_as(&req.principal, ctx.id, new_id, f.branch.as_bytes(), "web edit").await?;
         return Ok(Redirect::to(&url(&ctx.name, "blob", &f.branch, Some(&path))).into_response());
     }
     let branch = f.new_branch.trim();
     if branch.is_empty() {
         return Err(WebError::BadRequest("name the new branch".into()));
     }
-    flux.update_ref(ctx.id, branch.as_bytes(), flux_store::RefExpect::Absent, Some(new_id), actor, "web edit".into()).await?;
+    flux.update_ref_as(&req.principal, ctx.id, branch.as_bytes(), flux_store::RefExpect::Absent, Some(new_id), "web edit".into())
+        .await?;
     let target = if ctx.is_ref(&f.branch) { f.branch.clone() } else { ctx.default_branch().unwrap_or("main").to_string() };
     let r = flux.create_review(ctx.id, f.message.trim(), "", actor, new_id, target.as_bytes()).await?;
     Ok(Redirect::to(&format!("/{}/-/reviews/{}", enc(&ctx.name), r.number)).into_response())

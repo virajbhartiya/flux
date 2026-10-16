@@ -17,6 +17,29 @@ pub struct RepoConfig {
     /// Path ACL rules (SPEC §12.2). The most specific matching rule wins.
     #[serde(default)]
     pub acl: Vec<AclRule>,
+    /// Branch protection; `None` keeps the classic defaults (see `protect`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_rules: Option<Vec<crate::protect::BranchRule>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub homepage: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+    /// Read-only: pushes, landing and new reviews are refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Issues are enabled unless turned off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub issues_disabled: bool,
+    /// Mirrored from another server; set by `flux mirror`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MirrorInfo {
+    pub url: String,
+    #[serde(default)]
+    pub last_sync_ms: i64,
 }
 
 /// Who may read and write under a path prefix. Principals are user names,

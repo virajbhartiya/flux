@@ -22,7 +22,7 @@ use flux_store::{RefExpect, RepoId};
 use super::objects::{EMPTY_TREE, Kind, Sha, encode_commit, hash_object, hex, parse_hex};
 use super::pack::{PackObject, PackWriter, encode, flush, pkt, pkt_str, read_pack, read_pkts, sideband};
 use crate::auth::Principal;
-use crate::core::{Flux, FluxError, FluxResult, is_protected_ref};
+use crate::core::{Flux, FluxError, FluxResult};
 use crate::rbac::Role;
 
 const ZERO: Sha = [0; 20];
@@ -1142,16 +1142,7 @@ async fn update_one(
     } else {
         Some(*map.get(&c.new).ok_or_else(|| FluxError::Internal(anyhow::anyhow!("commit not converted")))?)
     };
-    if is_protected_ref(&name) && flux.repo_role(principal, repo).await? < Role::Admin {
-        match (new, &current) {
-            (None, _) => return Err(FluxError::PermissionDenied("protected ref: only repository admins can delete it".into())),
-            (Some(n), Some(cur)) if !flux.is_ancestor(repo, &cur.target, &n).await? => {
-                return Err(FluxError::PermissionDenied("protected ref: non-fast-forward (use flux land)".into()));
-            }
-            _ => {}
-        }
-    }
-    let (outcome, _) = flux.update_ref(repo, &name, expect, new, principal.name(), "git push".into()).await?;
+    let (outcome, _) = flux.update_ref_as(principal, repo, &name, expect, new, "git push".into()).await?;
     if matches!(outcome, flux_store::CasOutcome::Mismatch { .. }) {
         return Err(FluxError::FailedPrecondition("fetch first: the ref moved".into()));
     }

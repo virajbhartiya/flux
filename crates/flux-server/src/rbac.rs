@@ -90,6 +90,18 @@ pub fn scope_cap(scopes: &str) -> Role {
     cap
 }
 
+/// Repositories a token is bound to (`repo:<id>` scopes), if any.
+pub fn repo_limits(scopes: &str) -> Option<Vec<i64>> {
+    let ids: Vec<i64> = scopes.split([' ', ',']).filter_map(|s| s.strip_prefix("repo:")?.parse().ok()).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Ref patterns a token may move (`ref:<glob>` scopes); `None` = any.
+pub fn ref_limits(scopes: &str) -> Option<Vec<String>> {
+    let pats: Vec<String> = scopes.split([' ', ',']).filter_map(|s| s.strip_prefix("ref:")).map(str::to_string).collect();
+    (!pats.is_empty()).then_some(pats)
+}
+
 /// The role a review action needs. Authors may always close, reopen and
 /// comment on their own reviews.
 pub fn review_action_role(action: &str, is_author: bool) -> Role {
@@ -116,6 +128,11 @@ impl Flux {
 
     /// The principal's effective role on a repository.
     pub async fn repo_role(&self, who: &Principal, repo: RepoId) -> FluxResult<Role> {
+        // Repository-bound tokens (CI jobs, agents): exactly their scope on
+        // their repositories, nothing elsewhere.
+        if let Some(repos) = repo_limits(&who.scopes) {
+            return Ok(if repos.contains(&repo.0) { scope_cap(&who.scopes) } else { Role::None });
+        }
         if who.mode == crate::auth::AuthMode::Open {
             return Ok(Role::Admin);
         }
@@ -209,6 +226,10 @@ mod tests {
         assert_eq!(scope_cap("read write"), Role::Write);
         assert_eq!(scope_cap("all"), Role::Admin);
         assert_eq!(scope_cap(""), Role::None);
+        assert_eq!(scope_cap("read repo:7"), Role::Read);
+        assert_eq!(repo_limits("read repo:7 repo:9"), Some(vec![7, 9]));
+        assert_eq!(repo_limits("write"), None);
+        assert_eq!(ref_limits("write ref:agent/*"), Some(vec!["agent/*".to_string()]));
         for r in ROLES {
             assert_eq!(Role::parse(r.as_str()), Some(r));
         }

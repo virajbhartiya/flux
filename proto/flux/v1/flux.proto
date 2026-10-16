@@ -527,7 +527,7 @@ message WatchRequest {
 
 message RepoEvent {
   string repo = 1;
-  string kind = 2;      // ref | changesets | review
+  string kind = 2;      // ref | changesets | review | issue | comment | status | release | ci
   bytes ref_name = 3;
   bytes old = 4;
   bytes new = 5;

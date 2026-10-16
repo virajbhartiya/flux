@@ -110,15 +110,73 @@ pub struct Loaded {
 /// Something that happened in a repository (streamed to watchers).
 #[derive(Debug, Clone)]
 pub enum Event {
-    RefMoved { repo: String, name: Vec<u8>, old: Option<ChangesetId>, new: Option<ChangesetId>, actor: String },
-    Changesets { repo: String, count: usize, last: ChangesetId },
-    Review { repo: String, number: i64, kind: String },
+    RefMoved {
+        repo: String,
+        name: Vec<u8>,
+        old: Option<ChangesetId>,
+        new: Option<ChangesetId>,
+        actor: String,
+    },
+    Changesets {
+        repo: String,
+        count: usize,
+        last: ChangesetId,
+    },
+    Review {
+        repo: String,
+        number: i64,
+        kind: String,
+        actor: String,
+    },
+    /// An issue changed: `opened`, `closed`, `reopened`, `edited`,
+    /// `labeled`, `assigned`, ...
+    Issue {
+        repo: String,
+        number: i64,
+        action: String,
+        actor: String,
+    },
+    /// A comment on an issue or review (`on`: `issue` | `review`).
+    Comment {
+        repo: String,
+        number: i64,
+        on: &'static str,
+        seq: i64,
+        actor: String,
+        body: String,
+    },
+    Status {
+        repo: String,
+        cs: ChangesetId,
+        context: String,
+        state: String,
+        actor: String,
+    },
+    Release {
+        repo: String,
+        id: i64,
+        action: String,
+        actor: String,
+    },
+    /// A CI run changed state.
+    Ci {
+        repo: String,
+        run: i64,
+        state: String,
+    },
 }
 
 impl Event {
     pub fn repo(&self) -> &str {
         match self {
-            Event::RefMoved { repo, .. } | Event::Changesets { repo, .. } | Event::Review { repo, .. } => repo,
+            Event::RefMoved { repo, .. }
+            | Event::Changesets { repo, .. }
+            | Event::Review { repo, .. }
+            | Event::Issue { repo, .. }
+            | Event::Comment { repo, .. }
+            | Event::Status { repo, .. }
+            | Event::Release { repo, .. }
+            | Event::Ci { repo, .. } => repo,
         }
     }
 }
@@ -152,6 +210,15 @@ pub struct Flux {
         std::sync::Mutex<std::collections::HashMap<RepoId, (ChangesetId, std::time::Instant, std::time::Instant)>>,
     pub(crate) ahead_behind_cache: moka::sync::Cache<(RepoId, ChangesetId, ChangesetId), (usize, usize)>,
     pub(crate) file_lists: moka::sync::Cache<TreeId, crate::search::FileList>,
+    /// Server-wide settings (public URL, webhooks, secrets key, sign-in providers).
+    pub settings: crate::settings::Settings,
+    /// Events for the background reactor (webhooks, notifications, CI).
+    /// Unbounded, so nothing is dropped when a burst outpaces it.
+    pub(crate) reactor: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// Wakes the webhook delivery worker.
+    pub(crate) hook_wake: Arc<tokio::sync::Notify>,
+    /// Wakes CI runners waiting for jobs.
+    pub(crate) ci_wake: Arc<tokio::sync::Notify>,
 }
 
 impl Flux {
@@ -203,7 +270,16 @@ impl Flux {
                 .weigher(|_, l: &crate::search::FileList| (l.len() * 80 + 64) as u32)
                 .max_capacity(256 << 20)
                 .build(),
+            settings: Default::default(),
+            reactor: Default::default(),
+            hook_wake: Default::default(),
+            ci_wake: Default::default(),
         }
+    }
+
+    pub fn with_settings(mut self, settings: crate::settings::Settings) -> Self {
+        self.settings = settings;
+        self
     }
 
     pub fn with_signup(mut self, signup: crate::identity::SignupPolicy) -> Self {
@@ -238,6 +314,9 @@ impl Flux {
     }
 
     pub fn publish(&self, e: Event) {
+        if let Some(tx) = self.reactor.get() {
+            let _ = tx.send(e.clone());
+        }
         let _ = self.events.send(e);
     }
 
@@ -252,6 +331,16 @@ impl Flux {
             }
         }
         self.repo_names.get(&repo).unwrap_or_default()
+    }
+
+    /// Drop cached state for a deleted or renamed repository.
+    pub async fn forget_repo(&self, name: &str, id: RepoId) {
+        self.repos.invalidate(name).await;
+        self.repo_names.invalidate(&id);
+        self.repo_configs.invalidate(&id);
+        self.access_cache.invalidate(&id);
+        self.role_cache.invalidate_all();
+        self.graphs.lock().unwrap().remove(&id);
     }
 
     pub async fn repo(&self, name: &str) -> FluxResult<RepoId> {
@@ -774,11 +863,6 @@ impl Flux {
         }
         Ok((outcome, current))
     }
-}
-
-/// Refs that only move forward (or via landing) unless an admin moves them.
-pub fn is_protected_ref(name: &[u8]) -> bool {
-    matches!(name, b"main" | b"master" | b"trunk") || name.starts_with(b"release/")
 }
 
 /// Ref names: non-empty, no revision operators, no whitespace or control chars.

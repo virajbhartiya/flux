@@ -99,6 +99,68 @@ impl Flux {
         Err(FluxError::FailedPrecondition("CAS_MISMATCH: target kept moving; retry".into()))
     }
 
+    /// Land a review as one changeset: rebase the stack onto the target,
+    /// then replace it by a single changeset with the combined changes.
+    async fn land_squashed(self: &Arc<Self>, repo: RepoId, r: &Review, actor: &str, reason: &str) -> FluxResult<LandResult> {
+        for _attempt in 0..5 {
+            let cur = self.meta.get_ref(repo, &r.target).await?;
+            let onto = match cur {
+                Some(c) => c.target,
+                None => return self.land(repo, r.head, &r.target, actor, reason).await,
+            };
+            if self.is_ancestor(repo, &r.head, &onto).await? {
+                return Ok(LandResult { head: onto, rebased: vec![], fast_forward: true, merged_files: 0 });
+            }
+            let (rebased, merged_files) = self.rebase_stack(repo, r.head, onto, actor).await?;
+            let top = *rebased.last().expect("non-empty stack");
+            let (a, b) = (self.root_tree(repo, &onto).await?, self.root_tree(repo, &top).await?);
+            let diff = flux_derive::diff_trees(&self.blobs, Some(a), Some(b), &|_, _| true).await?;
+            let mut fc = BTreeMap::new();
+            for d in diff {
+                let change = match d.new {
+                    Some(f) => FileChange::Change {
+                        content_id: f.content_id.unwrap_or_else(|| flux_core::ContentId::from_bytes([0; 32])),
+                        size: f.size,
+                        kind: f.kind,
+                        copy_from: None,
+                    },
+                    None => FileChange::Deletion,
+                };
+                fc.insert(d.path, change);
+            }
+            let first = self.load_one_arc(repo, &rebased[0]).await?;
+            let mut message = r.title.trim().to_string();
+            if !r.body.trim().is_empty() {
+                message.push_str("\n\n");
+                message.push_str(r.body.trim());
+            }
+            message.push_str(&format!("\n\nReview: #{}\n", r.number));
+            let now = now_ms();
+            let cs = Changeset {
+                parents: vec![onto],
+                author: first.changeset.author.clone(),
+                author_time: first.changeset.author_time,
+                committer: Some(format!("{actor} <{actor}@flux>").into_bytes()),
+                committer_time: Some(Timestamp { unix_ms: now, tz_offset_min: 0 }),
+                message: message.into_bytes(),
+                file_changes: fc,
+                extra: BTreeMap::from([("flux.squashed_from".to_string(), r.head.to_hex().into_bytes())]),
+            };
+            let info = self.create_changeset(repo, cs).await?;
+            let head = ChangesetId::from_slice(&info.id).map_err(|e| FluxError::Internal(e.into()))?;
+            let expect = match cur {
+                Some(c) => RefExpect::Version(c.version),
+                None => RefExpect::Absent,
+            };
+            let (outcome, _) = self.update_ref(repo, &r.target, expect, Some(head), actor, reason.into()).await?;
+            if matches!(outcome, CasOutcome::Mismatch { .. }) {
+                continue;
+            }
+            return Ok(LandResult { head, rebased: vec![head], fast_forward: false, merged_files });
+        }
+        Err(FluxError::FailedPrecondition("CAS_MISMATCH: target kept moving; retry".into()))
+    }
+
     /// The changesets in `top` not in `base`, oldest first. Must be linear.
     pub async fn stack_between(&self, repo: RepoId, top: &ChangesetId, base: &ChangesetId) -> FluxResult<Vec<Arc<Loaded>>> {
         let (g, it) = self.graph_index(repo, top).await?;
@@ -249,13 +311,13 @@ impl Flux {
         self.load_one_arc(repo, &head).await?;
         let r = self.meta.create_review(repo, title.trim(), body, author, head, target).await?;
         self.meta.add_review_event(repo, r.number, "opened", author, "", Some(head), None, None).await?;
-        self.review_event(repo, r.number, "opened").await;
+        self.review_event(repo, r.number, "opened", author).await;
         Ok(r)
     }
 
-    async fn review_event(&self, repo: RepoId, number: i64, kind: &str) {
+    pub(crate) async fn review_event(&self, repo: RepoId, number: i64, kind: &str, actor: &str) {
         let name = self.repo_name(repo).await;
-        self.publish(Event::Review { repo: name, number, kind: kind.into() });
+        self.publish(Event::Review { repo: name, number, kind: kind.into(), actor: actor.into() });
     }
 
     pub async fn review(&self, repo: RepoId, number: i64) -> FluxResult<Review> {
@@ -316,7 +378,7 @@ impl Flux {
                 }
                 ReviewUpdate::default()
             }
-            "approve" => ReviewUpdate::default(),
+            "approve" | "request_changes" | "dismiss" => ReviewUpdate::default(),
             "close" if r.state == "open" => ReviewUpdate { state: Some("closed".into()), ..Default::default() },
             "reopen" if r.state == "closed" => ReviewUpdate { state: Some("open".into()), ..Default::default() },
             "update" if r.state == "open" => {
@@ -332,6 +394,8 @@ impl Flux {
         let kind = match action {
             "comment" => "comment",
             "approve" => "approved",
+            "request_changes" => "changes_requested",
+            "dismiss" => "dismissed",
             "close" => "closed",
             "reopen" => "reopened",
             _ => "updated",
@@ -339,7 +403,7 @@ impl Flux {
         let r =
             self.meta.update_review(repo, number, update).await?.ok_or_else(|| FluxError::NotFound("review vanished".into()))?;
         self.meta.add_review_event(repo, number, kind, actor, body, head, None, None).await?;
-        self.review_event(repo, number, kind).await;
+        self.review_event(repo, number, kind, actor).await;
         Ok(r)
     }
 
@@ -363,17 +427,27 @@ impl Flux {
         }
         self.meta.add_review_event(repo, number, "comment", actor, body, Some(r.head), Some(path), Some(line)).await?;
         self.meta.update_review(repo, number, ReviewUpdate::default()).await?;
-        self.review_event(repo, number, "comment").await;
+        self.review_event(repo, number, "comment", actor).await;
         Ok(())
     }
 
-    pub async fn land_review(self: &Arc<Self>, repo: RepoId, number: i64, actor: &str) -> FluxResult<LandResult> {
+    pub async fn land_review(
+        self: &Arc<Self>,
+        repo: RepoId,
+        number: i64,
+        actor: &str,
+        method: crate::protect::MergeMethod,
+    ) -> FluxResult<LandResult> {
         let r = self.review(repo, number).await?;
         if r.state != "open" {
             return Err(FluxError::FailedPrecondition(format!("review #{number} is {}", r.state)));
         }
         let base = self.meta.get_ref(repo, &r.target).await?.map(|x| x.target);
-        let result = self.land(repo, r.head, &r.target, actor, &format!("land review #{number}")).await?;
+        let reason = format!("land review #{number}");
+        let result = match method {
+            crate::protect::MergeMethod::Rebase => self.land(repo, r.head, &r.target, actor, &reason).await?,
+            crate::protect::MergeMethod::Squash => self.land_squashed(repo, &r, actor, &reason).await?,
+        };
         self.meta
             .update_review(
                 repo,
@@ -387,7 +461,7 @@ impl Flux {
             format!("rebased {} changeset(s), {} file(s) merged", result.rebased.len(), result.merged_files)
         };
         self.meta.add_review_event(repo, number, "landed", actor, &note, base, None, None).await?;
-        self.review_event(repo, number, "landed").await;
+        self.review_event(repo, number, "landed", actor).await;
         Ok(result)
     }
 }

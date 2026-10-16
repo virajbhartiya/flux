@@ -2,18 +2,27 @@
 
 pub mod auth;
 pub mod cache;
+pub mod checks;
+pub mod ci;
 pub mod core;
 pub mod git;
 pub mod graph;
 pub mod grpc;
 pub mod history;
+pub mod hooks;
 pub mod identity;
+pub mod issues;
 pub mod land;
 pub mod metrics;
 pub mod ops;
+pub mod protect;
 pub mod rbac;
+pub mod reactor;
 pub mod repo_config;
+pub mod repos;
 pub mod search;
+pub mod secrets;
+pub mod settings;
 pub mod web;
 
 use std::net::SocketAddr;

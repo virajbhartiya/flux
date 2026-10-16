@@ -831,7 +831,6 @@ impl write_service_server::WriteService for Services {
         let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
-        let role = self.flux.authorize(&principal, repo, Role::Write).await?;
         let expect = match req.expect {
             Some(update_ref_request::Expect::Any(_)) => RefExpect::Any,
             Some(update_ref_request::Expect::Absent(_)) => RefExpect::Absent,
@@ -840,27 +839,7 @@ impl write_service_server::WriteService for Services {
             None => return Err(Status::invalid_argument("an expectation is required (use any=true for unconditional)")),
         };
         let new = if req.new_target.is_empty() { None } else { Some(cs_id(&req.new_target)?) };
-        let mut expect = expect;
-        if crate::core::is_protected_ref(&req.name) && role < Role::Admin {
-            // Protected refs only move forward for non-admins (land is the
-            // way to put rebased work on them).
-            let Some(new) = new else {
-                return Err(Status::permission_denied("only repository admins can delete a protected ref"));
-            };
-            if let Some(cur) = self.flux.meta.get_ref(repo, &req.name).await.map_err(FluxError::from)? {
-                if !self.flux.is_ancestor(repo, &cur.target, &new).await? {
-                    return Err(Status::permission_denied(
-                        "protected ref: only fast-forward updates are allowed; use `flux land` to rebase onto it",
-                    ));
-                }
-                // Pin the check to the value we validated.
-                expect = match expect {
-                    RefExpect::Any => RefExpect::Version(cur.version),
-                    other => other,
-                };
-            }
-        }
-        let (outcome, current) = self.flux.update_ref(repo, &req.name, expect, new, principal.name(), req.reason).await?;
+        let (outcome, current) = self.flux.update_ref_as(&principal, repo, &req.name, expect, new, req.reason).await?;
         let current =
             current.map(|c| RefEntry { name: req.name.clone(), target: c.target.as_bytes().to_vec(), version: c.version });
         Ok(Response::new(match outcome {
@@ -896,8 +875,7 @@ impl write_service_server::WriteService for Services {
         let top = self.flux.resolve_rev(repo, &req.rev).await?;
         let target = if req.target_ref.is_empty() { "main".to_string() } else { req.target_ref };
         let reason = if req.reason.is_empty() { "flux land".to_string() } else { req.reason };
-        self.flux.check_land_paths(repo, &principal, &top, target.as_bytes()).await?;
-        let r = self.flux.land(repo, top, target.as_bytes(), principal.name(), &reason).await?;
+        let r = self.flux.land_as(&principal, repo, top, target.as_bytes(), &reason).await?;
         Ok(Response::new(land_pb(&r)))
     }
 }
@@ -1010,10 +988,7 @@ impl review_service_server::ReviewService for Services {
         let principal = self.who(&req).await?;
         let req = req.into_inner();
         let repo = self.flux.repo(&req.repo).await?;
-        self.flux.authorize(&principal, repo, Role::Write).await?;
-        let rv = self.flux.review(repo, req.number).await?;
-        self.flux.check_land_paths(repo, &principal, &rv.head, &rv.target).await?;
-        let r = self.flux.land_review(repo, req.number, principal.name()).await?;
+        let r = self.flux.land_review_as(&principal, repo, req.number, Default::default()).await?;
         Ok(Response::new(land_pb(&r)))
     }
 }
@@ -1039,8 +1014,48 @@ pub fn event_pb(e: &crate::core::Event) -> RepoEvent {
             count: *count as u64,
             ..Default::default()
         },
-        Event::Review { repo, number, kind } => {
-            RepoEvent { repo: repo.clone(), kind: "review".into(), review: *number, detail: kind.clone(), ..Default::default() }
+        Event::Review { repo, number, kind, actor } => RepoEvent {
+            repo: repo.clone(),
+            kind: "review".into(),
+            review: *number,
+            detail: kind.clone(),
+            actor: actor.clone(),
+            ..Default::default()
+        },
+        Event::Issue { repo, number, action, actor } => RepoEvent {
+            repo: repo.clone(),
+            kind: "issue".into(),
+            review: *number,
+            detail: action.clone(),
+            actor: actor.clone(),
+            ..Default::default()
+        },
+        Event::Comment { repo, number, on, actor, .. } => RepoEvent {
+            repo: repo.clone(),
+            kind: "comment".into(),
+            review: *number,
+            detail: on.to_string(),
+            actor: actor.clone(),
+            ..Default::default()
+        },
+        Event::Status { repo, cs, context, state, actor } => RepoEvent {
+            repo: repo.clone(),
+            kind: "status".into(),
+            new: cs.as_bytes().to_vec(),
+            detail: format!("{context}={state}"),
+            actor: actor.clone(),
+            ..Default::default()
+        },
+        Event::Release { repo, id, action, actor } => RepoEvent {
+            repo: repo.clone(),
+            kind: "release".into(),
+            count: *id as u64,
+            detail: action.clone(),
+            actor: actor.clone(),
+            ..Default::default()
+        },
+        Event::Ci { repo, run, state } => {
+            RepoEvent { repo: repo.clone(), kind: "ci".into(), count: *run as u64, detail: state.clone(), ..Default::default() }
         }
     }
 }
