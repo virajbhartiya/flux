@@ -200,8 +200,8 @@ fn parse_command(cmd: &str) -> FluxResult<(&'static str, String)> {
     .find_map(|(prefix, svc)| Some((svc, cmd.strip_prefix(prefix)?.trim())))
     .ok_or_else(|| FluxError::InvalidArgument(format!("unsupported command {cmd:?}: only git fetch and push are available")))?;
     let path = rest.trim_matches(|c| c == '\'' || c == '"');
-    let path = path.trim_start_matches("~/").trim_start_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+    let path = path.trim_start_matches("~/").trim_start_matches('/').trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
     if path.is_empty() || path.contains("..") {
         return Err(FluxError::InvalidArgument("missing repository path".into()));
     }
