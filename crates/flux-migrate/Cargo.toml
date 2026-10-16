@@ -1,0 +1,31 @@
+[package]
+name = "flux-migrate"
+description = "Migrate GitHub repositories to flux: git history, issues, pull requests, releases and settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+flux-client.workspace = true
+flux-git.workspace = true
+flux-proto.workspace = true
+anyhow.workspace = true
+base64 = "0.22"
+bytes.workspace = true
+dirs = "6"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+flux-server.workspace = true
+axum = "0.8"
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
