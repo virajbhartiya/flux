@@ -635,3 +635,13 @@ label.choice span { display: flex; flex-direction: column; gap: 2px; }
 }
 .owner-name label, .row-form label { display: flex; flex-direction: column; }
 .lazy-diff { display: flex; justify-content: center; padding: 18px; border-top: 1px solid var(--border); background: var(--bg-subtle); }
+
+/* sign-in providers and two-factor auth */
+.sso-buttons { display: grid; gap: 8px; margin: 4px 0 12px; }
+.divider { display: flex; align-items: center; gap: 10px; margin: 12px 0; color: var(--text-3); font-size: 12px; }
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.qr { display: inline-block; padding: 8px; margin: 4px 0 8px; background: #fff; border: 1px solid var(--border); border-radius: var(--r); line-height: 0; }
+.qr svg { width: 176px; height: 176px; }
+.recovery-codes { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; margin: 8px 0 14px; }
+.recovery-codes code { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg-subtle); font: 13px/1.2 var(--mono); text-align: center; }
+.table td.end { text-align: right; }

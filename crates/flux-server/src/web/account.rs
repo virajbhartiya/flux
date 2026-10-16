@@ -37,6 +37,9 @@ pub struct AccountForm {
     pub subject: String,
     pub owner: String,
     pub next: String,
+    pub code: String,
+    pub ticket: String,
+    pub provider: String,
 }
 
 /// CSRF defence in depth (cookies are SameSite=Lax).
@@ -160,6 +163,14 @@ pub async fn login_form(State(web): State<WebState>, req: Req) -> WebResult {
             div.card.login {
                 h1 { "Sign in to flux" }
                 (notice(&req))
+                @if !web.flux.settings.oauth.is_empty() {
+                    div.sso-buttons {
+                        @for p in &web.flux.settings.oauth {
+                            a.btn.wide href=(format!("/-/oauth/{}/start?next={}", p.name, enc(&next))) { "Continue with " (p.label) }
+                        }
+                    }
+                    div.divider { span { "or" } }
+                }
                 form method="post" action="/-/login" {
                     input type="hidden" name="next" value=(next);
                     label { "Username or email" input type="text" name="login" required autofocus autocomplete="username"; }
@@ -191,14 +202,216 @@ pub async fn login(State(web): State<WebState>, headers: HeaderMap, Form(f): For
             _ => return Ok(fail("That token is invalid, expired or revoked")),
         }
     } else {
-        match web.flux.password_login(f.login.trim(), &f.password, &client_of(&headers)).await {
-            Ok((_, t)) => (t, crate::identity::SESSION_DAYS * 86_400),
+        let client = client_of(&headers);
+        let user = match web.flux.check_password(f.login.trim(), &f.password, &client).await {
+            Ok(u) => u,
             Err(e) => return Ok(fail(&e.to_string())),
+        };
+        match web.flux.after_first_factor(user, next.clone(), &client).await? {
+            crate::sso::SignIn::Session { token, .. } => (token, crate::identity::SESSION_DAYS * 86_400),
+            crate::sso::SignIn::NeedCode { ticket, next } => {
+                return Ok(Redirect::to(&format!("/-/login/2fa?ticket={}&next={}", enc(&ticket), enc(&next))).into_response());
+            }
+            crate::sso::SignIn::Linked { next } => return Ok(Redirect::to(&next).into_response()),
         }
     };
     let mut r = Redirect::to(&next).into_response();
     r.headers_mut().insert(header::SET_COOKIE, session_cookie(&headers, &token, max_age)?);
     Ok(r)
+}
+
+/// The second sign-in step for accounts with two-factor auth.
+pub async fn two_factor_form(State(web): State<WebState>, req: Req) -> WebResult {
+    let ticket = query(&req, "ticket").unwrap_or_default();
+    let next = query(&req, "next").unwrap_or_else(|| "/".into());
+    let body = html! {
+        div.container.narrow {
+            div.card.login {
+                h1 { "Two-factor authentication" }
+                p.muted { "Enter the 6-digit code from your authenticator app, or one of your recovery codes." }
+                (notice(&req))
+                form method="post" action="/-/login/2fa" {
+                    input type="hidden" name="ticket" value=(ticket);
+                    input type="hidden" name="next" value=(next);
+                    label { "Code" input type="text" name="code" required autofocus autocomplete="one-time-code" inputmode="numeric" maxlength="20"; }
+                    button.btn.primary.wide type="submit" { "Verify" }
+                }
+                p.muted.small.center { a href="/-/login" { "Start over" } }
+            }
+        }
+    };
+    Ok(page(&web, &req, "Two-factor authentication", None, body))
+}
+
+pub async fn two_factor(State(web): State<WebState>, headers: HeaderMap, Form(f): Form<AccountForm>) -> WebResult {
+    check_origin(&headers)?;
+    match web.flux.finish_second_factor(&f.ticket, &f.code).await {
+        Ok((token, next)) => {
+            let mut r = Redirect::to(safe_next(&next)).into_response();
+            r.headers_mut().insert(header::SET_COOKIE, session_cookie(&headers, &token, crate::identity::SESSION_DAYS * 86_400)?);
+            Ok(r)
+        }
+        Err(crate::core::FluxError::Unauthenticated(m)) if m.contains("not right") => Ok(Redirect::to(&format!(
+            "/-/login/2fa?ticket={}&next={}&err={}",
+            enc(&f.ticket),
+            enc(safe_next(&f.next)),
+            enc("That code is not right")
+        ))
+        .into_response()),
+        Err(e) => Ok(Redirect::to(&format!("/-/login?err={}", enc(&e.to_string()))).into_response()),
+    }
+}
+
+/// Start signing in (or linking an account) with an external provider.
+pub async fn oauth_start(State(web): State<WebState>, req: Req, Path(provider): Path<String>) -> WebResult {
+    let next = safe_next(&query(&req, "next").unwrap_or_default()).to_string();
+    let link = query(&req, "link").is_some();
+    let link_user = if link { Some(me(&req)?.id) } else { None };
+    let url = web.flux.oauth_start(&provider, &next, link_user, &req.origin)?;
+    Ok(Redirect::to(&url).into_response())
+}
+
+pub async fn oauth_callback(
+    State(web): State<WebState>,
+    req: Req,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+) -> WebResult {
+    let fail = |m: &str| Ok(Redirect::to(&format!("/-/login?err={}", enc(m))).into_response());
+    if let Some(e) = query(&req, "error") {
+        return fail(&format!("sign-in was cancelled ({e})"));
+    }
+    let (Some(code), Some(state)) = (query(&req, "code"), query(&req, "state")) else {
+        return fail("the provider did not return a code");
+    };
+    match web.flux.oauth_finish(&provider, &code, &state, &req.origin, &client_of(&headers)).await {
+        Ok(crate::sso::SignIn::Session { token, next }) => {
+            let mut r = Redirect::to(safe_next(&next)).into_response();
+            r.headers_mut().insert(header::SET_COOKIE, session_cookie(&headers, &token, crate::identity::SESSION_DAYS * 86_400)?);
+            Ok(r)
+        }
+        Ok(crate::sso::SignIn::NeedCode { ticket, next }) => {
+            Ok(Redirect::to(&format!("/-/login/2fa?ticket={}&next={}", enc(&ticket), enc(&next))).into_response())
+        }
+        Ok(crate::sso::SignIn::Linked { .. }) => Ok(back("/-/settings/security", "Account linked")),
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// Password, two-factor auth and linked sign-in providers.
+pub async fn security(State(web): State<WebState>, req: Req) -> WebResult {
+    let user = me(&req)?.clone();
+    let flux = &web.flux;
+    let enabled = flux.two_factor_enabled(user.id).await?;
+    let left = flux.recovery_codes_left(user.id).await?;
+    let pending = flux.pending_totp(user.id);
+    let identities = flux.meta.identities_of(user.id).await?;
+    let has_password = flux.meta.get_account(&user.name).await?.and_then(|(_, p)| p).is_some();
+    // Shown once: the entry is gone after this view.
+    let shown_codes: Vec<String> =
+        query(&req, "codes").and_then(|h| flux.recovery_display.remove(&format!("{}:{h}", user.id))).unwrap_or_default();
+    let content = html! {
+        h2 { "Two-factor authentication" }
+        div.card {
+            @if !shown_codes.is_empty() {
+                div.notice.ok { (icon("check")) "Two-factor authentication is on. Save these recovery codes somewhere safe — each works once, and they are shown only now." }
+                div.recovery-codes { @for c in &shown_codes { code { (c) } } }
+            }
+            @if enabled {
+                p { span.state.open { "Enabled" } " Sign-ins ask for a code from your authenticator app. " (left) " recovery code" @if left != 1 { "s" } " left." }
+                form.form.row-form method="post" action="/-/settings/security/disable-2fa" {
+                    label { "Code to turn it off" input type="text" name="code" required autocomplete="one-time-code" inputmode="numeric"; }
+                    button.btn.danger type="submit" { "Turn off" }
+                }
+            } @else if let Some(e) = &pending {
+                p { "Scan this QR code with an authenticator app (1Password, Google Authenticator, Authy, ...), then enter the code it shows." }
+                div.qr { (maud::PreEscaped(crate::twofactor::qr_svg(&e.uri))) }
+                p.muted.small { "Or enter this key manually: " code { (e.secret_b32) } }
+                form.form.row-form method="post" action="/-/settings/security/enable-2fa" {
+                    label { "Code" input type="text" name="code" required autofocus autocomplete="one-time-code" inputmode="numeric" maxlength="8"; }
+                    button.btn.primary type="submit" { "Turn on" }
+                }
+            } @else {
+                p { span.pill { "Off" } " Protect your account with a code from your phone at every sign-in." }
+                @if flux.settings.require_2fa { div.notice.error { (icon("alert")) "This server requires two-factor authentication." } }
+                form method="post" action="/-/settings/security/start-2fa" { button.btn.primary type="submit" { "Set up two-factor authentication" } }
+            }
+        }
+        @if !flux.settings.oauth.is_empty() {
+            h2 { "Sign-in providers" }
+            div.card {
+                table.table {
+                    tbody {
+                        @for p in &flux.settings.oauth {
+                            @let linked = identities.iter().find(|i| i.provider == p.name);
+                            tr {
+                                td { strong { (p.label) } }
+                                td.muted { @if let Some(i) = linked { "Linked" @if !i.login.is_empty() { " as " (i.login) } } @else { "Not linked" } }
+                                td.end {
+                                    @if linked.is_some() {
+                                        @if has_password || identities.len() > 1 {
+                                            form method="post" action="/-/settings/security/unlink" {
+                                                input type="hidden" name="provider" value=(p.name);
+                                                button.btn.small type="submit" { "Unlink" }
+                                            }
+                                        }
+                                    } @else {
+                                        a.btn.small href=(format!("/-/oauth/{}/start?link=1&next=/-/settings/security", p.name)) { "Link" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Ok(settings_layout(&web, &req, "Password & security", "security", content))
+}
+
+pub async fn security_post(
+    State(web): State<WebState>,
+    req: Req,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+    Form(f): Form<AccountForm>,
+) -> WebResult {
+    check_origin(&headers)?;
+    let user = me(&req)?.clone();
+    let flux = &web.flux;
+    let err = |m: &str| Ok(Redirect::to(&format!("/-/settings/security?err={}", enc(m))).into_response());
+    match action.as_str() {
+        "start-2fa" => {
+            flux.begin_totp(&req.principal).await?;
+            Ok(Redirect::to("/-/settings/security").into_response())
+        }
+        "enable-2fa" => match flux.enable_totp(&req.principal, &f.code).await {
+            Ok(codes) => {
+                // Show the codes once, on the next page view only.
+                let mut h = [0u8; 12];
+                getrandom::fill(&mut h).expect("OS random number generator");
+                let h = hex::encode(h);
+                flux.recovery_display.insert(format!("{}:{h}", user.id), codes);
+                Ok(Redirect::to(&format!("/-/settings/security?codes={h}")).into_response())
+            }
+            Err(e) => err(&e.to_string()),
+        },
+        "disable-2fa" => match flux.disable_totp(&req.principal, &f.code).await {
+            Ok(()) => Ok(back("/-/settings/security", "Two-factor authentication is off")),
+            Err(e) => err(&e.to_string()),
+        },
+        "unlink" => {
+            let has_password = flux.meta.get_account(&user.name).await?.and_then(|(_, p)| p).is_some();
+            let ids = flux.meta.identities_of(user.id).await?;
+            if !has_password && ids.len() <= 1 {
+                return err("set a password first, or you could not sign in any more");
+            }
+            flux.meta.unlink_identity(user.id, &f.provider).await?;
+            flux.audit(&req.principal, "user.identity_unlinked", &user.name, &f.provider).await;
+            Ok(back("/-/settings/security", "Unlinked"))
+        }
+        _ => Err(WebError::NotFound("no such action".into())),
+    }
 }
 
 pub async fn logout(State(web): State<WebState>, headers: HeaderMap) -> WebResult {
@@ -229,6 +442,7 @@ fn settings_layout(web: &WebState, req: &Req, title: &str, active: &str, content
                 nav.side-nav {
                     div.side-title { "Settings" }
                     (item("/-/settings", "profile", "user", "Profile"))
+                    (item("/-/settings/security", "security", "lock", "Password & security"))
                     (item("/-/settings/tokens", "tokens", "key", "Access tokens"))
                     (item("/-/settings/orgs", "orgs", "org", "Organizations"))
                     @if is_admin {

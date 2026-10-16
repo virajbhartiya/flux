@@ -216,6 +216,22 @@ async fn main() -> anyhow::Result<()> {
     if let (Some(iss), Some(id), Some(secret)) = (&s.oidc_issuer, &s.oidc_client_id, &s.oidc_client_secret) {
         let mut p = flux_server::settings::OAuthProvider::oidc(iss, id.clone(), secret.clone());
         p.label = s.oidc_label.clone();
+        // Endpoints from the issuer's discovery document.
+        let url = format!("{}/.well-known/openid-configuration", iss.trim_end_matches('/'));
+        match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+            Ok(r) if r.status().is_success() => {
+                let d: serde_json::Value = r.json().await?;
+                let field = |k: &str| d.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                if let (Some(a), Some(t), Some(u)) =
+                    (field("authorization_endpoint"), field("token_endpoint"), field("userinfo_endpoint"))
+                {
+                    (p.auth_url, p.token_url, p.userinfo_url) = (a, t, u);
+                }
+            }
+            other => {
+                tracing::warn!(%url, status = ?other.map(|r| r.status()), "OIDC discovery failed; using default endpoint paths")
+            }
+        }
         oauth.push(p);
     }
     for p in &mut oauth {

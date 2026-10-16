@@ -279,6 +279,52 @@ impl Flux {
     /// Check a password and open a web session. Throttled per account and
     /// per client; the error never says which part was wrong.
     pub async fn password_login(&self, name_or_email: &str, password: &str, client: &str) -> FluxResult<(User, String)> {
+        self.password_login_2fa(name_or_email, password, None, client).await
+    }
+
+    /// Password sign-in with a two-factor code when the account has 2FA on
+    /// (`FailedPrecondition("TWO_FACTOR_REQUIRED ...")` when it is missing).
+    pub async fn password_login_2fa(
+        &self,
+        name_or_email: &str,
+        password: &str,
+        otp: Option<&str>,
+        client: &str,
+    ) -> FluxResult<(User, String)> {
+        let user = self.check_password(name_or_email, password, client).await?;
+        if self.two_factor_enabled(user.id).await? {
+            match otp.map(str::trim).filter(|o| !o.is_empty()) {
+                None => {
+                    return Err(FluxError::FailedPrecondition(
+                        "TWO_FACTOR_REQUIRED: enter a code from your authenticator app".into(),
+                    ));
+                }
+                Some(code) => {
+                    if !self.check_second_factor(user.id, code).await? {
+                        self.meta.audit_append(&user.name, "user.2fa_failed", &user.name, client).await?;
+                        return Err(FluxError::Unauthenticated("incorrect two-factor code".into()));
+                    }
+                }
+            }
+        }
+        let token = self.open_session(&user, client).await?;
+        Ok((user, token))
+    }
+
+    /// A new 30-day web session for a user who proved who they are.
+    pub async fn open_session(&self, user: &User, client: &str) -> FluxResult<String> {
+        let token = new_token();
+        let expires = now_ms() + SESSION_DAYS * DAY_MS;
+        self.meta
+            .add_token_ext(user.id, &hash_token(&token), &format!("web session ({client})"), "session", "all", Some(expires))
+            .await?;
+        self.meta.audit_append(&user.name, "user.login", &user.name, client).await?;
+        Ok(token)
+    }
+
+    /// Check a password (throttled per account and client; the error never
+    /// says which part was wrong). Does not open a session.
+    pub async fn check_password(&self, name_or_email: &str, password: &str, client: &str) -> FluxResult<User> {
         // Per (account, client) and per client: guessing is throttled, but
         // nobody can lock a user out from somewhere else.
         let keys = [format!("u:{}|{client}", name_or_email.to_lowercase()), format!("c:{client}")];
@@ -303,13 +349,7 @@ impl Flux {
             return Err(FluxError::Unauthenticated("incorrect name or password".into()));
         };
         self.login_failures.invalidate(&keys[0]);
-        let token = new_token();
-        let expires = now_ms() + SESSION_DAYS * DAY_MS;
-        self.meta
-            .add_token_ext(acct.user.id, &hash_token(&token), &format!("web session ({client})"), "session", "all", Some(expires))
-            .await?;
-        self.meta.audit_append(&acct.user.name, "user.login", &acct.user.name, client).await?;
-        Ok((acct.user, token))
+        Ok(acct.user)
     }
 
     /// End a session (or revoke the presented token).

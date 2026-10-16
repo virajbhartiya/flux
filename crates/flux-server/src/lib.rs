@@ -24,6 +24,8 @@ pub mod search;
 pub mod secrets;
 pub mod settings;
 pub mod sshkeys;
+pub mod sso;
+pub mod twofactor;
 pub mod web;
 
 /// Helpers shared by the web UI and the API.

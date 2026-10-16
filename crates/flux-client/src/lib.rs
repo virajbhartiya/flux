@@ -143,6 +143,12 @@ impl Client {
 
     /// Exchange a password for an API token: `(token, user)`.
     pub async fn login(&self, login: &str, password: &str, label: &str) -> Result<(String, String)> {
+        self.login_otp(login, password, "", label).await
+    }
+
+    /// Sign in with a password and, for accounts with two-factor auth, a
+    /// code (an error containing `TWO_FACTOR_REQUIRED` asks for one).
+    pub async fn login_otp(&self, login: &str, password: &str, otp: &str, label: &str) -> Result<(String, String)> {
         let r = self
             .auth
             .clone()
@@ -152,6 +158,7 @@ impl Client {
                 label: label.into(),
                 scopes: String::new(),
                 expires_days: 0,
+                otp: otp.into(),
             })
             .await
             .map_err(|s| anyhow!("{}", s.message()))?

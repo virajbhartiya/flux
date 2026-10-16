@@ -920,11 +920,18 @@ async fn run(cli: Cli) -> Result<()> {
                         .ok()
                         .or_else(|| std::env::var("COMPUTERNAME").ok())
                         .unwrap_or_else(|| "this machine".into());
-                    let (token, _) = Client::connect_with_token(&server, "", Some(""))
-                        .await?
-                        .login(&login, &password, &format!("flux CLI on {host}"))
-                        .await?;
-                    token
+                    let client = Client::connect_with_token(&server, "", Some("")).await?;
+                    let label = format!("flux CLI on {host}");
+                    match client.login(&login, &password, &label).await {
+                        Ok((token, _)) => token,
+                        Err(e) if e.to_string().contains("TWO_FACTOR_REQUIRED") => {
+                            eprint!("two-factor code (or a recovery code): ");
+                            let mut code = String::new();
+                            std::io::stdin().read_line(&mut code)?;
+                            client.login_otp(&login, &password, code.trim(), &label).await?.0
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             };
             let who = Client::connect_with_token(&server, "", Some(&token)).await?.whoami().await?;

@@ -1109,7 +1109,8 @@ impl auth_service_server::AuthService for Services {
         let req = req.into_inner();
         // Check the password (throttled), then mint an API token rather
         // than keeping the session.
-        let (user, session) = self.flux.password_login(&req.login, &req.password, &client).await?;
+        let otp = Some(req.otp.as_str()).filter(|o| !o.is_empty());
+        let (user, session) = self.flux.password_login_2fa(&req.login, &req.password, otp, &client).await?;
         let principal = self.flux.principal(Some(&session)).await?;
         let scopes = if req.scopes.is_empty() { "all" } else { req.scopes.as_str() };
         let label = if req.label.is_empty() { "flux CLI" } else { req.label.as_str() };

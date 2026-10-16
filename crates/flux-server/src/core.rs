@@ -219,6 +219,14 @@ pub struct Flux {
     pub(crate) hook_wake: Arc<tokio::sync::Notify>,
     /// Wakes CI runners waiting for jobs.
     pub(crate) ci_wake: Arc<tokio::sync::Notify>,
+    /// Two-factor enrollments awaiting confirmation, by user id.
+    pub(crate) pending_totp: moka::sync::Cache<i64, crate::twofactor::Enrollment>,
+    /// Last TOTP step accepted per user (codes work once).
+    pub(crate) totp_used: moka::sync::Cache<i64, i64>,
+    /// Sign-ins waiting for a second factor, and OAuth flows in progress.
+    pub tickets: moka::sync::Cache<String, crate::sso::Ticket>,
+    /// Recovery codes waiting for their one-time display.
+    pub recovery_display: moka::sync::Cache<String, Vec<String>>,
 }
 
 impl Flux {
@@ -274,6 +282,10 @@ impl Flux {
             reactor: Default::default(),
             hook_wake: Default::default(),
             ci_wake: Default::default(),
+            pending_totp: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(900)).build(),
+            totp_used: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
+            tickets: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(600)).max_capacity(100_000).build(),
+            recovery_display: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
         }
     }
 

@@ -1454,6 +1454,7 @@ dependencies = [
  "maud",
  "moka",
  "pulldown-cmark",
+ "qrcode",
  "rayon",
  "regex",
  "reqwest",
@@ -3254,6 +3255,12 @@ checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
