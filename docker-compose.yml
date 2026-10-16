@@ -1,4 +1,4 @@
-# Production-shaped stack: Postgres metadata + S3-compatible blobs (MinIO).
+# Production-shaped stack: Postgres metadata + S3-compatible blobs.
 #   docker compose up -d
 #   docker compose exec flux flux-server token --user admin --admin
 #   open http://localhost:7878
@@ -15,34 +15,39 @@ services:
       interval: 5s
       retries: 20
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
+  # S3-compatible object storage (Versity Gateway on a local volume). In
+  # production, point FLUX_BLOB_URL at S3, R2 or GCS instead.
+  s3:
+    image: versity/versitygw:v1.9.0
+    command: posix /data
     environment:
-      MINIO_ROOT_USER: flux
-      MINIO_ROOT_PASSWORD: fluxflux123
-    volumes: [minio:/data]
-    ports: ["9001:9001"]
+      ROOT_ACCESS_KEY: flux
+      ROOT_SECRET_KEY: fluxflux123
+    volumes: [s3:/data]
 
-  minio-init:
-    image: minio/mc:latest
-    depends_on: [minio]
+  s3-init:
+    image: amazon/aws-cli:2.38.1
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: flux
+      AWS_SECRET_ACCESS_KEY: fluxflux123
+      AWS_REGION: us-east-1
     entrypoint: >
-      /bin/sh -c "until mc alias set local http://minio:9000 flux fluxflux123; do sleep 1; done;
-                  mc mb -p local/flux; mc version enable local/flux"
+      /bin/sh -c "until aws --endpoint-url http://s3:7070 s3 ls >/dev/null 2>&1; do sleep 1; done;
+                  aws --endpoint-url http://s3:7070 s3 mb s3://flux 2>&1 | grep -v BucketAlready || true"
 
   flux:
     build: .
     depends_on:
       postgres: { condition: service_healthy }
-      minio-init: { condition: service_completed_successfully }
+      s3-init: { condition: service_completed_successfully }
     environment:
       FLUX_META_URL: postgres://flux:flux@postgres:5432/flux
       FLUX_BLOB_URL: s3://flux/objects
       FLUX_AUTH: token
       FLUX_PUBLIC_URL: ${FLUX_PUBLIC_URL:-http://localhost:7878}
       FLUX_SSH_LISTEN: 0.0.0.0:2222
-      AWS_ENDPOINT: http://minio:9000
+      AWS_ENDPOINT: http://s3:7070
       AWS_ALLOW_HTTP: "true"
       AWS_ACCESS_KEY_ID: flux
       AWS_SECRET_ACCESS_KEY: fluxflux123
@@ -56,5 +61,5 @@ services:
 
 volumes:
   pg: {}
-  minio: {}
+  s3: {}
   flux: {}

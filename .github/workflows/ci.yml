@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and boot the compose stack (Postgres + MinIO)
+      - name: Build and boot the compose stack (Postgres + S3)
         run: |
           docker compose up -d --build
           for i in $(seq 60); do curl -fsS http://localhost:7878/-/readyz && break; sleep 2; done

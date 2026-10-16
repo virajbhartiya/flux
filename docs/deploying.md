@@ -16,7 +16,7 @@ Production: `flux-server --meta-url postgres://… --blob-url s3://bucket/prefix
 
 ## 2. Run it
 
-### Docker Compose (Postgres + MinIO + flux)
+### Docker Compose (Postgres + S3-compatible storage + flux)
 
 ```sh
 git clone https://github.com/virajbhartiya/flux && cd flux
@@ -24,7 +24,7 @@ FLUX_PUBLIC_URL=https://flux.example.com docker compose up -d --build
 docker compose exec flux flux-server token --user admin --admin   # an admin token, printed once
 ```
 
-Before exposing it, change the Postgres and MinIO passwords in `docker-compose.yml`. Or point `FLUX_META_URL` and `FLUX_BLOB_URL` at managed services (RDS, Cloud SQL, Neon; S3 or R2) and remove the bundled containers.
+Before exposing it, change the Postgres and S3 passwords in `docker-compose.yml`. Or point `FLUX_META_URL` and `FLUX_BLOB_URL` at managed services (RDS, Cloud SQL, Neon; S3 or R2) and remove the bundled containers.
 
 ### A single VM with systemd
 

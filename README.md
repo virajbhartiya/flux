@@ -128,7 +128,7 @@ Served by `flux-server` on the same port as gRPC (HTTP/1.1 and HTTP/2):
 # Postgres metadata + S3-compatible blobs (S3, R2, MinIO via AWS_ENDPOINT).
 flux-server --meta-url postgres://flux@db/flux --blob-url s3://bucket/flux --auth token
 
-# Or the whole stack with Docker: Postgres + MinIO + flux.
+# Or the whole stack with Docker: Postgres + S3-compatible storage + flux.
 docker compose up -d
 docker compose exec flux flux-server token --user admin --admin
 ```
