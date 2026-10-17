@@ -82,8 +82,8 @@ pub fn refusal(findings: &[Finding]) -> crate::core::FluxError {
     let list: Vec<String> = findings.iter().take(10).map(ToString::to_string).collect();
     crate::core::FluxError::PermissionDenied(format!(
         "push protection: this change contains what looks like a secret ({}). Remove it (and rotate it), \
-         add `flux:allow-secret` to the line if it is a test fixture, or turn push protection off in the \
-         repository settings",
+         add `flux:allow-secret` to the line if it is a test fixture, or turn push protection off for the \
+         repository (Settings → Security, or `secret_scanning: false` over the API)",
         list.join("; ")
     ))
 }

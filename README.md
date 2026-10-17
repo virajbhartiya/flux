@@ -153,6 +153,7 @@ Full guide (TLS, systemd, sign-in providers, runners, backups): [docs/deploying.
 - **Backups:** `flux-server backup DIR` takes a consistent online snapshot of the all-in-one layout (metadata first, then append-only blobs). Restore with `flux-server --data-dir DIR`. For Postgres use `pg_dump` or PITR; for S3, bucket versioning.
 - **Caching tier:** `flux-server cache --upstream http://primary:7878 --dir /var/cache/flux` is a regional cache (SPEC §9.2). It serves verified trees and contents from local disk and proxies everything else, web UI included. Clients point at it exactly as they would at the server.
 - **Observability:** Prometheus metrics at `/-/metrics` (request counts and latency histograms per surface, blob stats), `/-/healthz`, `/-/readyz` and `Server-Timing` on every response. The server shuts down gracefully on SIGTERM.
+- **Push protection:** pushes, API commits and web edits that leave credentials in the repository (AWS, GitHub, GitLab, Slack, Stripe, Google, OpenAI, Anthropic, npm and PyPI keys, private keys) are refused. Only what a push leaves at its tips is checked, so importing history with long-removed test keys works. Mark a fixture with `flux:allow-secret` on its line, or turn it off per repository (Settings → Security).
 - **Web security:** strict CSP (no inline scripts, no third-party code), escaped and sanitized repository Markdown, and raw files served sandboxed with `nosniff`. Same-origin checks run on every form POST.
 
 ## Architecture

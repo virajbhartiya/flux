@@ -366,7 +366,21 @@ pub fn danger_zone(ctx: &RepoCtx) -> Markup {
         None => (None, ctx.name.as_str()),
     };
     let archived = ctx.config.archived;
+    let scanning = !ctx.config.secret_scanning_disabled;
     html! {
+        h2.section-title { "Security" }
+        div.card {
+            div.list-row {
+                div.list-main {
+                    strong { "Push protection" " " @if scanning { span.pill.small.ok { "On" } } @else { span.pill.small { "Off" } } }
+                    div.muted.small { "Refuse pushes and edits that leave credentials (cloud keys, tokens, private keys) in the repository. Mark a test fixture with " code { "flux:allow-secret" } " on its line." }
+                }
+                form method="post" action=(format!("{b}/push-protection")) data-confirm=[(scanning).then_some("Turn off push protection? Credentials will no longer be blocked.")] {
+                    input type="hidden" name="enabled" value=(if scanning { "0" } else { "1" });
+                    button.btn.small.danger[scanning].primary[!scanning] type="submit" { (if scanning { "Turn off" } else { "Turn on" }) }
+                }
+            }
+        }
         h2.section-title { "Danger zone" }
         div.card.danger-zone {
             div.list-row {
@@ -532,6 +546,19 @@ pub async fn post(web: &WebState, req: &Req, ctx: &RepoCtx, s: &[&str], f: &Fiel
                 Ok(()) => done(&format!("/{}/-/settings", enc(&new)), Ok::<_, WebError>(format!("Renamed to {new}"))),
                 Err(e) => done(&sb, Err::<String, _>(e)),
             }
+        }
+        ["settings", "push-protection"] => {
+            let r = async {
+                flux.authorize(who, ctx.id, Role::Admin).await?;
+                let mut cfg = (*flux.repo_config(ctx.id).await?).clone();
+                cfg.secret_scanning_disabled = f.trim("enabled") != "1";
+                flux.set_repo_config(ctx.id, &cfg).await?;
+                let on = !cfg.secret_scanning_disabled;
+                flux.audit(who, if on { "repo.push_protection.on" } else { "repo.push_protection.off" }, &ctx.name, "").await;
+                Ok::<String, WebError>(if on { "Push protection is on" } else { "Push protection is off" }.into())
+            }
+            .await;
+            done(&sb, r)
         }
         ["settings", "archive"] => {
             let r = async {

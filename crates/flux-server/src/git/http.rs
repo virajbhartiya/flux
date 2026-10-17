@@ -987,6 +987,23 @@ async fn import_commits(
         }
     }
     let mut r = Resolver { flux, pushed: objs, trees: HashMap::new() };
+    // Push protection looks at what the push leaves at its tips. Scanning
+    // every historical blob would refuse imports of existing repositories
+    // over secrets that were removed long ago (test keys in git.git's
+    // history, for one), and there is no way to fix that short of
+    // rewriting history.
+    let mut tip_blobs: std::collections::HashSet<Sha> = std::collections::HashSet::new();
+    for (_, c) in &tip_commits {
+        if map.contains_key(c) {
+            continue;
+        }
+        let tree = commit_tree(flux, repo, objs, c).await?;
+        for (_, v) in diff(&mut r, None, Some(tree)).await? {
+            if let Some((_, sha)) = v {
+                tip_blobs.insert(sha);
+            }
+        }
+    }
     let mut batch: Vec<(Sha, Changeset, Sha)> = Vec::new();
     for s in &order {
         let raw = &objs[s].data;
@@ -1032,16 +1049,28 @@ async fn import_commits(
         let mut upload_shas: Vec<Sha> = Vec::new();
         let mut scanned: Vec<(String, Bytes)> = Vec::new();
         for (path, mode, sha) in &blobs_needed {
-            if *mode == 0o160000 || existing.contains_key(sha) || upload_shas.contains(sha) {
+            if *mode == 0o160000 || upload_shas.contains(sha) {
+                continue;
+            }
+            if let Some(cid) = existing.get(sha) {
+                // Known content (perhaps only from history) newly at this
+                // path: scan it if the push leaves it in place.
+                if tip_blobs.contains(sha)
+                    && let Some(data) = flux.blobs.get_content(cid).await?
+                {
+                    scanned.push((path.to_string(), Bytes::from(data)));
+                }
                 continue;
             }
             let o = objs.get(sha).ok_or_else(|| FluxError::InvalidArgument(format!("blob {} missing from push", hex(sha))))?;
             let data = Bytes::from(o.data.clone());
-            scanned.push((path.to_string(), data.clone()));
+            if tip_blobs.contains(sha) {
+                scanned.push((path.to_string(), data.clone()));
+            }
             uploads.push((data, None));
             upload_shas.push(*sha);
         }
-        // Push protection: only content new to the server is scanned.
+        // Push protection: content new to the server that is still at a tip.
         flux.scan_new_contents(repo, &scanned).await?;
         let stored = flux.put_contents(uploads).await?;
         let mut contents = existing;

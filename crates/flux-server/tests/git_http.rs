@@ -154,3 +154,51 @@ async fn clones_use_the_cached_pack_plus_a_tail() {
     let head = commit_and_push(5..9).await.unwrap();
     assert_eq!(clone_head("c2").await.unwrap(), head, "cached pack plus tail");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_protection_checks_what_the_push_leaves_at_its_tips() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = flux_server::StorageConfig::data_dir(&dir.path().join("data")).unwrap();
+    let flux = flux_server::open(&cfg).await.unwrap();
+    flux.create_repo("r").await.unwrap();
+    let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
+    let url = format!("http://{addr}/r.git");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    tokio::task::spawn_blocking(move || {
+        // Assembled at runtime so this file does not trip scanners itself.
+        let key = format!("-----BEGIN {} PRIVATE KEY-----\nabc\n", "OPENSSH");
+        git(&src, &["init", "-q", "-b", "main"]);
+        // History that once held a key, long since removed: importable.
+        std::fs::write(src.join("id_test"), &key).unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "add a test key"]);
+        std::fs::remove_file(src.join("id_test")).unwrap();
+        std::fs::write(src.join("README.md"), "# hi\n").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "drop the test key"]);
+        git(&src, &["push", "-q", &url, "main"]);
+        // A key that the push leaves in place is refused.
+        std::fs::write(src.join("deploy_key"), &key).unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "add a deploy key"]);
+        let out = Command::new("git")
+            .args(["push", &url, "main"])
+            .current_dir(&src)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("push protection") && err.contains("deploy_key"), "{err}");
+    })
+    .await
+    .unwrap();
+}

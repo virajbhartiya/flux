@@ -406,6 +406,19 @@ async fn api_end_to_end() {
         )
         .await;
     assert_eq!(s, 201);
+    // Admins can turn it off for a repository.
+    let (s, _) = api.patch(&alice, "repos/app", json!({ "secret_scanning": false })).await;
+    assert_eq!(s, 403, "needs admin");
+    let (s, v) = api.patch(&root, "repos/app", json!({ "secret_scanning": false })).await;
+    assert_eq!((s, &v["secret_scanning"]), (200, &json!(false)), "{v}");
+    let (s, v) = api
+        .post(
+            &alice,
+            "repos/app/changes",
+            json!({ "message": "allowed", "branch": "agent/leak", "files": [{ "path": "cfg.toml", "content": leaked }] }),
+        )
+        .await;
+    assert_eq!(s, 201, "{v}");
 }
 
 #[tokio::test]

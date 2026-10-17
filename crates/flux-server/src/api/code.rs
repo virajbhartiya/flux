@@ -103,6 +103,7 @@ async fn repo_summary(c: &Ctx, repo: RepoId, name: &str) -> ApiResult<Value> {
         "default_branch": default_branch(&c.flux, repo).await?,
         "visibility": access.visibility,
         "archived": cfg.archived,
+        "secret_scanning": !cfg.secret_scanning_disabled,
         "html_url": format!("{base}/{name}"),
         "clone_url": format!("{base}/{name}.git"),
         "ssh_url": c.flux.settings.ssh_host.as_ref().map(|h| format!("ssh://git@{h}/{name}.git")),
@@ -170,6 +171,8 @@ struct RepoPatch {
     topics: Option<Vec<String>>,
     archived: Option<bool>,
     has_issues: Option<bool>,
+    /// Push protection (credential scanning of new content).
+    secret_scanning: Option<bool>,
 }
 
 pub async fn update_repo(c: &Ctx, repo: RepoId) -> ApiResult {
@@ -190,6 +193,12 @@ pub async fn update_repo(c: &Ctx, repo: RepoId) -> ApiResult {
     }
     if let Some(i) = p.has_issues {
         cfg.issues_disabled = !i;
+    }
+    if let Some(on) = p.secret_scanning {
+        if role < Role::Admin {
+            return Err(super::ApiError(axum::http::StatusCode::FORBIDDEN, "changing push protection needs admin access".into()));
+        }
+        cfg.secret_scanning_disabled = !on;
     }
     if let Some(a) = p.archived {
         if role < Role::Admin {

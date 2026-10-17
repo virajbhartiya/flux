@@ -24,7 +24,7 @@ Repository paths take either `repos/{owner}/{name}` or `repos/{name}`.
 | | |
 |---|---|
 | `GET /repos`, `POST /repos {name, visibility, description, default_branch}` | List readable; create (`owner/name`) |
-| `GET/PATCH/DELETE /repos/{r}` | Info; settings (name, description, default branch, visibility, topics, archived, has_issues); delete |
+| `GET/PATCH/DELETE /repos/{r}` | Info; settings (name, description, default branch, visibility, topics, archived, has_issues, secret_scanning); delete |
 | `GET /repos/{r}/refs?prefix=`, `/branches`, `/tags` | Refs |
 | `GET/PUT/DELETE /repos/{r}/refs/{name}` `{target, expect?, force?}` | Read or move a ref (compare-and-swap; protection applies) |
 | `GET /repos/{r}/commits?rev=&path=&since=&first_parent=1&files=1&git=1` | History |
