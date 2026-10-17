@@ -848,6 +848,19 @@ pub(crate) async fn receive_pack_report(
             if !tips.is_empty() {
                 converted = import_commits(flux, repo, principal, objs, &tips).await.map_err(|e| e.to_string());
             }
+            // Like GitHub, a push that creates more than three tags (a
+            // migration, a mirror) starts no CI runs for them.
+            let new_tags: Vec<&Command> =
+                cmds.iter().filter(|c| c.old == ZERO && c.new != ZERO && c.name.starts_with(b"refs/tags/")).collect();
+            if new_tags.len() > 3
+                && let Ok(map) = &converted
+            {
+                for c in new_tags {
+                    if let (Some(name), Some(cs)) = (flux_ref(&c.name), map.get(&c.new)) {
+                        flux.ci_quiet_tags.insert((repo.0, name), *cs);
+                    }
+                }
+            }
             for c in &cmds {
                 let r = match &converted {
                     Err(e) => Err(e.clone()),

@@ -221,6 +221,9 @@ pub struct Flux {
     pub(crate) hook_wake: Arc<tokio::sync::Notify>,
     /// Wakes CI runners waiting for jobs.
     pub(crate) ci_wake: Arc<tokio::sync::Notify>,
+    /// Tags created by a push of many tags at once, which (as on GitHub)
+    /// trigger no CI runs: (repository, flux ref name) → target.
+    pub(crate) ci_quiet_tags: moka::sync::Cache<(i64, Vec<u8>), ChangesetId>,
     /// Two-factor enrollments awaiting confirmation, by user id.
     pub(crate) pending_totp: moka::sync::Cache<i64, crate::twofactor::Enrollment>,
     /// Last TOTP step accepted per user (codes work once).
@@ -295,6 +298,7 @@ impl Flux {
             reactor: Default::default(),
             hook_wake: Default::default(),
             ci_wake: Default::default(),
+            ci_quiet_tags: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(600)).build(),
             pending_totp: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(900)).build(),
             totp_used: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(300)).build(),
             tickets: moka::sync::Cache::builder().time_to_live(std::time::Duration::from_secs(600)).max_capacity(100_000).build(),

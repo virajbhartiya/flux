@@ -202,3 +202,49 @@ async fn push_protection_checks_what_the_push_leaves_at_its_tips() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pushing_many_tags_at_once_starts_no_ci_for_them() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = flux_server::StorageConfig::data_dir(&dir.path().join("data")).unwrap();
+    let flux = flux_server::open(&cfg).await.unwrap();
+    let repo = flux.create_repo("r").await.unwrap();
+    let (listener, addr) = flux_server::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    tokio::spawn(flux_server::serve(flux.clone(), listener, std::future::pending()));
+    let url = format!("http://{addr}/r.git");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join(".flux-ci/workflows")).unwrap();
+    tokio::task::spawn_blocking(move || {
+        git(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            src.join(".flux-ci/workflows/ci.yml"),
+            "name: CI\non: [push]\njobs:\n  t:\n    steps:\n      - run: true\n",
+        )
+        .unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["commit", "-qm", "ci"]);
+        for v in ["v1", "v2", "v3", "v4", "v5"] {
+            git(&src, &["tag", v]);
+        }
+        // A migration-style push: the branch and five tags in one go.
+        git(&src, &["push", "-q", &url, "main", "--tags"]);
+    })
+    .await
+    .unwrap();
+    let mut runs = vec![];
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        runs = flux.meta.list_ci_runs(repo, None, 100).await.unwrap();
+        if !runs.is_empty() {
+            break;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let runs = if runs.is_empty() { runs } else { flux.meta.list_ci_runs(repo, None, 100).await.unwrap() };
+    let refs: Vec<&str> = runs.iter().map(|r| r.ref_name.as_str()).collect();
+    assert_eq!(refs, ["main"], "only the branch push runs CI");
+}
