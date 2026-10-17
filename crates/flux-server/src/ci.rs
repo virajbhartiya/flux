@@ -787,7 +787,7 @@ pub(crate) async fn on_event(flux: &Arc<Flux>, repo: RepoId, e: &Event) -> FluxR
             if n.starts_with("pull/") || n.starts_with("review/") || n.starts_with("flux/") {
                 return Ok(());
             }
-            if old.is_none() && flux.ci_quiet_tags.remove(&(repo.0, name.clone())) == Some(*new) {
+            if flux.ci_quiet.remove(&(repo.0, name.clone())) == Some(*new) {
                 return Ok(());
             }
             Trigger { event: "push".into(), ref_name: n, cs: *new, before: *old, review: None, actor: actor.clone(), only: None }

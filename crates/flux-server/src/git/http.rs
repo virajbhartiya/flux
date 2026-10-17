@@ -857,7 +857,7 @@ pub(crate) async fn receive_pack_report(
             {
                 for c in new_tags {
                     if let (Some(name), Some(cs)) = (flux_ref(&c.name), map.get(&c.new)) {
-                        flux.ci_quiet_tags.insert((repo.0, name), *cs);
+                        flux.ci_quiet.insert((repo.0, name), *cs);
                     }
                 }
             }
@@ -1145,30 +1145,12 @@ async fn import_commits(
         let id = cs.id();
         map.insert(*s, id);
         batch.push((*s, cs, c.tree));
-    }
-    if !batch.is_empty() {
-        let changesets: Vec<Changeset> = batch.iter().map(|b| b.1.clone()).collect();
-        flux.create_changesets(repo, changesets).await?;
-        // Every pushed tree must regenerate to the same git tree.
-        for (sha, _, tree) in &batch {
-            let cs = map[sha];
-            let ours = flux.git_tree_sha(flux.root_tree(repo, &cs).await?).await?;
-            if ours != *tree {
-                return Err(FluxError::InvalidArgument(format!(
-                    "commit {} has a non-canonical tree (git would hash it to {}); re-create it with a modern git",
-                    hex(sha),
-                    hex(&ours)
-                )));
-            }
+        // Parents come first, so earlier chunks can be stored as they fill.
+        if batch.len() >= PUSH_BATCH {
+            flush_batch(flux, repo, principal, &mut batch, &map).await?;
         }
-        let pairs: Vec<(ChangesetId, Sha)> = batch.iter().map(|(s, _, _)| (map[s], *s)).collect();
-        flux.meta.git_commits_put(repo, &pairs).await?;
-        flux.meta.git_map_put(repo, &pairs).await?;
-        for (cs, sha) in &pairs {
-            flux.git_caches().commits.insert((repo, *cs), *sha);
-        }
-        tracing::info!(repo = repo.0, commits = batch.len(), user = principal.name(), "git push imported");
     }
+    flush_batch(flux, repo, principal, &mut batch, &map).await?;
     for (t, c) in tip_commits {
         if t != c {
             let cs = map[&c];
@@ -1176,6 +1158,45 @@ async fn import_commits(
         }
     }
     Ok(map)
+}
+
+/// Changesets stored per batch while importing a push.
+const PUSH_BATCH: usize = 5_000;
+
+/// Store converted commits (and their git mappings), emptying `batch`.
+async fn flush_batch(
+    flux: &Arc<Flux>,
+    repo: RepoId,
+    principal: &Principal,
+    batch: &mut Vec<(Sha, Changeset, Sha)>,
+    map: &HashMap<Sha, ChangesetId>,
+) -> FluxResult<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let changesets: Vec<Changeset> = batch.iter().map(|b| b.1.clone()).collect();
+    flux.create_changesets(repo, changesets).await?;
+    // Every pushed tree must regenerate to the same git tree.
+    for (sha, _, tree) in batch.iter() {
+        let cs = map[sha];
+        let ours = flux.git_tree_sha(flux.root_tree(repo, &cs).await?).await?;
+        if ours != *tree {
+            return Err(FluxError::InvalidArgument(format!(
+                "commit {} has a non-canonical tree (git would hash it to {}); re-create it with a modern git",
+                hex(sha),
+                hex(&ours)
+            )));
+        }
+    }
+    let pairs: Vec<(ChangesetId, Sha)> = batch.iter().map(|(s, _, _)| (map[s], *s)).collect();
+    flux.meta.git_commits_put(repo, &pairs).await?;
+    flux.meta.git_map_put(repo, &pairs).await?;
+    for (cs, sha) in &pairs {
+        flux.git_caches().commits.insert((repo, *cs), *sha);
+    }
+    tracing::info!(repo = repo.0, commits = batch.len(), user = principal.name(), "git push imported");
+    batch.clear();
+    Ok(())
 }
 
 async fn commit_tree(flux: &Flux, repo: RepoId, objs: &HashMap<Sha, PackObject>, commit: &Sha) -> FluxResult<Sha> {

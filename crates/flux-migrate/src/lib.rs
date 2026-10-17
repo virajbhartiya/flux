@@ -439,7 +439,9 @@ async fn protect(gh: &GitHub, flux: &FluxApi, base: &str, branch: &str, opts: &O
     let p = match gh.get_opt::<serde_json::Value>(&path).await {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(()),
-        Err(e) if status_of(&e) == Some(403) => {
+        // GitHub answers 401 or 403 without admin access, depending on the
+        // token; neither should stop the rest of the migration.
+        Err(e) if matches!(status_of(&e), Some(401 | 403)) => {
             if !report.incremental {
                 report.warn(format!(
                     "could not read branch protection for {branch} (needs admin access); set it with PUT /api/v1/repos/{}/protection",
